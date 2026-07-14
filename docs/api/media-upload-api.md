@@ -463,7 +463,7 @@ wx.uploadFile({
 - 状态进入 `completing` 后不再接受分片。
 - `serverTime >= expiresAt` 时不再接受新分片，返回 `410 UPLOAD_EXPIRED` 并触发安全终止。
 - 服务端将文件字段流式写入 R2 `UploadPart`，不把整个分片转成进程级 Buffer。
-- 首片 magic bytes 与声明 MIME/扩展名不兼容时返回 `415 MIME_MISMATCH`，并持久化 `aborting + abort_reason=validationFailed`；后台安全终止 multipart 后记录变为 `upload_failed`。SHA-256 或长度不匹配只拒绝并重传当前 part，不终止整个会话。
+- 首片不足以完成格式签名校验时返回 `422 FILE_TOO_SMALL`；magic bytes 与声明 MIME/扩展名不兼容时返回 `415 MIME_MISMATCH`。两者都持久化 `aborting + abort_reason=validationFailed` 及对应安全 `failure_code`，后台安全终止 multipart 后记录变为 `upload_failed`。SHA-256 或长度不匹配只拒绝并重传当前 part，不终止整个会话。
 
 响应 `200`：
 
@@ -743,6 +743,8 @@ uploading | finalizing | cancelling | uploaded | upload_failed | aborted | expir
 | R2 UploadPart | 150 秒 |
 | 后台 R2 Complete/HEAD | 单次 30 秒；超时继续对账 |
 | 上传写入期限 | 24 小时；finalizing 不按年龄直接终止 |
+
+普通接口的 10 秒为从收到请求头开始计算的绝对时限。只有精确匹配分片路径且使用 `multipart/form-data` 的请求采用 180 秒总时限；同一路径上的其他 Content-Type 仍按普通时限处理。分片请求若在鉴权、限流、路径参数或表单校验阶段失败，服务端会排空请求体并关闭该 HTTP 连接。
 
 可自动重试：网络错误、`408`、`429`、`502`、`503`、`504`，以及错误体明确标记 `retryable=true` 的响应；`409` 或 `500` 只有在该标志为 true 时重试。使用 full-jitter 指数退避：
 

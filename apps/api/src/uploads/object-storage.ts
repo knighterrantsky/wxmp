@@ -73,6 +73,7 @@ export interface ObjectStorage {
     partNumber: number
     contentLength: number
     body: Readable
+    signal?: AbortSignal
   }): Promise<{ etag: string }>
   listParts(input: MultipartIdentity): Promise<
     {

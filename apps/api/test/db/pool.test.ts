@@ -16,6 +16,18 @@ describe('runtime PostgreSQL pool', () => {
     expect(pool.options.connectionTimeoutMillis).toBeGreaterThan(0)
     expect(pool.options.query_timeout).toBeGreaterThan(0)
     expect(pool.options.statement_timeout).toBeGreaterThan(0)
+    expect(pool.options.max).toBe(20)
+  })
+
+  it('supports bounded dedicated pools with distinct application names', () => {
+    const pool = createPool('postgresql://runtime:password@127.0.0.1:55432/wx_upload', undefined, {
+      max: 12,
+      applicationName: 'wx-private-upload-locks',
+    })
+    pools.push(pool)
+
+    expect(pool.options.max).toBe(12)
+    expect(pool.options.application_name).toBe('wx-private-upload-locks')
   })
 
   it('handles idle-client errors instead of leaving an unhandled error event', () => {

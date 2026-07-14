@@ -1,3 +1,6 @@
+import { createConnection } from 'node:net'
+import { once } from 'node:events'
+
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { buildApp } from '../../src/app.js'
@@ -14,6 +17,86 @@ afterEach(async () => {
 })
 
 describe('Fastify application shell', () => {
+  it('sets finite request and idle deadlines for streaming bodies', () => {
+    const app = buildApp(fakeDependencies())
+    apps.push(app)
+
+    expect(app.server.requestTimeout).toBe(180_000)
+    expect(app.initialConfig.connectionTimeout).toBe(30_000)
+  })
+
+  it('closes a slow ordinary request at its shorter absolute deadline', async () => {
+    const app = buildApp(fakeDependencies({ ordinaryRequestTimeoutMs: 50 }))
+    apps.push(app)
+    app.post('/__test/slow-json', () => ({ accepted: true }))
+    await app.listen({ host: '127.0.0.1', port: 0 })
+    const address = app.server.address()
+    if (address === null || typeof address === 'string') throw new Error('test server did not bind')
+    for (const path of [
+      '/__test/slow-json',
+      '/v1/uploads/01981c31-4c80-7000-8000-000000000101/parts/1',
+    ]) {
+      const socket = createConnection({ host: '127.0.0.1', port: address.port })
+      socket.on('error', () => undefined)
+      await once(socket, 'connect')
+      const startedAt = performance.now()
+      socket.write(
+        `POST ${path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{`,
+      )
+
+      await once(socket, 'close')
+
+      expect(performance.now() - startedAt).toBeLessThan(500)
+    }
+  })
+
+  it('keeps the longer streaming deadline only for the multipart part route', async () => {
+    const app = buildApp(fakeDependencies({ ordinaryRequestTimeoutMs: 50 }))
+    apps.push(app)
+    await app.listen({ host: '127.0.0.1', port: 0 })
+    const address = app.server.address()
+    if (address === null || typeof address === 'string') throw new Error('test server did not bind')
+    const socket = createConnection({ host: '127.0.0.1', port: address.port })
+    socket.on('error', () => undefined)
+    let closed = false
+    socket.once('close', () => {
+      closed = true
+    })
+    await once(socket, 'connect')
+    socket.write(
+      'POST /v1/uploads/01981c31-4c80-7000-8000-000000000101/parts/1 HTTP/1.1\r\n' +
+        'Host: 127.0.0.1\r\n' +
+        'Authorization: Bearer test-access-token\r\n' +
+        'Content-Type: multipart/form-data; boundary=slow-boundary\r\n' +
+        'Content-Length: 100\r\n\r\n' +
+        '--slow-boundary\r\n',
+    )
+
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(closed).toBe(false)
+    const close = once(socket, 'close')
+    socket.destroy()
+    await close
+  })
+
+  it('adds Retry-After when an upload-wide gate times out', async () => {
+    const app = buildApp(fakeDependencies())
+    apps.push(app)
+    app.get('/__test/upload-busy', () => {
+      throw new ApiError({
+        code: 'UPLOAD_BUSY',
+        message: 'UPLOAD_BUSY',
+        retryable: true,
+        statusCode: 409,
+      })
+    })
+
+    const response = await app.inject({ method: 'GET', url: '/__test/upload-busy' })
+
+    expect(response.statusCode).toBe(409)
+    expect(response.headers['retry-after']).toBe('1')
+  })
+
   it('rejects unknown JSON body fields instead of silently removing them', async () => {
     const app = buildApp(fakeDependencies())
     apps.push(app)

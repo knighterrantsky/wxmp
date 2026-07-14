@@ -185,6 +185,22 @@ describe('R2ObjectStorage command mapping', () => {
     })
   })
 
+  it('forwards the upload-part deadline signal to the SDK sender', async () => {
+    const body = Readable.from(Buffer.from('part-body', 'utf8'))
+    const { sender, calls } = fakeSender({ ETag: '"part-etag"' })
+    const abort = new AbortController()
+
+    await storage(sender).uploadPart({
+      ...identity,
+      partNumber: 2,
+      contentLength: 9,
+      body,
+      signal: abort.signal,
+    })
+
+    expect(calls[0]?.options).toEqual({ abortSignal: abort.signal })
+  })
+
   it('maps the caller-supplied ordered part manifest when completing', async () => {
     const { sender, calls } = fakeSender({
       $metadata: { httpStatusCode: 200 },

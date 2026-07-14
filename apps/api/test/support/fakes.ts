@@ -30,6 +30,9 @@ export interface FakeDependencyOverrides {
   objectStorage?: ObjectStorage
   objectStorageBucket?: string
   uploadRepository?: UploadRepository
+  uploadConcurrency?: AppDependencies['uploadConcurrency']
+  uploadLockPool?: AppDependencies['uploadLockPool']
+  ordinaryRequestTimeoutMs?: AppDependencies['ordinaryRequestTimeoutMs']
 }
 
 export interface FakeDependencies extends AppDependencies {
@@ -111,6 +114,13 @@ export function fakeDependencies(overrides: FakeDependencyOverrides = {}): FakeD
     ...(overrides.uploadRepository === undefined
       ? {}
       : { uploadRepository: overrides.uploadRepository }),
+    ...(overrides.uploadConcurrency === undefined
+      ? {}
+      : { uploadConcurrency: overrides.uploadConcurrency }),
+    ...(overrides.uploadLockPool === undefined ? {} : { uploadLockPool: overrides.uploadLockPool }),
+    ...(overrides.ordinaryRequestTimeoutMs === undefined
+      ? {}
+      : { ordinaryRequestTimeoutMs: overrides.ordinaryRequestTimeoutMs }),
     probes,
   }
 }

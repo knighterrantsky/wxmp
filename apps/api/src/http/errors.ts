@@ -170,7 +170,11 @@ export function toApiErrorEnvelope(
   reply: FastifyReply,
 ): FastifyReply {
   const safe = classifyError(error)
-  if ((safe.statusCode === 429 || safe.statusCode === 503) && !reply.hasHeader('Retry-After')) {
+  const uploadBusy = error instanceof ApiError && error.code === 'UPLOAD_BUSY'
+  if (
+    (safe.statusCode === 429 || safe.statusCode === 503 || uploadBusy) &&
+    !reply.hasHeader('Retry-After')
+  ) {
     reply.header('Retry-After', '1')
   }
   const publicError = {

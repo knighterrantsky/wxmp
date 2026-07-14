@@ -370,6 +370,7 @@ export class R2ObjectStorage implements ObjectStorage {
     partNumber: number
     contentLength: number
     body: Readable
+    signal?: AbortSignal
   }): Promise<{ etag: string }> {
     const operation = 'uploadPart'
     const output = record(
@@ -383,6 +384,7 @@ export class R2ObjectStorage implements ObjectStorage {
           ContentLength: input.contentLength,
           Body: input.body,
         }),
+        input.signal,
       ),
       operation,
     )

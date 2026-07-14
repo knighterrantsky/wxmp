@@ -131,6 +131,7 @@ sequenceDiagram
 - 服务端生成 UUIDv7 内部用户 ID。`openid`、`unionid` 和 `session_key` 不返回客户端。
 - 首版不依赖微信敏感数据解密，`session_key` 只在本次登录交换的进程内存中短暂存在，不写数据库、缓存或日志。
 - Access Token 有效期 15 分钟；Refresh Token 有效期 30 天并每次使用时轮换。
+- Access Token 虽为无状态 JWT，但用户状态不是延迟到 Token 到期才生效：资料读取、上传预检、分片确认和上传详情都重新核对 `users.status`；账号变为 `disabled` 后，已经签发的 Token 也不能继续写入或读取上传记录。
 - 数据库只保存 Refresh Token 的 SHA-256 摘要；发现旧 Token 重用时撤销整个 token family。
 
 ### 7.2 昵称确认
@@ -331,7 +332,7 @@ PostgreSQL 与 R2 没有分布式事务，系统使用 Saga + Reconciliation：
 |---|---|
 | 微信登录服务临时不可用 | 返回可重试错误，不创建匿名本地身份 |
 | 昵称缺失 | 上传初始化返回 `NICKNAME_REQUIRED`，不创建 R2 multipart |
-| 文件不足 12 bytes 或无法检查格式签名 | 客户端先阻止，服务端返回 `422 FILE_TOO_SMALL` |
+| 文件不足 12 bytes 或无法检查格式签名 | 客户端先阻止；服务端返回 `422 FILE_TOO_SMALL`，并按 `validationFailed` 安全终止已创建的 multipart |
 | 文件超过 200 MiB | 客户端先阻止，服务端返回 `413 FILE_TOO_LARGE` |
 | 首片 magic bytes 与 MIME/扩展名不符 | 返回 `415`，持久化 `validationFailed` 清理原因；安全终止 multipart 后记录为 `upload_failed` |
 | 分片网络中断 | 不计入已确认字节，重传同一 part number |
@@ -372,7 +373,8 @@ PostgreSQL 与 R2 没有分布式事务，系统使用 Saga + Reconciliation：
 - 客户端分片为 8 MiB，服务端必须流式读取 multipart 文件字段，禁止一次性转为 Buffer。
 - Nginx 设置 `client_max_body_size 16m`、关闭上传请求缓冲，并将上传上游读取超时设为至少 210 秒。
 - API 到 R2 的单分片超时必须短于客户端总超时，建议 150 秒。
-- 初始单实例建议至少 2 vCPU、4 GiB 内存；数据库连接池上限 20。
+- API 对普通请求执行 10 秒绝对时限；只有路径和 `Content-Type` 都匹配分片 multipart 接口时使用 180 秒总时限。分片请求在鉴权、限流或参数校验前失败时必须排空或关闭连接，不能让未读取的大请求体继续占用连接。
+- 初始单实例建议至少 2 vCPU、4 GiB 内存；数据库总连接池上限 20，其中短事务业务池 8 条、上传 advisory-lock 专用池 12 条，长时间持有的会话锁不得耗尽登录、进度和确认事务所需连接。
 - API 保持无状态，可在共享 PostgreSQL 前横向扩容。分片并发与 finalizer 互斥不能只使用进程内锁。
 - 本地磁盘不保存服务端上传文件；临时分片只存在用户设备并及时删除。
 

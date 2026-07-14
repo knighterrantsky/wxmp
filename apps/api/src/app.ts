@@ -23,9 +23,13 @@ import { registerHealthRoutes } from './routes/health.js'
 import type { ObjectStorage } from './uploads/object-storage.js'
 import { PostgresUploadRepository, type UploadRepository } from './uploads/upload-repository.js'
 import { registerUploadRoutes } from './uploads/upload-routes.js'
-import { UploadService } from './uploads/upload-service.js'
+import { PostgresUploadConcurrency } from './uploads/upload-concurrency.js'
+import { UploadService, type PartUploadConcurrency } from './uploads/upload-service.js'
 
 const UUID_V7 = new RegExp(UUID_V7_PATTERN)
+const REQUEST_TIMEOUT_MS = 180_000
+const CONNECTION_IDLE_TIMEOUT_MS = 30_000
+const ORDINARY_REQUEST_TIMEOUT_MS = 10_000
 
 export interface AppShellDependencies {
   pool: Pool
@@ -39,6 +43,7 @@ export interface AppShellDependencies {
   metrics: Metrics
   monitoringToken: string
   trustProxy: Exclude<FastifyServerOptions['trustProxy'], undefined>
+  ordinaryRequestTimeoutMs?: number
 }
 
 export interface AppDependencies extends AppShellDependencies {
@@ -49,13 +54,37 @@ export interface AppDependencies extends AppShellDependencies {
   objectStorage: ObjectStorage
   objectStorageBucket: string
   uploadRepository?: UploadRepository
+  uploadConcurrency?: PartUploadConcurrency
+  uploadLockPool?: Pool
 }
 
 function clientRequestId(value: string | string[] | undefined): string | undefined {
   return typeof value === 'string' && UUID_V7.test(value) ? value : undefined
 }
 
+function isUploadPartRequest(
+  method: string,
+  url: string | undefined,
+  contentType: string | string[] | undefined,
+): boolean {
+  return (
+    method === 'POST' &&
+    url !== undefined &&
+    /^\/v1\/uploads\/[^/?]+\/parts\/[^/?]+(?:\?|$)/u.test(url) &&
+    typeof contentType === 'string' &&
+    /^multipart\/form-data(?:;|$)/iu.test(contentType.trim())
+  )
+}
+
 export function buildAppShell(deps: AppShellDependencies): FastifyInstance {
+  const ordinaryRequestTimeoutMs = deps.ordinaryRequestTimeoutMs ?? ORDINARY_REQUEST_TIMEOUT_MS
+  if (
+    !Number.isSafeInteger(ordinaryRequestTimeoutMs) ||
+    ordinaryRequestTimeoutMs < 1 ||
+    ordinaryRequestTimeoutMs > REQUEST_TIMEOUT_MS
+  ) {
+    throw new RangeError('ordinary request timeout must be between 1 and 180000 milliseconds')
+  }
   const commonOptions: FastifyServerOptions = {
     ajv: {
       customOptions: {
@@ -63,6 +92,8 @@ export function buildAppShell(deps: AppShellDependencies): FastifyInstance {
       },
     },
     bodyLimit: 65_536,
+    requestTimeout: REQUEST_TIMEOUT_MS,
+    connectionTimeout: CONNECTION_IDLE_TIMEOUT_MS,
     logController: new LogController({ disableRequestLogging: true }),
     trustProxy: deps.trustProxy,
     requestIdHeader: false,
@@ -76,6 +107,17 @@ export function buildAppShell(deps: AppShellDependencies): FastifyInstance {
   app.addHook('onRequest', async (request, reply) => {
     initializeRequestContext(request, deps.clock)
     reply.header('X-Request-Id', request.id)
+    if (!isUploadPartRequest(request.method, request.raw.url, request.headers['content-type'])) {
+      const timeout = setTimeout(() => {
+        if (!reply.raw.destroyed) reply.raw.destroy()
+      }, ordinaryRequestTimeoutMs)
+      timeout.unref()
+      const clearDeadline = () => {
+        clearTimeout(timeout)
+      }
+      reply.raw.once('finish', clearDeadline)
+      reply.raw.once('close', clearDeadline)
+    }
   })
   app.addHook('onResponse', async (request, reply) => {
     request.log.info(
@@ -140,6 +182,9 @@ export function buildApp(deps: AppDependencies): FastifyInstance {
     ids: deps.ids,
     repository: uploadRepository,
     storage: deps.objectStorage,
+    concurrency:
+      deps.uploadConcurrency ??
+      new PostgresUploadConcurrency({ pool: deps.uploadLockPool ?? deps.pool }),
   })
   registerUploadRoutes(app, { uploads, tokens: deps.tokenService })
   return app

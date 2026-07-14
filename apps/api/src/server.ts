@@ -173,9 +173,23 @@ export function createServerRuntime(config: RuntimeConfig) {
     service: 'wx-upload-api',
     secrets: configuredSecrets(config),
   })
-  const pool = createPool(config.databaseUrl, (error) => {
-    logger.error({ err: error, errorCode: 'POSTGRES_IDLE_CLIENT_ERROR' }, 'database pool error')
-  })
+  const pool = createPool(
+    config.databaseUrl,
+    (error) => {
+      logger.error({ err: error, errorCode: 'POSTGRES_IDLE_CLIENT_ERROR' }, 'database pool error')
+    },
+    { max: 8, applicationName: 'wx-private-upload-api' },
+  )
+  const uploadLockPool = createPool(
+    config.databaseUrl,
+    (error) => {
+      logger.error(
+        { err: error, errorCode: 'POSTGRES_UPLOAD_LOCK_CLIENT_ERROR' },
+        'upload lock pool error',
+      )
+    },
+    { max: 12, applicationName: 'wx-private-upload-locks' },
+  )
   const ids = createSecureIdGenerator(systemClock)
   const objectStorage = new R2ObjectStorage(config.r2)
   const app = buildApp({
@@ -195,8 +209,16 @@ export function createServerRuntime(config: RuntimeConfig) {
     tokenService: createConfiguredTokenService(config, ids),
     objectStorage,
     objectStorageBucket: config.r2.bucket,
+    uploadLockPool,
   })
-  return { app, pool }
+  return {
+    app,
+    pool: {
+      async end() {
+        await Promise.all([pool.end(), uploadLockPool.end()])
+      },
+    },
+  }
 }
 
 export function createResourceCloser(app: Pick<ServerApp, 'close'>, pool: ServerPool) {

@@ -3,6 +3,7 @@ import type { InitializeUploadRequest, InitializeUploadResponse } from '@wx-uplo
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { buildAppShell } from '../../src/app.js'
+import { PostgresAuthRepository } from '../../src/auth/auth-repository.js'
 import type { AccessTokenVerifier } from '../../src/auth/auth-routes.js'
 import { applyRoleGrants } from '../../src/db/grants.js'
 import { runMigrations } from '../../src/db/migrate.js'
@@ -150,7 +151,17 @@ function uploadService(
 ): UploadService {
   const ids = createSecureIdGenerator(clock)
   const repository = new PostgresUploadRepository({ pool: runtimePool, clock, ids })
-  return new UploadService({ bucket, clock, ids, repository, storage, ...options })
+  return new UploadService({
+    bucket,
+    clock,
+    ids,
+    repository,
+    storage,
+    concurrency: {
+      acquirePart: () => Promise.reject(new Error('part upload is outside this test')),
+    },
+    ...options,
+  })
 }
 
 function initialize(
@@ -165,6 +176,22 @@ function initialize(
     idempotencyKey: key,
     context,
   })
+}
+
+async function waitForRuntimeLockWaiters(expected: number): Promise<void> {
+  const deadline = performance.now() + 2_000
+  for (;;) {
+    const waiting = await runtimePool.query<{ count: string }>(
+      `select count(*)::text as count
+         from pg_stat_activity
+        where datname = current_database()
+          and usename = 'wx_runtime'
+          and wait_event_type = 'Lock'`,
+    )
+    if (Number(waiting.rows[0]?.count ?? 0) >= expected) return
+    if (performance.now() >= deadline) throw new Error('runtime lock waiter was not observed')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
 }
 
 interface SagaState {
@@ -281,6 +308,97 @@ describe('upload initialization saga', () => {
     expect(storage.createMultipart).toHaveBeenCalledOnce()
   })
 
+  it('does not complete initialization when the user is disabled during storage creation', async () => {
+    await seedUser()
+    const storage = fakeStorage()
+    const key = idempotencyKey(7)
+    storage.createMultipart.mockImplementationOnce(async () => {
+      await migrationPool.query(`update media_app.users set status = 'disabled' where id = $1`, [
+        userId,
+      ])
+      return { uploadId: privateUploadId }
+    })
+
+    await expect(initialize(uploadService(storage.storage), key)).rejects.toMatchObject({
+      code: 'USER_DISABLED',
+      statusCode: 403,
+    })
+    expect(storage.createMultipart).toHaveBeenCalledOnce()
+    await expect(sagaState(key)).resolves.toMatchObject({
+      idempotency_status: 'in_progress',
+      upload_status: 'initiating',
+      r2_upload_id: null,
+      media_status: 'pending_upload',
+      part_count: 0,
+    })
+  })
+
+  it('does not deadlock completion against a same-key initialization retry', async () => {
+    await seedUser()
+    const storage = fakeStorage()
+    const service = uploadService(storage.storage)
+    const key = idempotencyKey(8)
+    let storageEnteredResolve!: () => void
+    let storageReleaseResolve!: () => void
+    const storageEntered = new Promise<void>((resolve) => {
+      storageEnteredResolve = resolve
+    })
+    const storageRelease = new Promise<void>((resolve) => {
+      storageReleaseResolve = resolve
+    })
+    storage.createMultipart.mockImplementationOnce(async () => {
+      storageEnteredResolve()
+      await storageRelease
+      return { uploadId: privateUploadId }
+    })
+    const primary = initialize(service, key)
+    void primary.catch(() => undefined)
+    await storageEntered
+    const media = await migrationPool.query<{ id: string }>(
+      `select m.id
+         from media_app.idempotency_records i
+         join media_app.upload_sessions u on u.id = i.resource_id
+         join media_app.media_objects m on m.id = u.media_object_id
+        where i.principal_type = 'user' and i.principal_id = $1
+          and i.operation = 'upload.initialize' and i.idempotency_key = $2`,
+      [userId, key],
+    )
+    const blocker = await runtimePool.connect()
+    await blocker.query('begin')
+    await blocker.query(`select id from media_app.media_objects where id = $1 for update`, [
+      media.rows[0]?.id,
+    ])
+
+    try {
+      storageReleaseResolve()
+      await waitForRuntimeLockWaiters(1)
+      const retry = initialize(service, key)
+      void retry.catch(() => undefined)
+      const retrySettled = retry.then(
+        () => undefined,
+        () => undefined,
+      )
+      await Promise.race([retrySettled, waitForRuntimeLockWaiters(2)])
+      await blocker.query('commit')
+
+      const [primaryResult, retryResult] = await Promise.allSettled([primary, retry])
+      expect(primaryResult.status).toBe('fulfilled')
+      expect(retryResult).toMatchObject({
+        status: 'rejected',
+        reason: { code: 'IDEMPOTENCY_IN_PROGRESS', statusCode: 409 },
+      })
+      for (const result of [primaryResult, retryResult]) {
+        if (result.status === 'rejected') {
+          expect(result.reason).not.toMatchObject({ code: '40P01' })
+        }
+      }
+    } finally {
+      storageReleaseResolve()
+      await blocker.query('rollback').catch(() => undefined)
+      blocker.release()
+    }
+  })
+
   it('requires a confirmed nickname before reserving idempotency or calling storage', async () => {
     await seedUser({ confirmed: false })
     const storage = fakeStorage()
@@ -326,6 +444,116 @@ describe('upload initialization saga', () => {
       [userId],
     )
     expect(count.rows[0]?.count).toBe('5')
+  })
+
+  it('serializes concurrent initialization when only one unfinished-session slot remains', async () => {
+    await seedUser()
+    const storage = fakeStorage()
+    const service = uploadService(storage.storage)
+    for (let index = 30; index < 34; index += 1) {
+      await initialize(service, idempotencyKey(index))
+    }
+    await migrationPool.query(`
+      create function media_app.test_slow_concurrent_initialize()
+      returns trigger language plpgsql as $function$
+      begin
+        perform pg_sleep(0.2);
+        return new;
+      end
+      $function$;
+      create trigger test_slow_concurrent_initialize
+      before insert on media_app.media_objects
+      for each row execute function media_app.test_slow_concurrent_initialize();
+    `)
+
+    let results: PromiseSettledResult<Awaited<ReturnType<typeof initialize>>>[]
+    try {
+      results = await Promise.allSettled([
+        initialize(service, idempotencyKey(34)),
+        initialize(service, idempotencyKey(35)),
+      ])
+    } finally {
+      await migrationPool.query(`
+        drop trigger if exists test_slow_concurrent_initialize on media_app.media_objects;
+        drop function if exists media_app.test_slow_concurrent_initialize();
+      `)
+    }
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    const rejected = results.find((result) => result.status === 'rejected')
+    expect(rejected?.status).toBe('rejected')
+    if (rejected?.status !== 'rejected') throw new Error('one initialization must be rejected')
+    expect(rejected.reason as unknown).toMatchObject({
+      code: 'UPLOAD_SESSION_LIMIT',
+      statusCode: 429,
+    })
+    expect(storage.createMultipart).toHaveBeenCalledTimes(5)
+    const count = await migrationPool.query<{ count: string }>(
+      `select count(*)::text as count from media_app.upload_sessions
+        where user_id = $1 and status in ('initiating', 'uploading', 'completing', 'aborting')`,
+      [userId],
+    )
+    expect(count.rows[0]?.count).toBe('5')
+  })
+
+  it('does not deadlock initialization audit against refresh rotation', async () => {
+    await seedUser()
+    const storage = fakeStorage()
+    const ids = createSecureIdGenerator(clock)
+    const authRepository = new PostgresAuthRepository({ pool: runtimePool, clock, ids })
+    const blocker = await migrationPool.connect()
+    await blocker.query(`select pg_advisory_lock(8675309)`)
+    await migrationPool.query(`
+      create function media_app.test_pause_initialize_audit()
+      returns trigger language plpgsql as $function$
+      begin
+        if new.event_type = 'upload.initialize_started' then
+          perform pg_advisory_xact_lock(8675309);
+        end if;
+        return new;
+      end
+      $function$;
+      create trigger test_pause_initialize_audit
+      before insert on media_app.audit_events
+      for each row execute function media_app.test_pause_initialize_audit();
+    `)
+
+    try {
+      const initialization = initialize(uploadService(storage.storage), idempotencyKey(36))
+      void initialization.catch(() => undefined)
+      await waitForRuntimeLockWaiters(1)
+      const refresh = authRepository.rotateRefresh({
+        refreshTokenHash: Buffer.alloc(32, 1),
+        nextRefreshTokenHash: Buffer.alloc(32, 2),
+        refreshExpiresAt: new Date('2026-08-14T05:00:00.000Z'),
+        context,
+      })
+      void refresh.catch(() => undefined)
+      await waitForRuntimeLockWaiters(2)
+      await blocker.query(`select pg_advisory_unlock(8675309)`)
+
+      const [initializationResult, refreshResult] = await Promise.allSettled([
+        initialization,
+        refresh,
+      ])
+      expect(initializationResult.status).toBe('fulfilled')
+      expect(refreshResult).toMatchObject({
+        status: 'fulfilled',
+        value: { kind: 'rotated' },
+      })
+      for (const result of [initializationResult, refreshResult]) {
+        if (result.status === 'rejected') {
+          expect(result.reason).not.toMatchObject({ code: '40P01' })
+        }
+      }
+    } finally {
+      await blocker.query(`select pg_advisory_unlock(8675309)`).catch(() => undefined)
+      blocker.release()
+      await migrationPool.query(`
+        drop trigger if exists test_pause_initialize_audit on media_app.audit_events;
+        drop function if exists media_app.test_pause_initialize_audit();
+      `)
+    }
   })
 
   it('does not call storage when the first transaction rolls back', async () => {
@@ -437,6 +665,9 @@ describe('upload initialization saga', () => {
       ids,
       repository,
       storage: storage.storage,
+      concurrency: {
+        acquirePart: () => Promise.reject(new Error('part upload is outside this test')),
+      },
     })
     const key = idempotencyKey(27)
 
@@ -607,7 +838,11 @@ function uploadRouteApp(
   },
 ) {
   const initializeUpload = vi.fn<UploadRouteService['initialize']>().mockResolvedValue(result)
-  const uploads: UploadRouteService = { initialize: initializeUpload }
+  const uploads: UploadRouteService = {
+    initialize: initializeUpload,
+    uploadPart: () => Promise.reject(new Error('part upload is outside this test')),
+    getDetail: () => Promise.reject(new Error('upload detail is outside this test')),
+  }
   const verifyAccessToken = vi
     .fn<AccessTokenVerifier['verifyAccessToken']>()
     .mockResolvedValue({ sub: userId, sid: sessionId })

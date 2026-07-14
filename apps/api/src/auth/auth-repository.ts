@@ -270,9 +270,10 @@ export class PostgresAuthRepository implements AuthRepository {
                 s.revoked_at, s.revoke_reason,
                 u.id, u.status, u.nickname, u.nickname_confirmed_at, u.created_at, u.updated_at
            from media_app.user_sessions s
-           join media_app.users u on u.id = s.user_id
+          join media_app.users u on u.id = s.user_id
           where s.refresh_token_hash = $1
-          for update of s, u`,
+          for no key update of s
+          for share of u`,
         [input.refreshTokenHash],
       )
       const row = selected.rows[0]
