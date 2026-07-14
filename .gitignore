@@ -1,1 +1,12 @@
+node_modules/
+dist/
+coverage/
+.DS_Store
 .worktrees/
+
+.env
+.env.*
+!.env.example
+
+apps/miniprogram/project.private.config.json
+apps/miniprogram/miniprogram/config.generated.ts
