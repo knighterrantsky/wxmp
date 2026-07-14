@@ -1,0 +1,28 @@
+CREATE ROLE wx_migrate
+  LOGIN
+  PASSWORD 'wx_migrate_local'
+  NOSUPERUSER
+  NOCREATEDB
+  NOCREATEROLE
+  NOINHERIT;
+
+CREATE ROLE wx_runtime
+  LOGIN
+  PASSWORD 'wx_runtime_local'
+  NOSUPERUSER
+  NOCREATEDB
+  NOCREATEROLE
+  NOINHERIT;
+
+CREATE ROLE wx_maintenance
+  LOGIN
+  PASSWORD 'wx_maintenance_local'
+  NOSUPERUSER
+  NOCREATEDB
+  NOCREATEROLE
+  NOINHERIT;
+
+CREATE DATABASE wx_upload OWNER wx_migrate;
+
+REVOKE ALL ON DATABASE wx_upload FROM PUBLIC;
+GRANT CONNECT ON DATABASE wx_upload TO wx_runtime, wx_maintenance;
