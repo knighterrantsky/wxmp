@@ -1,6 +1,6 @@
 # 微信小程序私有素材上传系统架构设计
 
-> 文档状态：待评审
+> 文档状态：已确认
 > 版本：1.0
 > 日期：2026-07-14
 > 关联文档：[接口设计](../../api/media-upload-api.md) · [数据库设计](../../database/media-upload-database.md)
@@ -219,6 +219,7 @@ progress = min(1,
 - 冷启动时先尝试重新打开原临时路径，并对所有已上传分片重新计算 SHA-256 与服务端记录逐片比对；全部匹配后才只上传缺失分片。路径失效或任一哈希不匹配时禁止复用旧会话：客户端以 `reason=replaced` 中止旧记录，要求用户重新选择、再次二次确认并创建全新的上传。
 - 同一 `uploadId + partNumber + SHA-256` 是自然幂等操作。相同内容重复提交返回已有结果。
 - `initiating/uploading` 会话在 24 小时后停止接受分片和 complete，并进入安全终止流程。已在截止前进入 `completing` 的会话不因年龄直接过期，必须先用 HEAD/ListParts 判断 R2 事实并收敛；上游结果未知时始终保持 `completing`。
+- 用户取消或超时清理先持久化为 `aborting`。后台 aborter 依据 `next_abort_at` 重试 R2 AbortMultipartUpload，使用最大 5 分钟 full-jitter；进程重启不丢任务，成功后按持久化原因投影为 `aborted` 或 `expired`。
 - R2 未完成 multipart 的 7 天自动终止策略作为服务端清理失败时的安全兜底。
 
 ### 7.6 上传记录
@@ -266,18 +267,19 @@ users/019bfae0-7b1a-7c32-a9fd-6dfb0ce51234/video/2026/07/019bfae2-1b5a-7890-b7ad
 ### 9.1 上传会话状态
 
 ```text
-initiating -> uploading -> completing -> completed
-     |           |             |
-     v           v             v
-   failed     aborting       failed
+initiating -> uploading <-> completing -> completed
+     |           |              |
+     v           v              v
+   failed     aborting        failed
                   |
-             aborted/expired
+          aborted/expired/failed(validation)
 ```
 
 `completing` 结果不确定时不能直接创建第二个对象。对账任务按固定 object key 执行 `HEAD`：
 
 - 对象存在且大小匹配：补齐数据库的 `completed/ready` 状态。
-- Multipart 仍存在：继续安全完成或回到可重试上传状态。
+- 对象存在但大小不匹配：标记不可恢复失败并发出高优先级告警；不自动删除该私有对象，也不在同 key 创建第二个对象。
+- Multipart 仍存在：继续安全完成；若 Complete 明确未成功且期限内确认缺片，则清空对应分片确认字段并回到可重试上传状态。
 - 对象和 multipart 均不存在：标记不可恢复失败。
 
 24 小时清理任务只扫描 `initiating/uploading`。`completing` 只有在 HEAD 明确对象不存在、ListParts 明确 multipart 尚未完成且上传截止时间已过时，才可转 `aborting`，成功终止 multipart 后投影为 `expired`；任何 R2 超时或结果未知都不得按年龄标记过期。
@@ -286,8 +288,8 @@ initiating -> uploading -> completing -> completed
 
 PostgreSQL 与 R2 没有分布式事务，系统使用 Saga + Reconciliation：
 
-- 初始化先在数据库占用幂等键和对象键，再创建 R2 multipart。
-- 若 R2 已创建 multipart 但 API 在保存 `r2_upload_id` 前崩溃，`initiating` 对账按唯一 object key 列出并终止对应 multipart；列举或终止持续失败时由 R2 7 天生命周期兜底。
+- 初始化先在数据库占用幂等键和对象键，并把会话 ID 关联到 `in_progress` 幂等记录，再创建 R2 multipart。
+- 若 R2 已创建 multipart 但 API 在保存 `r2_upload_id` 前崩溃，或 CreateMultipart 结果未知，`initiating` 对账按唯一 object key 列出并终止对应 multipart；事实确定后在同一短事务中收敛会话、媒体和幂等账本，列举或终止持续失败时由 R2 7 天生命周期兜底。
 - R2 分片成功但数据库写入失败时，重传同 part number 即可覆盖并恢复。
 - 完成前先把数据库切换到 `completing`，避免新分片进入。
 - 完成后用 `HEAD` 验证，再在单事务中更新媒体与上传会话。
@@ -331,6 +333,7 @@ PostgreSQL 与 R2 没有分布式事务，系统使用 Saga + Reconciliation：
 | 昵称缺失 | 上传初始化返回 `NICKNAME_REQUIRED`，不创建 R2 multipart |
 | 文件不足 12 bytes 或无法检查格式签名 | 客户端先阻止，服务端返回 `422 FILE_TOO_SMALL` |
 | 文件超过 200 MiB | 客户端先阻止，服务端返回 `413 FILE_TOO_LARGE` |
+| 首片 magic bytes 与 MIME/扩展名不符 | 返回 `415`，持久化 `validationFailed` 清理原因；安全终止 multipart 后记录为 `upload_failed` |
 | 分片网络中断 | 不计入已确认字节，重传同一 part number |
 | 分片哈希不符 | 返回 `PART_CHECKSUM_MISMATCH`，删除临时分片并重新读取 |
 | R2 UploadPart 超时 | 查询数据库状态后按相同 part number 重试 |

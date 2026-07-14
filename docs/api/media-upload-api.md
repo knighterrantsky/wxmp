@@ -1,6 +1,6 @@
 # 私有素材上传系统接口设计
 
-> 文档状态：待评审
+> 文档状态：已确认
 > 版本：v1
 > 日期：2026-07-14
 > 关联文档：[架构设计](../superpowers/specs/2026-07-14-wechat-private-media-upload-design.md) · [数据库设计](../database/media-upload-database.md)
@@ -27,7 +27,7 @@
 - JSON 请求最大 64 KiB；未知字段返回 `422 VALIDATION_ERROR`。
 - 所有包含身份或上传状态的响应设置 `Cache-Control: no-store`。
 
-所有成功与错误响应均遵循本节 JSON envelope；`204 No Content` 响应除外。
+所有业务 API 的成功与错误响应均遵循本节 JSON envelope；`204 No Content` 与供探针使用的 `/health/*` 裸响应除外。
 
 ### 2.2 成功响应
 
@@ -119,6 +119,7 @@ Idempotency-Key: 019bfae6-d170-76cc-9df3-c3f1624b789a
 - 同一 Key 和同一规范化请求返回首次稳定结果，并返回 `Idempotency-Replayed: true`。
 - 同一 Key 对应不同请求返回 `409 IDEMPOTENCY_KEY_REUSED`。
 - 首次请求仍执行时返回 `409 IDEMPOTENCY_IN_PROGRESS` 与 `Retry-After: 1`。
+- 对外部存储创建结果未知的初始化请求，账本保持 `in_progress` 并关联内部上传会话；后台对账只有在 R2 事实确定后，才把会话与账本一起收敛为稳定结果，避免同 Key 永久卡住。
 - 分片接口以 `uploadId + partNumber + chunkSha256` 自然幂等，不要求 Idempotency-Key。
 
 ## 3. 文件与上传限制
@@ -373,8 +374,9 @@ Idempotency-Key: 019bfae6-d170-76cc-9df3-c3f1624b789a
 初始化流程：
 
 1. 检查昵称、文件名、MIME、大小和活跃会话数量。
-2. 创建媒体记录、R2 object key 和 multipart upload。
-3. 返回固定分片计划；R2 multipart upload ID 和 object key 不返回客户端。
+2. 先在 PostgreSQL 中创建 `initiating` 媒体/会话并把会话 ID 关联到 `in_progress` 幂等记录，再在事务外创建 R2 multipart。
+3. R2 明确拒绝且确认未创建时，业务记录与幂等记录一起收敛为稳定失败；超时、网络中断或 5xx 导致结果未知时保持 `initiating + in_progress`，由 object key 对账并在事实确定后一起收口。
+4. 成功后返回固定分片计划；R2 multipart upload ID 和 object key 不返回客户端。
 
 响应 `201`：
 
@@ -461,6 +463,7 @@ wx.uploadFile({
 - 状态进入 `completing` 后不再接受分片。
 - `serverTime >= expiresAt` 时不再接受新分片，返回 `410 UPLOAD_EXPIRED` 并触发安全终止。
 - 服务端将文件字段流式写入 R2 `UploadPart`，不把整个分片转成进程级 Buffer。
+- 首片 magic bytes 与声明 MIME/扩展名不兼容时返回 `415 MIME_MISMATCH`，并持久化 `aborting + abort_reason=validationFailed`；后台安全终止 multipart 后记录变为 `upload_failed`。SHA-256 或长度不匹配只拒绝并重传当前 part，不终止整个会话。
 
 响应 `200`：
 
@@ -581,7 +584,7 @@ Idempotency-Key: 019bfae7-e281-75bb-aef4-d402735c89ab
 {}
 ```
 
-请求处理器只接受 `serverTime < expiresAt` 的 `uploading` 会话，校验数据库分片连续并把会话持久化为 `completing`。持久化后台 finalizer 每秒只扫描 `nextFinalizeAt` 已到期的候选，对 `uploadId` 取得 PostgreSQL session-level advisory lock 后，先 `HEAD` 固定对象键：对象已存在且大小正确时直接补齐数据库，否则依据数据库分片记录执行 `ListParts`、`CompleteMultipartUpload` 与最终 `HEAD`；客户端不提交 ETag 清单。失败次数、错误和下一次执行时间持久化，并以最大 5 分钟 full-jitter 退避。即使 API 进程在返回后退出，其他实例或重启后的扫描也会继续处理。
+请求处理器只接受 `serverTime < expiresAt` 的 `uploading` 会话，校验数据库分片连续并把会话持久化为 `completing`。若会话已到期，则在同一短事务中持久化 `aborting + abort_reason=expired + next_abort_at=now` 后返回 `410 UPLOAD_EXPIRED`。持久化后台 finalizer 每秒只扫描 `nextFinalizeAt` 已到期的候选，对 `uploadId` 取得 PostgreSQL session-level advisory lock 后，先 `HEAD` 固定对象键：对象已存在且大小正确时直接补齐数据库，否则依据数据库分片记录执行 `ListParts`、`CompleteMultipartUpload` 与最终 `HEAD`；客户端不提交 ETag 清单。失败次数、错误和下一次执行时间持久化，并以最大 5 分钟 full-jitter 退避。即使 API 进程在返回后退出，其他实例或重启后的扫描也会继续处理。
 
 正常响应 `202`：
 
@@ -608,6 +611,8 @@ Idempotency-Key: 019bfae7-e281-75bb-aef4-d402735c89ab
 
 完成后查询状态返回成功终态 `uploaded`。finalizing 时，GET 状态中的 `pollAfterSeconds` 根据下一次 finalizer 时间计算并限制在 2–30 秒；进入任一终态后返回 `pollAfterSeconds=null`，客户端停止轮询。分片不齐返回 `409 PARTS_INCOMPLETE`，`details.missingPartNumbers` 列出缺失片。
 
+若 `HEAD` 明确对象不存在、`ListParts` 明确 Complete 尚未成功并发现缺片/不匹配，且仍在写入期限内，finalizer 将受影响分片恢复为 `pending`，清空其已确认字段、重新汇总权威进度，并把会话恢复为 `uploading`。客户端重新上传这些分片；再次满足完成条件时必须生成新的 complete `Idempotency-Key`，因为上一完成周期的 Key 仍稳定重放其首次 `202`。若 `HEAD` 找到对象但大小与预期不符，则标记 `upload_failed` 和 `STORAGE_OBJECT_SIZE_MISMATCH`、写高优先级审计/告警并停止自动处理；系统不得删除该私有对象，也不得在同一 object key 创建第二个 multipart。
+
 ### 6.5 中止上传
 
 ```http
@@ -625,7 +630,7 @@ Idempotency-Key: 019bfae8-f392-74aa-bf05-e513846d9abc
 }
 ```
 
-`reason` 允许 `userCancelled` 或 `replaced`。仅 `initiating/uploading` 可以中止；该接口不删除已完成对象。
+`reason` 允许 `userCancelled` 或 `replaced`。仅 `initiating/uploading` 可以中止；该接口只持久化 `aborting` 调度，不在 HTTP 请求内等待 R2。后台 aborter 使用持久化 full-jitter 重试，最大间隔 5 分钟；进程重启后继续。该流程不删除已完成对象。
 
 响应 `202` 返回用户聚合状态 `status=cancelling`，最终查询为 `aborted`。已中止记录重复调用返回原结果。
 
@@ -698,10 +703,13 @@ uploading | finalizing | cancelling | uploaded | upload_failed | aborted | expir
 |---|---|---|
 | `uploading` | `finalizing` | 所有分片已确认并请求 complete |
 | `uploading` | `cancelling` | 用户中止或会话过期并开始清理 |
+| `uploading` | `cancelling` | 首片类型验证不可恢复失败，先安全终止 multipart |
 | `cancelling` | `aborted` | 用户中止清理完成 |
 | `cancelling` | `expired` | 超时会话清理完成 |
+| `cancelling` | `upload_failed` | 类型验证失败的 multipart 清理完成 |
 | `uploading` | `upload_failed` | 文件校验或 R2 分片不可恢复失败 |
 | `finalizing` | `uploaded` | R2 完成并 HEAD 验证成功 |
+| `finalizing` | `uploading` | HEAD 明确对象不存在、ListParts 明确 Complete 未成功、期限内发现缺片；GET 返回需补传的 `pending` 分片 |
 | `finalizing` | `upload_failed` | 对账确认不可恢复失败 |
 | `finalizing` | `cancelling` | HEAD 明确对象不存在、multipart 未完成且写入期限已过 |
 
@@ -727,6 +735,7 @@ uploading | finalizing | cancelling | uploaded | upload_failed | aborted | expir
 | 操作 | 服务端时限 |
 |---|---:|
 | 普通 JSON 接口 | 10 秒 |
+| complete/abort 获取上传独占门 | 最多 8 秒；超时返回可重试 `409 UPLOAD_BUSY` |
 | 微信 code2Session | 连接 2 秒，总时限 5 秒 |
 | 分片 POST | 请求空闲 30 秒，总时限 180 秒 |
 | R2 UploadPart | 150 秒 |
@@ -747,6 +756,7 @@ delay = random(0, min(2^retryIndex, 30)) seconds
 - `401 TOKEN_EXPIRED`：先刷新 Token；刷新失败则重新 `wx.login`。
 - 幂等接口重试必须复用原 Idempotency-Key。
 - `complete` 返回 202 后按 `pollAfterSeconds` 查询状态，不能不断使用新 Key 重提。
+- 仅当 finalizer 明确把会话从 `finalizing` 恢复为 `uploading` 并返回新的 `pending` 分片时，补传完成后的提交属于新的完成周期，客户端必须生成新的 complete Key。
 - `429` 和 `503` 返回整数秒 `Retry-After`。
 
 ## 9. 错误码
@@ -770,6 +780,7 @@ delay = random(0, min(2^retryIndex, 30)) seconds
 | 409 | `PARTS_INCOMPLETE` | 否 | 分片不完整 |
 | 409 | `UPLOAD_NOT_WRITABLE` | 否 | 当前状态不允许上传分片 |
 | 409 | `UPLOAD_NOT_ABORTABLE` | 否 | 当前状态不允许中止 |
+| 409 | `UPLOAD_BUSY` | 是 | 仍有分片请求占用上传门；复用原幂等 Key 稍后重试 |
 | 410 | `UPLOAD_EXPIRED` | 否 | 上传会话已过期 |
 | 413 | `FILE_TOO_LARGE` | 否 | 文件超过 200 MiB |
 | 413 | `PART_TOO_LARGE` | 否 | 请求分片超过上限 |

@@ -1,6 +1,6 @@
 # 私有素材上传系统数据库设计
 
-> 文档状态：待评审
+> 文档状态：已确认
 > 版本：1.0
 > 日期：2026-07-14
 > 数据库：PostgreSQL 17
@@ -374,6 +374,11 @@ CREATE TABLE upload_sessions (
   next_finalize_at         timestamptz,
   last_finalize_error_code varchar(64),
   last_finalize_error_at   timestamptz,
+  abort_reason             varchar(32),
+  abort_attempt_count      integer NOT NULL DEFAULT 0,
+  next_abort_at            timestamptz,
+  last_abort_error_code    varchar(64),
+  last_abort_error_at      timestamptz,
 
   expires_at               timestamptz NOT NULL,
   last_activity_at         timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -408,6 +413,25 @@ CREATE TABLE upload_sessions (
   ),
   CONSTRAINT ck_upload_finalize_error CHECK (
     (last_finalize_error_code IS NULL) = (last_finalize_error_at IS NULL)
+  ),
+  CONSTRAINT ck_upload_abort_attempts CHECK (abort_attempt_count >= 0),
+  CONSTRAINT ck_upload_abort_schedule CHECK (
+    (status = 'aborting') = (next_abort_at IS NOT NULL)
+  ),
+  CONSTRAINT ck_upload_abort_error CHECK (
+    (last_abort_error_code IS NULL) = (last_abort_error_at IS NULL)
+  ),
+  CONSTRAINT ck_upload_abort_reason CHECK (
+    abort_reason IS NULL OR abort_reason IN (
+      'userCancelled', 'replaced', 'expired', 'validationFailed'
+    )
+  ),
+  CONSTRAINT ck_upload_abort_reason_state CHECK (
+    (status = 'aborting' AND abort_reason IS NOT NULL)
+    OR (status = 'aborted' AND abort_reason IN ('userCancelled', 'replaced'))
+    OR (status = 'expired' AND abort_reason = 'expired')
+    OR (status = 'failed' AND (abort_reason IS NULL OR abort_reason = 'validationFailed'))
+    OR (status NOT IN ('aborting', 'aborted', 'expired', 'failed') AND abort_reason IS NULL)
   ),
   CONSTRAINT ck_upload_expiry CHECK (expires_at > created_at),
   CONSTRAINT ck_upload_r2_required CHECK (
@@ -447,6 +471,10 @@ CREATE INDEX ix_upload_finalize_due
   ON upload_sessions (next_finalize_at, id)
   WHERE status = 'completing';
 
+CREATE INDEX ix_upload_abort_due
+  ON upload_sessions (next_abort_at, id)
+  WHERE status = 'aborting';
+
 CREATE INDEX ix_upload_reconcile_stuck
   ON upload_sessions (status, last_activity_at, id)
   WHERE status IN ('initiating', 'completing', 'aborting');
@@ -454,7 +482,7 @@ CREATE INDEX ix_upload_reconcile_stuck
 
 每个媒体记录只对应一个上传会话。活跃会话内可重传分片；会话进入不可恢复的 `failed/aborted/expired` 后，用户重新上传会创建新的媒体记录和上传会话，旧记录保留在历史中。
 
-`last_activity_at` 在成功确认分片或进入 `completing/aborting` 时更新，用于判断状态持续时长；finalizer 的失败重试只更新 `next_finalize_at` 和错误字段，不推进 `last_activity_at`，否则会掩盖长期卡住告警。
+`last_activity_at` 在成功确认分片或进入 `completing/aborting` 时更新，用于判断状态持续时长；finalizer/aborter 的失败重试只更新各自的 `next_*_at` 和错误字段，不推进 `last_activity_at`，否则会掩盖长期卡住告警。
 
 ### 5.6 上传分片
 
@@ -564,7 +592,7 @@ CREATE TABLE idempotency_records (
 CREATE INDEX ix_idempotency_expiry ON idempotency_records (expires_at);
 ```
 
-`request_hash` 是规范化请求的 SHA-256。同 Key 与同 hash 重放稳定结果；同 Key 与不同 hash 返回 409。`response_body` 只保存可安全重放的普通 JSON，不得包含 Token、openid、object key、R2 凭据或文件内容。
+`request_hash` 是规范化请求的 SHA-256。同 Key 与同 hash 重放稳定结果；同 Key 与不同 hash 返回 409。`response_body` 只保存可安全重放的普通 JSON，不得包含 Token、openid、object key、R2 凭据或文件内容。`in_progress` 的 `expires_at` 不能作为直接删除依据；账本转为 `completed/failed` 的同一事务把 `expires_at` 重设为 `serverTime + 7 days`，保证稳定结果从收敛时刻起完整保留 7 天。
 
 ### 5.8 审计事件
 
@@ -671,7 +699,7 @@ aborting   -> aborted | expired | failed
 
 `completing -> uploading` 只允许在 `ListParts` 确认缺片、R2 Complete 尚未成功且写入期限仍有效时发生。`completing -> aborting` 只允许在 HEAD 明确对象不存在、ListParts 明确 multipart 未完成且写入期限已过时发生。R2 完成结果未知时必须保持 `completing`，不得仅按年龄转为 `aborting/expired`。
 
-进入 `completing` 必须设置 `next_finalize_at`；离开 `completing` 的同一状态更新必须清空该字段。`finalize_attempt_count` 和最后错误可保留用于运维审计。
+进入 `completing` 必须设置 `next_finalize_at`；离开 `completing` 的同一状态更新必须清空该字段。进入 `aborting` 必须设置 `abort_reason` 与 `next_abort_at`；离开 `aborting` 时清空 `next_abort_at`，但保留原因和尝试摘要用于审计。`finalize_attempt_count`、`abort_attempt_count` 和最后错误可保留用于运维审计。
 
 ### 6.2 媒体存储
 
@@ -690,7 +718,10 @@ aborted        -> purged
 pending  -> uploaded
 uploaded -> uploaded   # 相同 part number 合法重传
 uploaded -> verified
+uploaded -> pending    # 仅 finalizer 在期限内确认 R2 缺片/不匹配后修复
 ```
+
+`uploaded -> pending` 只能发生在会话仍为 `completing`、`HEAD` 明确完整对象不存在、`ListParts` 明确 Complete 尚未成功且写入期限仍有效时。转换事务必须清空该分片的 `actual_size_bytes`、`checksum_sha256`、`r2_etag`、`uploaded_at`、`verified_at`，保留 `attempt_count`，再从剩余 `uploaded/verified` 行重新计算会话确认字节数和分片数，并把会话恢复为 `uploading`。客户端看到这些 `pending` 分片后重新读取原文件并上传；再次满足完成条件时，这是新的完成周期，必须使用新的 complete `Idempotency-Key`，而不是重放上一周期已经稳定返回的 `202`。
 
 `verified` 分片不可再修改。状态转换必须使用带当前状态与 `row_version` 的条件更新，不能先读后无条件写。
 
@@ -714,14 +745,16 @@ uploaded -> verified
 3. 插入 `media_objects(pending_upload)` 与 `upload_sessions(initiating)`。
 4. 写审计并提交。
 
-事务外调用 R2 `CreateMultipartUpload`。成功后第二事务：
+第一事务还要把新会话 ID 写入幂等记录的 `resource_id`，使崩溃恢复可以同时收敛业务记录与幂等账本。事务外调用 R2 `CreateMultipartUpload`。成功后第二事务：
 
 1. 锁定上传会话。
 2. 写入 `r2_upload_id` 并转为 `uploading`。
 3. 插入 1–25 行 `upload_parts(pending)`。
 4. 完成幂等记录并提交。
 
-R2 成功而第二事务前崩溃时，数据库还没有 `r2_upload_id`。initiating 对账任务使用已经持久化且全局唯一的 object key 调用 `ListMultipartUploads`，终止该 key 下与本次创建时间匹配的 multipart，再把数据库状态恢复为可解释终态；列举或终止持续失败时由 R2 默认 7 天未完成上传生命周期兜底。对账不得为同一 session 再创建第二个 multipart。
+R2 明确拒绝且可确定 multipart 未创建时，在短事务中把会话/媒体与对应幂等记录一起写成稳定失败。R2 超时、网络中断或 5xx 等创建结果未知时，保持 `initiating + in_progress`，返回可重试错误并交给 initiating 对账，不能直接声称创建失败。
+
+R2 成功而第二事务前崩溃，或 CreateMultipart 结果未知时，数据库还没有 `r2_upload_id`。initiating 对账任务使用已经持久化且全局唯一的 object key 调用 `ListMultipartUploads`：找到与本次创建时间匹配的 multipart 时先终止；明确不存在时直接收口；之后在同一短事务中把会话/媒体转为可解释失败，并把关联的 `in_progress` 幂等记录写成可稳定重放的失败响应、清空 `locked_until`。列举或终止结果未知时保持两者原状态并重试；列举或终止持续失败时由 R2 默认 7 天未完成上传生命周期兜底。对账不得为同一 session 再创建第二个 multipart，也不得让同 Key 永久停留在 `IDEMPOTENCY_IN_PROGRESS`。
 
 ### 7.3 上传分片
 
@@ -744,7 +777,15 @@ R2 成功而第二事务前崩溃时，数据库还没有 `r2_upload_id`。initi
    - 写审计并提交。
 6. R2 请求超时且结果未知时保留 `completing`。对账任务先 HEAD 固定 object key，再决定补齐成功、继续完成或在取得确定证据后标记失败；进程重启后沿用持久化的退避计划。
 
-### 7.5 Refresh Token 轮换
+### 7.5 中止 multipart
+
+1. 用户中止事务只锁定仍为 `initiating/uploading` 的会话，写 `status=aborting`、请求原因、`abort_attempt_count=0`、`next_abort_at=now` 与审计事件后提交；HTTP 随即返回 `202 cancelling`。
+2. 超时清理以相同方式写入 `abort_reason=expired`。`completing` 必须先按 R2 事实对账，不能直接进入本流程。
+3. 持久化 aborter 扫描到期记录并对 `uploadId` 取得 session-level advisory lock。没有 `r2_upload_id` 时直接收口；否则在事务外调用 AbortMultipartUpload。R2 返回“upload 不存在”也按成功清理处理。
+4. 可重试错误增加 `abort_attempt_count`，写错误摘要，并用最大 300 秒 full-jitter 更新 `next_abort_at`；明确的权限/配置错误同样保持 `aborting`，固定 300 秒后再检查并触发高优先级告警，等待运维修复凭据或策略。任何 Abort 失败都不能伪装成清理完成，也不能让 worker 停止对账；进程重启后继续。
+5. 清理成功后在短事务中按原因收口：`userCancelled/replaced -> aborted`、`expired -> expired`、`validationFailed -> failed`。最后一种必须同时写预先保存的安全 `failure_code/failed_at` 并把媒体转为 `failed`。所有分支清空 `next_abort_at`、同步媒体状态并写审计。完整 R2 对象已经存在时不得走中止流程。
+
+### 7.6 Refresh Token 轮换
 
 1. 按 `refresh_token_hash` 锁定旧会话。
 2. 验证未过期、未撤销、未使用。
