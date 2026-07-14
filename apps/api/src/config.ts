@@ -25,6 +25,12 @@ export interface RuntimeConfig {
     secretAccessKey: string
     forcePathStyle: boolean
   }
+  server: {
+    host: '127.0.0.1' | '0.0.0.0' | '::1' | '::'
+    port: number
+    monitoringToken: string
+    trustProxy: false | 1
+  }
 }
 
 export interface MigrationConfig {
@@ -38,9 +44,11 @@ export interface MaintenanceConfig {
 }
 
 const DEFAULT_WECHAT_ENDPOINT = 'https://api.weixin.qq.com/sns/jscode2session'
-const PLACEHOLDER_PATTERN = /(?:change[-_ ]?me|example|placeholder|replace[-_ ]?me|temporary)/i
+const PLACEHOLDER_PATTERN =
+  /(?:change[-_ ]?me|example|local[-_ ]?monitor[-_ ]?token|placeholder|replace[-_ ]?(?:me|with)|temporary|use[-_ ]?(?:a[-_ ]?)?random[-_ ]?value)/i
 const ROLE_PATTERN = /^[A-Za-z_][A-Za-z0-9_$]{0,62}$/
 const BUCKET_PATTERN = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/
+const SERVER_HOSTS = ['127.0.0.1', '0.0.0.0', '::1', '::'] as const
 
 function invalid(name: string): never {
   throw new Error(`Invalid configuration: ${name}`)
@@ -105,6 +113,34 @@ function booleanValue(env: Environment, name: string, fallback: boolean): boolea
   return invalid(name)
 }
 
+function serverConfig(env: Environment, nodeEnv: NodeEnvironment): RuntimeConfig['server'] {
+  const candidateHost = env['HOST'] ?? '127.0.0.1'
+  const host = SERVER_HOSTS.find((value) => value === candidateHost)
+  if (host === undefined) invalid('HOST')
+
+  const portValue = env['PORT'] ?? '3000'
+  if (!/^\d{1,5}$/u.test(portValue)) invalid('PORT')
+  const port = Number(portValue)
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) invalid('PORT')
+
+  const trustProxyValue = env['TRUST_PROXY'] ?? 'false'
+  if (trustProxyValue !== 'false' && trustProxyValue !== '1') invalid('TRUST_PROXY')
+
+  const monitoringToken =
+    nodeEnv === 'test'
+      ? (env['MONITORING_TOKEN'] ?? 'test-only-monitoring-token')
+      : nodeEnv === 'production'
+        ? nonPlaceholder(env, 'MONITORING_TOKEN', 32)
+        : required(env, 'MONITORING_TOKEN')
+
+  return {
+    host,
+    port,
+    monitoringToken,
+    trustProxy: trustProxyValue === '1' ? 1 : false,
+  }
+}
+
 function endpointUrl(value: string, name: string): URL {
   try {
     return new URL(value)
@@ -162,6 +198,7 @@ function validateEd25519Keys(privateKey: string, publicKey: string): void {
 
 export function loadRuntimeConfig(env: Environment): RuntimeConfig {
   const nodeEnv = nodeEnvironment(env)
+  const server = serverConfig(env, nodeEnv)
   const runtimeDatabaseUrl = databaseUrl(env, 'DATABASE_URL')
   const authMode = wechatAuthMode(env)
   const endpoint = env['WECHAT_CODE2SESSION_ENDPOINT'] ?? DEFAULT_WECHAT_ENDPOINT
@@ -194,6 +231,7 @@ export function loadRuntimeConfig(env: Environment): RuntimeConfig {
         secretAccessKey: env['R2_SECRET_ACCESS_KEY'] ?? '',
         forcePathStyle,
       },
+      server,
     }
   }
 
@@ -264,6 +302,7 @@ export function loadRuntimeConfig(env: Environment): RuntimeConfig {
       secretAccessKey,
       forcePathStyle,
     },
+    server,
   }
 }
 

@@ -773,6 +773,7 @@ delay = random(0, min(2^retryIndex, 30)) seconds
 | 401 | `WECHAT_CODE_INVALID` | 否 | 微信 code 无效或已使用 |
 | 403 | `USER_DISABLED` | 否 | 用户被禁用 |
 | 404 | `UPLOAD_NOT_FOUND` | 否 | 上传不存在或不属于用户 |
+| 404 | `ROUTE_NOT_FOUND` | 否 | 请求的接口不存在 |
 | 409 | `IDEMPOTENCY_KEY_REUSED` | 否 | 同 Key 请求内容不同 |
 | 409 | `IDEMPOTENCY_IN_PROGRESS` | 是 | 原幂等请求仍在执行 |
 | 409 | `FIRST_PART_REQUIRED` | 否 | 首片尚未验证 |
@@ -783,6 +784,7 @@ delay = random(0, min(2^retryIndex, 30)) seconds
 | 409 | `UPLOAD_BUSY` | 是 | 仍有分片请求占用上传门；复用原幂等 Key 稍后重试 |
 | 410 | `UPLOAD_EXPIRED` | 否 | 上传会话已过期 |
 | 413 | `FILE_TOO_LARGE` | 否 | 文件超过 200 MiB |
+| 413 | `PAYLOAD_TOO_LARGE` | 否 | JSON 请求体超过 64 KiB |
 | 413 | `PART_TOO_LARGE` | 否 | 请求分片超过上限 |
 | 415 | `FILE_TYPE_NOT_ALLOWED` | 否 | 类型不在白名单 |
 | 415 | `MIME_MISMATCH` | 否 | MIME、扩展名和 magic bytes 不匹配 |

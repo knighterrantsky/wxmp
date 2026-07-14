@@ -7,9 +7,15 @@
     "build": "node --input-type=module --eval \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "db:migrate": "pnpm build && node dist/db/migrate.js"
+    "db:migrate": "pnpm build && node dist/db/migrate.js",
+    "start": "node dist/server.js"
   },
   "dependencies": {
+    "@fastify/rate-limit": "11.1.0",
+    "@wx-upload/contracts": "workspace:*",
+    "fastify": "5.10.0",
+    "pino": "10.3.1",
+    "prom-client": "15.1.3",
     "pg": "8.16.3"
   },
   "devDependencies": {

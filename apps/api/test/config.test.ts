@@ -21,6 +21,10 @@ const productionEnv = {
   R2_ACCESS_KEY_ID: 'r2-production-access-key-id',
   R2_SECRET_ACCESS_KEY: 'r2-production-secret-access-key-value',
   R2_FORCE_PATH_STYLE: 'false',
+  HOST: '127.0.0.1',
+  PORT: '3000',
+  MONITORING_TOKEN: 'production-monitor-token-at-least-32-characters',
+  TRUST_PROXY: '1',
 } satisfies Record<string, string>
 
 const developmentStubEnv = {
@@ -141,6 +145,12 @@ describe('runtime production safety', () => {
     expect(config.wechat.connectTimeoutMs).toBe(2_000)
     expect(config.wechat.totalTimeoutMs).toBe(5_000)
     expect(config.r2.forcePathStyle).toBe(false)
+    expect(config.server).toEqual({
+      host: '127.0.0.1',
+      port: 3000,
+      monitoringToken: 'production-monitor-token-at-least-32-characters',
+      trustProxy: 1,
+    })
   })
 
   it.each([
@@ -161,6 +171,24 @@ describe('runtime production safety', () => {
     ['R2_FORCE_PATH_STYLE', 'true'],
     ['JWT_PRIVATE_KEY', 'temporary-development-key'],
     ['JWT_PUBLIC_KEY', 'temporary-development-key'],
+    ['HOST', 'api.internal.example'],
+    ['PORT', '0'],
+    ['PORT', '65536'],
+    ['TRUST_PROXY', 'true'],
+    ['TRUST_PROXY', 'loopback'],
+    ['TRUST_PROXY', '0'],
+    ['TRUST_PROXY', '2'],
+    ['TRUST_PROXY', '-1'],
+    ['TRUST_PROXY', '1.0'],
+    ['TRUST_PROXY', '01'],
+    ['TRUST_PROXY', '127.0.0.1'],
+    ['TRUST_PROXY', '172.16.0.0/12'],
+    ['TRUST_PROXY', '0.0.0.0/0'],
+    ['TRUST_PROXY', '::/0'],
+    ['MONITORING_TOKEN', 'change-me'],
+    ['MONITORING_TOKEN', 'local-monitor-token-use-a-random-value'],
+    ['MONITORING_TOKEN', 'replace-with-random-monitoring-token'],
+    ['MONITORING_TOKEN', 'use-a-random-value-use-a-random-value'],
   ])('rejects unsafe production %s', (name, value) => {
     expect(() => loadRuntimeConfig({ ...productionEnv, [name]: value })).toThrow(new RegExp(name))
   })
@@ -187,6 +215,7 @@ describe('runtime production safety', () => {
       'R2_BUCKET',
       'R2_ACCESS_KEY_ID',
       'R2_SECRET_ACCESS_KEY',
+      'MONITORING_TOKEN',
     ]) {
       const env = Object.fromEntries(Object.entries(productionEnv).filter(([key]) => key !== name))
       expect(() => loadRuntimeConfig(env), name).toThrow(new RegExp(name))

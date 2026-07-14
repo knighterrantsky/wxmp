@@ -4,6 +4,8 @@ import { ResponseMetaSchema, strictObject } from './envelope.js'
 
 export const ERROR_CODES = [
   'INVALID_JSON',
+  'PAYLOAD_TOO_LARGE',
+  'ROUTE_NOT_FOUND',
   'INVALID_CURSOR',
   'IDEMPOTENCY_KEY_REQUIRED',
   'UNAUTHORIZED',
