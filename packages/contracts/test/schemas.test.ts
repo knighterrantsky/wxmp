@@ -194,6 +194,12 @@ describe('public request schemas', () => {
     expect(Value.Check(CompleteUploadRequestSchema, { etags: [] })).toBe(false)
   })
 
+  it('rejects a device identifier that PostgreSQL cannot store', () => {
+    expect(
+      Value.Check(WechatLoginRequestSchema, { ...loginRequest, deviceId: 'device\u0000id' }),
+    ).toBe(false)
+  })
+
   it('rejects unsupported MIME and out-of-range file sizes', () => {
     expect(
       Value.Check(InitializeUploadRequestSchema, {

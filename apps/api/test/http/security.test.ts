@@ -46,13 +46,13 @@ describe('HTTP security policy', () => {
   it('sets no-store on identity and upload success and error responses', async () => {
     const app = buildApp(fakeDependencies())
     apps.push(app)
-    app.get('/v1/profile', () => ({ ok: true }))
+    app.get('/v1/profile/test-fixture', () => ({ ok: true }))
     app.get('/v1/uploads/test', () => {
       throw new Error('private failure')
     })
 
     const responses = await Promise.all([
-      app.inject({ method: 'GET', url: '/v1/profile' }),
+      app.inject({ method: 'GET', url: '/v1/profile/test-fixture' }),
       app.inject({ method: 'GET', url: '/v1/uploads/test' }),
       app.inject({ method: 'GET', url: '/v1/auth/missing' }),
     ])
@@ -64,6 +64,7 @@ describe('HTTP security policy', () => {
 
   it.each([
     ['login', 10, 'ip'],
+    ['refresh', 30, 'ip'],
     ['ordinary', 120, 'user'],
     ['initialize', 10, 'user'],
     ['history', 60, 'user'],
@@ -77,6 +78,7 @@ describe('HTTP security policy', () => {
 
   it.each([
     ['login', 10],
+    ['refresh', 30],
     ['ordinary', 120],
     ['initialize', 10],
     ['history', 60],

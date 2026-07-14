@@ -210,7 +210,7 @@ Content-Type: application/json
 - `code` 长度 1–128，后端使用固定 AppID 与 AppSecret 调用微信 `code2Session`。
 - 按 `(appId, openid)` 查询或创建内部用户。
 - 登录请求失败且结果未知时，客户端重新调用 `wx.login` 获取新 code。
-- `deviceId` 是客户端生成的不透明安装标识，长度 1–128，仅用于会话风控，不是用户身份。
+- `deviceId` 是客户端生成的不透明安装标识，长度 1–128，不得包含 `U+0000`；它仅用于会话风控，不是用户身份。
 
 响应 `200`：
 
@@ -731,6 +731,8 @@ uploading | finalizing | cancelling | uploaded | upload_failed | aborted | expir
 `stage` 只能为 `validation`、`upload` 或 `storage`。
 
 ## 8. 超时、并发与重试
+
+微信登录按 IP 限制为 10 次/分钟，令牌刷新使用独立配额按 IP 限制为 30 次/分钟；两者不共享计数器。
 
 | 操作 | 服务端时限 |
 |---|---:|

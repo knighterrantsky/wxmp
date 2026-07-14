@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 
-import type { AppDependencies } from '../app.js'
+import type { AppShellDependencies } from '../app.js'
 import { ApiError } from '../http/errors.js'
 import { isMonitoringTokenValid } from '../http/security.js'
 
@@ -27,7 +27,7 @@ async function safeProbe(
   }
 }
 
-async function readinessWithinDeadline(deps: AppDependencies): Promise<boolean> {
+async function readinessWithinDeadline(deps: AppShellDependencies): Promise<boolean> {
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | undefined
   const deadline = new Promise<readonly [false, false]>((resolve) => {
@@ -50,7 +50,7 @@ async function readinessWithinDeadline(deps: AppDependencies): Promise<boolean> 
   }
 }
 
-export function registerHealthRoutes(app: FastifyInstance, deps: AppDependencies): void {
+export function registerHealthRoutes(app: FastifyInstance, deps: AppShellDependencies): void {
   app.get('/health/live', () => ({ status: 'ok' }))
 
   app.get('/health/ready', async (request, reply) => {

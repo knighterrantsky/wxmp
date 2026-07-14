@@ -6,7 +6,7 @@ import type { FastifyInstance, FastifyRequest, preHandlerAsyncHookHandler } from
 import { ApiError } from './errors.js'
 import { authenticatedUserId } from './request-context.js'
 
-export type RateLimitPolicyName = 'login' | 'ordinary' | 'initialize' | 'history'
+export type RateLimitPolicyName = 'login' | 'refresh' | 'ordinary' | 'initialize' | 'history'
 export type RateLimitIdentity = 'ip' | 'user'
 
 export interface RateLimitPolicy {
@@ -22,6 +22,7 @@ const POLICIES: Readonly<
   Record<RateLimitPolicyName, { max: number; identity: RateLimitIdentity }>
 > = {
   login: { max: 10, identity: 'ip' },
+  refresh: { max: 30, identity: 'ip' },
   ordinary: { max: 120, identity: 'user' },
   initialize: { max: 10, identity: 'user' },
   history: { max: 60, identity: 'user' },
@@ -51,6 +52,7 @@ function createRateLimitPolicy(name: RateLimitPolicyName): RateLimitPolicy {
 
 const RATE_LIMIT_POLICIES: Readonly<Record<RateLimitPolicyName, RateLimitPolicy>> = {
   login: createRateLimitPolicy('login'),
+  refresh: createRateLimitPolicy('refresh'),
   ordinary: createRateLimitPolicy('ordinary'),
   initialize: createRateLimitPolicy('initialize'),
   history: createRateLimitPolicy('history'),

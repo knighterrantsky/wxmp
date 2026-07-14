@@ -1,10 +1,15 @@
+import { generateKeyPairSync } from 'node:crypto'
 import { pathToFileURL } from 'node:url'
 
 import { buildApp } from './app.js'
+import { Ed25519TokenService } from './auth/token-service.js'
+import type { WechatGateway } from './auth/wechat-gateway.js'
+import { WechatHttpGateway } from './auth/wechat-http-gateway.js'
+import { WechatStubGateway } from './auth/wechat-stub-gateway.js'
 import { loadRuntimeConfig, type Environment, type RuntimeConfig } from './config.js'
 import { createPool } from './db/pool.js'
-import { createSecureIdGenerator } from './lib/id.js'
 import { systemClock } from './lib/clock.js'
+import { createSecureIdGenerator, type IdGenerator } from './lib/id.js'
 import { createProductionLogger } from './observability/logger.js'
 import { Metrics } from './observability/metrics.js'
 
@@ -123,6 +128,44 @@ function configuredSecrets(config: RuntimeConfig): string[] {
   ].filter((value) => value !== '')
 }
 
+export function createConfiguredWechatGateway(config: RuntimeConfig['wechat']): WechatGateway {
+  if (config.authMode === 'stub') return new WechatStubGateway()
+  return new WechatHttpGateway({
+    appId: config.appId,
+    appSecret: config.appSecret,
+    endpoint: config.endpoint,
+    connectTimeoutMs: config.connectTimeoutMs,
+    totalTimeoutMs: config.totalTimeoutMs,
+  })
+}
+
+function developmentSigningKeys(config: RuntimeConfig): {
+  privateKey: string
+  publicKey: string
+} {
+  const temporary = 'temporary-development-key'
+  const mayGenerate = config.nodeEnv !== 'production'
+  const privateIsTemporary = config.jwt.privateKey === '' || config.jwt.privateKey === temporary
+  const publicIsTemporary = config.jwt.publicKey === '' || config.jwt.publicKey === temporary
+  if (mayGenerate && privateIsTemporary && publicIsTemporary) {
+    const pair = generateKeyPairSync('ed25519')
+    return {
+      privateKey: pair.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString(),
+      publicKey: pair.publicKey.export({ format: 'pem', type: 'spki' }).toString(),
+    }
+  }
+  return { privateKey: config.jwt.privateKey, publicKey: config.jwt.publicKey }
+}
+
+export function createConfiguredTokenService(config: RuntimeConfig, ids: IdGenerator) {
+  const keys = developmentSigningKeys(config)
+  return new Ed25519TokenService({
+    ...keys,
+    clock: systemClock,
+    ids,
+  })
+}
+
 export function createServerRuntime(config: RuntimeConfig) {
   const logger = createProductionLogger({
     environment: config.nodeEnv,
@@ -132,6 +175,7 @@ export function createServerRuntime(config: RuntimeConfig) {
   const pool = createPool(config.databaseUrl, (error) => {
     logger.error({ err: error, errorCode: 'POSTGRES_IDLE_CLIENT_ERROR' }, 'database pool error')
   })
+  const ids = createSecureIdGenerator(systemClock)
   const app = buildApp({
     pool,
     readiness: {
@@ -140,11 +184,14 @@ export function createServerRuntime(config: RuntimeConfig) {
       objectStorage: () => Promise.resolve(false),
     },
     clock: systemClock,
-    ids: createSecureIdGenerator(systemClock),
+    ids,
     logger,
     metrics: new Metrics(),
     monitoringToken: config.server.monitoringToken,
     trustProxy: config.server.trustProxy,
+    wechatAppId: config.wechat.appId,
+    wechatGateway: createConfiguredWechatGateway(config.wechat),
+    tokenService: createConfiguredTokenService(config, ids),
   })
   return { app, pool }
 }

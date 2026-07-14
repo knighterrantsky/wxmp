@@ -5,7 +5,7 @@ import { PublicUserSchema } from './profile.js'
 
 export const WechatLoginRequestSchema = strictObject({
   code: Type.String({ minLength: 1, maxLength: 128 }),
-  deviceId: Type.String({ minLength: 1, maxLength: 128 }),
+  deviceId: Type.String({ minLength: 1, maxLength: 128, pattern: '^[^\\u0000]+$' }),
 })
 
 export const TokenPairSchema = strictObject({
