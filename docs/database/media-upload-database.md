@@ -11,12 +11,13 @@
 1. 内部主键使用应用生成的 UUIDv7。数据库将其视为不透明 UUID。
 2. 微信 `openid` 的唯一范围是小程序 AppID，因此身份唯一键为 `(provider, app_id, openid)`。
 3. 昵称可以为空直到首次上传确认，可以重复和修改，不能用于授权或对象路径。
-4. 媒体对象、上传会话、分片和采集任务分别建模，避免一个状态字段承担多套状态机。
+4. 媒体对象、上传会话和分片分别建模，避免一个状态字段承担多套状态机。
 5. 原文件名只用于展示；R2 object key 必须由服务端生成。
 6. 单文件范围为 `12 bytes` 至 `200 MiB = 209,715,200 bytes`；分片固定为 `8 MiB = 8,388,608 bytes`，最多 25 片。
 7. PostgreSQL 与 R2 不存在分布式事务，使用幂等操作、固定对象键和对账任务恢复。
-8. R2 Multipart ETag 不能当作完整文件 MD5；完整 SHA-256 由采集服务器下载后计算。
-9. 完整媒体对象和采集结果首版不自动删除；任何物理删除都必须是后续明确审批的管理操作。
+8. R2 Multipart ETag 不能当作完整文件 MD5；首版仅保存每个分片的 SHA-256，并以 ListParts/HEAD 校验分片 ETag、大小和最终对象大小，不宣称已经得到完整文件的 SHA-256。
+9. 完整媒体对象首版不自动删除；任何物理删除都必须是后续明确审批的管理操作。
+10. 未来 QNAP NAS 与 R2 的自动同步、同步凭据、计划任务、同步状态、完整性校验及同步后的删除策略不属于当前版本；当前表不为其预留字段。
 
 ## 2. 状态定义
 
@@ -53,24 +54,12 @@
 
 API 详情可返回 `pending | uploaded | verified`。客户端只在会话仍为 `uploading` 时重传 `pending`；`uploaded` 与 `verified` 均不得重传。
 
-### 2.4 采集任务状态
-
-| 状态 | 含义 |
-|---|---|
-| `queued` | 可以立即领取 |
-| `leased` | 已被采集服务器持有有效租约 |
-| `retry_wait` | 失败后等待下一次领取 |
-| `succeeded` | 已确认最终采集成功 |
-| `dead` | 不可重试或达到 5 次上限 |
-| `cancelled` | 由受控管理操作取消；首版用户端不产生此状态 |
-
-### 2.5 用户聚合状态
+### 2.4 用户聚合状态
 
 用户接口不直接返回上述数据库状态组合，而是投影为：
 
 ```text
-uploading | finalizing | cancelling | awaiting_collection | collecting | collected |
-upload_failed | collection_failed | aborted | expired
+uploading | finalizing | cancelling | uploaded | upload_failed | aborted | expired
 ```
 
 聚合逻辑：
@@ -80,12 +69,8 @@ upload_failed | collection_failed | aborted | expired
 | upload session 为 initiating/uploading | `uploading` |
 | upload session 为 completing | `finalizing` |
 | upload session 为 aborting | `cancelling` |
-| media ready 且 job queued/retry_wait | `awaiting_collection` |
-| job leased | `collecting` |
-| job succeeded | `collected` |
+| upload session 为 completed 且 media 为 ready | `uploaded` |
 | upload/media failed | `upload_failed` |
-| job dead | `collection_failed` |
-| job cancelled | `collection_failed`，失败码为 `COLLECTION_CANCELLED_BY_ADMIN` |
 | upload aborted | `aborted` |
 | upload expired | `expired` |
 
@@ -98,8 +83,6 @@ erDiagram
     USERS ||--o{ MEDIA_OBJECTS : uploads
     MEDIA_OBJECTS ||--o{ UPLOAD_SESSIONS : attempts
     UPLOAD_SESSIONS ||--|{ UPLOAD_PARTS : contains
-    MEDIA_OBJECTS ||--o| COLLECTOR_JOBS : produces
-    COLLECTOR_CREDENTIALS ||--o{ COLLECTOR_JOBS : leases
     USERS o|--o{ AUDIT_EVENTS : acts
     USER_SESSIONS o|--o{ AUDIT_EVENTS : originates
 ```
@@ -116,8 +99,6 @@ erDiagram
 | `media_objects` | 原始素材与 R2 完整对象元数据 |
 | `upload_sessions` | 一次 R2 multipart 上传会话 |
 | `upload_parts` | 计划分片及服务端确认结果 |
-| `collector_credentials` | 采集服务器 API Key 摘要与 scope |
-| `collector_jobs` | 采集任务、租约、重试及结果 |
 | `idempotency_records` | 跨请求幂等账本 |
 | `audit_events` | 不可变业务审计事件 |
 
@@ -128,8 +109,6 @@ erDiagram
 ### 5.1 扩展、Schema 与枚举
 
 ```sql
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
 CREATE SCHEMA IF NOT EXISTS media_app;
 SET search_path = media_app, public;
 
@@ -158,20 +137,12 @@ CREATE TYPE upload_part_status AS ENUM (
   'pending', 'uploaded', 'verified'
 );
 
-CREATE TYPE collector_job_status AS ENUM (
-  'queued', 'leased', 'retry_wait', 'succeeded', 'dead', 'cancelled'
-);
-
-CREATE TYPE credential_status AS ENUM (
-  'active', 'revoked', 'expired'
-);
-
 CREATE TYPE idempotency_status AS ENUM (
   'in_progress', 'completed', 'failed'
 );
 
 CREATE TYPE audit_actor_type AS ENUM (
-  'user', 'collector', 'system', 'admin'
+  'user', 'system', 'admin'
 );
 ```
 
@@ -302,11 +273,9 @@ CREATE TABLE media_objects (
   r2_bucket                   varchar(255) COLLATE "C" NOT NULL,
   object_key                  varchar(1024) COLLATE "C" NOT NULL,
   object_etag                 varchar(1024),
-  checksum_sha256             bytea,
 
   create_idempotency_key      varchar(128) COLLATE "C" NOT NULL,
   uploaded_at                 timestamptz,
-  collected_at                timestamptz,
   failed_at                   timestamptz,
   failure_code                varchar(64),
   purged_at                   timestamptz,
@@ -349,9 +318,6 @@ CREATE TABLE media_objects (
     AND object_key !~ '(^/|[[:cntrl:]])'
     AND object_key !~ '(^|/)\.\.(/|$)'
   ),
-  CONSTRAINT ck_media_checksum CHECK (
-    checksum_sha256 IS NULL OR octet_length(checksum_sha256) = 32
-  ),
   CONSTRAINT ck_media_ready_fields CHECK (
     storage_status <> 'ready'
     OR (
@@ -367,9 +333,6 @@ CREATE TABLE media_objects (
   ),
   CONSTRAINT ck_media_purged CHECK (
     (storage_status = 'purged') = (purged_at IS NOT NULL)
-  ),
-  CONSTRAINT ck_media_collected_after_upload CHECK (
-    collected_at IS NULL OR (uploaded_at IS NOT NULL AND collected_at >= uploaded_at)
   ),
   CONSTRAINT ck_media_version CHECK (row_version >= 0)
 );
@@ -553,132 +516,7 @@ CREATE INDEX ix_upload_parts_status
 - 最后一片等于 `expected_size - offset`。
 - 所有分片大小之和等于会话期望大小。
 
-### 5.7 采集机器凭据
-
-```sql
-CREATE TABLE collector_credentials (
-  id               uuid PRIMARY KEY,
-  name             varchar(128) NOT NULL,
-  token_prefix     varchar(64) COLLATE "C" NOT NULL,
-  token_hash       bytea NOT NULL,
-  scopes           text[] NOT NULL,
-  status           credential_status NOT NULL DEFAULT 'active',
-  max_active_jobs  smallint NOT NULL DEFAULT 10,
-  expires_at       timestamptz,
-  last_used_at     timestamptz,
-  created_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
-  updated_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
-  row_version      bigint NOT NULL DEFAULT 0,
-
-  CONSTRAINT uq_collector_name UNIQUE (name),
-  CONSTRAINT uq_collector_prefix UNIQUE (token_prefix),
-  CONSTRAINT uq_collector_hash UNIQUE (token_hash),
-  CONSTRAINT ck_collector_hash CHECK (octet_length(token_hash) = 32),
-  CONSTRAINT ck_collector_scopes CHECK (
-    scopes = ARRAY['collector:jobs']::text[]
-  ),
-  CONSTRAINT ck_collector_max_jobs CHECK (max_active_jobs BETWEEN 1 AND 10),
-  CONSTRAINT ck_collector_version CHECK (row_version >= 0)
-);
-```
-
-采集服务器不持有 R2 凭据。本表只保存业务 API 机器凭据摘要；内容由 API 在有效租约下从 R2 分段流式转发。
-
-### 5.8 采集任务
-
-```sql
-CREATE TABLE collector_jobs (
-  id                         uuid PRIMARY KEY,
-  media_object_id            uuid NOT NULL
-                               REFERENCES media_objects(id) ON DELETE RESTRICT,
-  status                     collector_job_status NOT NULL DEFAULT 'queued',
-  priority                   smallint NOT NULL DEFAULT 0,
-  available_at               timestamptz NOT NULL DEFAULT clock_timestamp(),
-
-  lease_credential_id        uuid
-                               REFERENCES collector_credentials(id) ON DELETE RESTRICT,
-  lease_owner                varchar(64),
-  lease_token_hash           bytea,
-  leased_at                  timestamptz,
-  heartbeat_at               timestamptz,
-  lease_expires_at           timestamptz,
-  attempt_deadline_at        timestamptz,
-
-  attempt_count              smallint NOT NULL DEFAULT 0,
-  max_attempts               smallint NOT NULL DEFAULT 5,
-  last_error_code            varchar(64),
-  last_error_detail          varchar(1000),
-
-  completion_idempotency_key varchar(128) COLLATE "C",
-  result_ref                 varchar(1024),
-  result_checksum_sha256     bytea,
-  result_metadata            jsonb NOT NULL DEFAULT '{}'::jsonb,
-  completed_at               timestamptz,
-  dead_at                    timestamptz,
-  cancelled_at               timestamptz,
-  created_at                 timestamptz NOT NULL DEFAULT clock_timestamp(),
-  updated_at                 timestamptz NOT NULL DEFAULT clock_timestamp(),
-  row_version                bigint NOT NULL DEFAULT 0,
-
-  CONSTRAINT uq_collector_media UNIQUE (media_object_id),
-  CONSTRAINT ck_job_priority CHECK (priority BETWEEN -100 AND 100),
-  CONSTRAINT ck_job_attempts CHECK (
-    max_attempts = 5
-    AND attempt_count BETWEEN 0 AND max_attempts
-  ),
-  CONSTRAINT ck_job_lease_hash CHECK (
-    lease_token_hash IS NULL OR octet_length(lease_token_hash) = 32
-  ),
-  CONSTRAINT ck_job_leased_fields CHECK (
-    status <> 'leased'
-    OR (
-      lease_credential_id IS NOT NULL
-      AND lease_owner IS NOT NULL
-      AND lease_token_hash IS NOT NULL
-      AND leased_at IS NOT NULL
-      AND heartbeat_at IS NOT NULL
-      AND lease_expires_at IS NOT NULL
-      AND attempt_deadline_at IS NOT NULL
-      AND lease_expires_at > leased_at
-      AND attempt_deadline_at > leased_at
-    )
-  ),
-  CONSTRAINT ck_job_retry_error CHECK (
-    status NOT IN ('retry_wait', 'dead', 'cancelled') OR last_error_code IS NOT NULL
-  ),
-  CONSTRAINT ck_job_success CHECK (
-    status <> 'succeeded'
-    OR (
-      completed_at IS NOT NULL
-      AND result_ref IS NOT NULL
-      AND result_checksum_sha256 IS NOT NULL
-    )
-  ),
-  CONSTRAINT ck_job_dead CHECK ((status = 'dead') = (dead_at IS NOT NULL)),
-  CONSTRAINT ck_job_cancelled CHECK (
-    (status = 'cancelled') = (cancelled_at IS NOT NULL)
-  ),
-  CONSTRAINT ck_job_result_hash CHECK (
-    result_checksum_sha256 IS NULL OR octet_length(result_checksum_sha256) = 32
-  ),
-  CONSTRAINT ck_job_metadata CHECK (jsonb_typeof(result_metadata) = 'object'),
-  CONSTRAINT ck_job_version CHECK (row_version >= 0)
-);
-
-CREATE INDEX ix_collector_claim
-  ON collector_jobs (priority DESC, available_at, created_at, id)
-  WHERE status IN ('queued', 'retry_wait');
-
-CREATE INDEX ix_collector_expired_lease
-  ON collector_jobs (lease_expires_at)
-  WHERE status = 'leased';
-
-CREATE INDEX ix_collector_credential_active
-  ON collector_jobs (lease_credential_id, lease_expires_at)
-  WHERE status = 'leased';
-```
-
-### 5.9 幂等账本
+### 5.7 幂等账本
 
 ```sql
 CREATE TABLE idempotency_records (
@@ -694,7 +532,6 @@ CREATE TABLE idempotency_records (
   resource_id         uuid,
   response_status     smallint,
   response_body       jsonb,
-  response_ciphertext bytea,
   expires_at          timestamptz NOT NULL,
   created_at          timestamptz NOT NULL DEFAULT clock_timestamp(),
   updated_at          timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -704,7 +541,7 @@ CREATE TABLE idempotency_records (
     principal_type, principal_id, operation, idempotency_key
   ),
   CONSTRAINT ck_idempotency_principal CHECK (
-    principal_type IN ('user', 'collector', 'system')
+    principal_type IN ('user', 'system')
   ),
   CONSTRAINT ck_idempotency_key CHECK (
     char_length(idempotency_key) BETWEEN 16 AND 128
@@ -727,9 +564,9 @@ CREATE TABLE idempotency_records (
 CREATE INDEX ix_idempotency_expiry ON idempotency_records (expires_at);
 ```
 
-`request_hash` 是规范化请求的 SHA-256。同 Key 与同 hash 重放稳定结果；同 Key 与不同 hash 返回 409。包含租约 Token 等敏感值的响应使用应用级 AES-GCM 写入 `response_ciphertext`，普通 JSON 中不得保存秘密。
+`request_hash` 是规范化请求的 SHA-256。同 Key 与同 hash 重放稳定结果；同 Key 与不同 hash 返回 409。`response_body` 只保存可安全重放的普通 JSON，不得包含 Token、openid、object key、R2 凭据或文件内容。
 
-### 5.10 审计事件
+### 5.8 审计事件
 
 ```sql
 CREATE TABLE audit_events (
@@ -752,7 +589,7 @@ CREATE TABLE audit_events (
   CONSTRAINT uq_audit_event_id UNIQUE (event_id),
   CONSTRAINT ck_audit_actor CHECK (
     (actor_type IN ('user', 'admin') AND actor_user_id IS NOT NULL)
-    OR (actor_type IN ('collector', 'system') AND actor_service IS NOT NULL)
+    OR (actor_type = 'system' AND actor_service IS NOT NULL)
   ),
   CONSTRAINT ck_audit_event_type CHECK (
     char_length(btrim(event_type)) BETWEEN 1 AND 128
@@ -782,9 +619,9 @@ CREATE INDEX ix_audit_time_brin
   ON audit_events USING brin (occurred_at);
 ```
 
-应用角色对审计表只拥有 `INSERT/SELECT`，不拥有 `UPDATE/DELETE`。审计不得包含 openid、object key、Token、R2 凭据、租约 Token 或文件内容。
+应用角色对审计表只拥有 `INSERT/SELECT`，不拥有 `UPDATE/DELETE`。审计不得包含 openid、object key、Token、R2 凭据或文件内容。
 
-### 5.11 自动更新时间与乐观锁
+### 5.9 自动更新时间与乐观锁
 
 ```sql
 CREATE FUNCTION touch_versioned_row()
@@ -802,10 +639,6 @@ CREATE TRIGGER touch_users
 BEFORE UPDATE ON users
 FOR EACH ROW EXECUTE FUNCTION touch_versioned_row();
 
-CREATE TRIGGER touch_collector_credentials
-BEFORE UPDATE ON collector_credentials
-FOR EACH ROW EXECUTE FUNCTION touch_versioned_row();
-
 CREATE TRIGGER touch_media_objects
 BEFORE UPDATE ON media_objects
 FOR EACH ROW EXECUTE FUNCTION touch_versioned_row();
@@ -816,10 +649,6 @@ FOR EACH ROW EXECUTE FUNCTION touch_versioned_row();
 
 CREATE TRIGGER touch_upload_parts
 BEFORE UPDATE ON upload_parts
-FOR EACH ROW EXECUTE FUNCTION touch_versioned_row();
-
-CREATE TRIGGER touch_collector_jobs
-BEFORE UPDATE ON collector_jobs
 FOR EACH ROW EXECUTE FUNCTION touch_versioned_row();
 
 CREATE TRIGGER touch_idempotency_records
@@ -864,17 +693,6 @@ uploaded -> verified
 ```
 
 `verified` 分片不可再修改。状态转换必须使用带当前状态与 `row_version` 的条件更新，不能先读后无条件写。
-
-### 6.4 采集任务
-
-```text
-queued     -> leased | cancelled
-retry_wait -> leased | cancelled
-leased     -> succeeded | retry_wait | dead | cancelled
-dead       -> queued  # 仅受审计的管理员重开
-```
-
-管理员取消必须同时写 `cancelled_at` 与 `last_error_code='COLLECTION_CANCELLED_BY_ADMIN'`；管理员重开 dead 任务必须清空 `dead_at`、结果字段和租约字段，把 `attempt_count` 重置为 0，并记录审计事件。首版 `max_attempts` 固定为 5。
 
 ## 7. 关键事务边界
 
@@ -923,7 +741,6 @@ R2 成功而第二事务前崩溃时，数据库还没有 `r2_upload_id`。initi
    - 分片转 `verified`；
    - 上传会话转 `completed` 并清空 `next_finalize_at`；
    - 媒体转 `ready`，写最终大小、类型、ETag 与 `uploaded_at`；
-   - 插入唯一 `collector_jobs(queued)`；
    - 写审计并提交。
 6. R2 请求超时且结果未知时保留 `completing`。对账任务先 HEAD 固定 object key，再决定补齐成功、继续完成或在取得确定证据后标记失败；进程重启后沿用持久化的退避计划。
 
@@ -934,164 +751,24 @@ R2 成功而第二事务前崩溃时，数据库还没有 `r2_upload_id`。initi
 3. 插入同一 `token_family_id` 的新会话，并撤销旧会话。
 4. 若旧 Token 再次出现，将 `reuse_detected_at` 置位并撤销整个 family。
 
-### 7.6 采集成功
-
-事务锁定顺序为 `media_objects -> collector_jobs`：
-
-1. 校验任务仍为 leased、机器凭据 ID 与 `X-Collector-Worker-Id` 一致、租约 Token 摘要一致且未过期。
-2. 校验 `observed_size` 与媒体最终大小一致。
-3. 将 job 转为 `succeeded`，写结果引用和 SHA-256。
-4. 写 `media_objects.collected_at` 与 `checksum_sha256`。
-5. 写审计后提交。
-
-## 8. 并发领取与租约
-
-系统提供 at-least-once 语义。`job_id` 是采集端下游写入的幂等键。
-
-租约清理任务每分钟分批扫描过期的 `leased` 行，并使用 `FOR UPDATE SKIP LOCKED` 防止多个实例重复处理。它必须在 claim 之前或并行持续运行：
-
-```sql
-WITH expired AS (
-  SELECT id, attempt_count, max_attempts
-  FROM media_app.collector_jobs
-  WHERE status = 'leased'
-    AND (
-      lease_expires_at <= clock_timestamp()
-      OR attempt_deadline_at <= clock_timestamp()
-    )
-  ORDER BY lease_expires_at, id
-  FOR UPDATE SKIP LOCKED
-  LIMIT 100
-)
-UPDATE media_app.collector_jobs AS j
-SET status = CASE
-      WHEN e.attempt_count >= e.max_attempts THEN 'dead'::media_app.collector_job_status
-      ELSE 'retry_wait'::media_app.collector_job_status
-    END,
-    available_at = CASE
-      WHEN e.attempt_count >= e.max_attempts THEN j.available_at
-      ELSE clock_timestamp()
-        + interval '30 seconds'
-          * LEAST(720::double precision, power(2, GREATEST(e.attempt_count - 1, 0)))
-          * (1 + random() * 0.2)
-    END,
-    last_error_code = CASE
-      WHEN e.attempt_count >= e.max_attempts THEN 'ATTEMPT_LIMIT_EXCEEDED'
-      ELSE 'LEASE_EXPIRED'
-    END,
-    last_error_detail = 'collector lease expired before completion',
-    dead_at = CASE
-      WHEN e.attempt_count >= e.max_attempts THEN clock_timestamp()
-      ELSE NULL
-    END,
-    lease_credential_id = NULL,
-    lease_owner = NULL,
-    lease_token_hash = NULL,
-    leased_at = NULL,
-    heartbeat_at = NULL,
-    lease_expires_at = NULL,
-    attempt_deadline_at = NULL
-FROM expired AS e
-WHERE j.id = e.id;
-```
-
-因此最后一次 attempt 的进程即使崩溃，也会在租约到期后进入 `dead`，不会永久停留在 `leased`。
-
-claim 事务先按机器凭据 ID 锁定额度行，串行化同一凭据的并发 claim：
-
-```sql
-SELECT id, max_active_jobs
-FROM media_app.collector_credentials
-WHERE id = $1
-  AND status = 'active'
-  AND (expires_at IS NULL OR expires_at > clock_timestamp())
-FOR UPDATE;
-
-SELECT count(*) AS active_jobs
-FROM media_app.collector_jobs
-WHERE lease_credential_id = $1
-  AND status = 'leased'
-  AND lease_expires_at > clock_timestamp();
-```
-
-`claim_limit = min(request.maxJobs, max_active_jobs - active_jobs)`；小于等于 0 时返回 `429 COLLECTOR_LEASE_LIMIT`。凭据行锁必须一直持有到候选任务全部更新为 `leased` 并提交，因此同一凭据的并发请求不能一起看到旧额度。
-
-随后在同一事务中领取候选：
-
-```sql
-SELECT j.id
-FROM media_app.collector_jobs j
-JOIN media_app.media_objects m ON m.id = j.media_object_id
-WHERE j.status IN ('queued', 'retry_wait')
-  AND j.available_at <= clock_timestamp()
-  AND j.attempt_count < j.max_attempts
-  AND m.storage_status = 'ready'
-  AND m.collected_at IS NULL
-ORDER BY j.priority DESC, j.available_at, j.created_at
-FOR UPDATE OF j SKIP LOCKED
-LIMIT $1;
-```
-
-上面候选查询的 `$1` 是已经计算出的 `claim_limit`，不是凭据 ID；实现时使用命名参数或独立 prepared statement，避免位置参数混淆。
-
-应用在同一事务中为每行生成独立租约 Token，只保存摘要，并设置：
-
-```text
-status = leased
-lease_credential_id = 当前机器凭据 ID
-lease_owner = 请求 workerId
-lease_token_hash = SHA-256(本次高熵租约 Token)
-leased_at = heartbeat_at = now
-lease_expires_at = now + 5 minutes
-attempt_deadline_at = now + 30 minutes
-attempt_count = attempt_count + 1
-dead_at = cancelled_at = NULL
-```
-
-心跳条件更新：
-
-```sql
-UPDATE media_app.collector_jobs
-SET heartbeat_at = clock_timestamp(),
-    lease_expires_at = LEAST(
-      clock_timestamp() + interval '5 minutes',
-      attempt_deadline_at
-    )
-WHERE id = $1
-  AND status = 'leased'
-  AND lease_credential_id = $2
-  AND lease_owner = $3
-  AND lease_token_hash = $4
-  AND lease_expires_at > clock_timestamp()
-  AND attempt_deadline_at > clock_timestamp()
-RETURNING lease_expires_at;
-```
-
-返回零行表示租约失效，旧 worker 不得再提交结果。可重试失败进入 `retry_wait`，默认退避：
-
-```text
-min(6 hours, 30 seconds × 2^(attempt_count - 1)) + 0–20% jitter
-```
-
-## 9. 数据保留与清理
+## 8. 数据保留与清理
 
 | 数据 | 保留策略 |
 |---|---|
 | 完整 R2 对象 | 首版长期保留，不自动删除 |
-| `media_objects` | 长期保留，与 R2 对象及采集事实对应 |
+| `media_objects` | 长期保留，与 R2 对象及上传事实对应 |
 | initiating/uploading 会话 | 24 小时后转 aborting，清理完成后 expired |
 | completing 会话 | 不按年龄直接过期；必须先 HEAD/ListParts 收敛，结果未知时持续重试并告警 |
 | R2 未完成 multipart | initiating/uploading 超过 24 小时主动终止；completing 先对账；R2 7 天兜底 |
 | 终态 upload sessions | 摘要长期保留，与媒体主记录共同支撑历史列表和 `uploadId` 详情 |
 | 终态 upload parts | 进入终态时计算 `terminalAt + 90 days`；到期后删除，API 此后返回 `partDetailsRetained=false`。活跃时截止时间为 `null` |
-| 成功与 dead collector jobs | 长期保留，便于采集审计 |
 | idempotency records | 稳定结果保留 7 天；in_progress 超时先对账 |
 | 已撤销/过期 user sessions | 保留 90 天用于重用检测 |
 | audit events | 在线保留 365 天 |
 
 清理任务按时间索引和主键分批处理，每批不超过 5,000 行，避免长事务和大量 WAL。任何完整 R2 对象删除必须先有独立审批和审计流程，不能由上述常规清理任务触发。
 
-## 10. 安全与权限
+## 9. 安全与权限
 
 - API 数据库角色只获得 `media_app` 必需表的最小权限。
 - Migration 角色与运行时角色分离。
@@ -1099,12 +776,10 @@ min(6 hours, 30 seconds × 2^(attempt_count - 1)) + 0–20% jitter
 - PostgreSQL 不对公网开放；应用连接使用 TLS。
 - 备份加密并与生产数据库凭据分离。
 - `openid` 属于敏感标识，只允许身份服务读取，不进入普通查询、用户 API、对象键或日志。
-- Refresh Token、Collector API Key 和租约 Token 只保存摘要。
-- `response_ciphertext` 使用独立于数据库的应用加密密钥。
-- R2 读写凭据仅 API 持有；小程序和采集服务器都不能直接访问 R2。
-- Collector 内容读取按 job、机器凭据、scope 与有效租约授权，单个 Range 最多 8 MiB；数据库和 API 响应均不向 Collector 暴露 object key。
+- Refresh Token 只保存摘要。
+- R2 读写凭据仅 API 持有；小程序不能直接访问 R2。
 
-## 11. 迁移策略
+## 10. 迁移策略
 
 - 使用版本化 SQL migration，并以 PostgreSQL advisory lock 保证每个环境只有一个 runner。
 - 采用 expand/contract：先添加可空列或新结构、部署兼容代码、回填和验证，再收紧约束或删除旧结构。
@@ -1114,7 +789,7 @@ min(6 hours, 30 seconds × 2^(attempt_count - 1)) + 0–20% jitter
 - 状态机变化必须同时更新枚举、CHECK、接口 contracts、投影逻辑和测试。
 - 破坏性 migration 前创建逻辑备份，并在独立恢复环境验证。
 
-## 12. 备份与恢复
+## 11. 备份与恢复
 
 - 每日 PostgreSQL 备份，保留 7 个日备、4 个周备和 3 个长期恢复点。
 - 生产量增长后启用连续 WAL 归档，以支持时间点恢复。
