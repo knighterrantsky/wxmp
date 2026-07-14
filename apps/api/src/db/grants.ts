@@ -152,14 +152,33 @@ export async function applyRoleGrants(pool: Pool, roleNames: DatabaseRoleNames):
     )
 
     await client.query(
-      `grant select, delete on table
+      `grant delete on table
          media_app.audit_events,
          media_app.idempotency_records,
          media_app.upload_parts,
          media_app.user_sessions
        to ${maintenanceRole}`,
     )
-    await client.query(`grant select on table media_app.upload_sessions to ${maintenanceRole}`)
+    await client.query(
+      `grant select (id, occurred_at)
+         on table media_app.audit_events to ${maintenanceRole}`,
+    )
+    await client.query(
+      `grant select (id, status, expires_at)
+         on table media_app.idempotency_records to ${maintenanceRole}`,
+    )
+    await client.query(
+      `grant select (upload_session_id)
+         on table media_app.upload_parts to ${maintenanceRole}`,
+    )
+    await client.query(
+      `grant select (id, status, completed_at, aborted_at, expired_at, failed_at)
+         on table media_app.upload_sessions to ${maintenanceRole}`,
+    )
+    await client.query(
+      `grant select (id, expires_at, revoked_at)
+         on table media_app.user_sessions to ${maintenanceRole}`,
+    )
 
     await client.query('commit')
   } catch (error) {

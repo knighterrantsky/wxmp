@@ -201,6 +201,41 @@ describe('R2ObjectStorage command mapping', () => {
     expect(calls[0]?.options).toEqual({ abortSignal: abort.signal })
   })
 
+  it('forwards worker deadline signals to every reconciliation operation', async () => {
+    const { sender, calls } = fakeSender(
+      { IsTruncated: false, Uploads: [] },
+      { IsTruncated: false, Parts: [] },
+      { ETag: '"completed-etag"' },
+      { $metadata: { httpStatusCode: 204 } },
+      { ContentLength: 12, ETag: '"head-etag"' },
+    )
+    const abort = new AbortController()
+    const objectStorage = storage(sender)
+
+    await objectStorage.listMultipartUploads({
+      bucket: identity.bucket,
+      prefix: identity.key,
+      signal: abort.signal,
+    })
+    await objectStorage.listParts({ ...identity, signal: abort.signal })
+    await objectStorage.completeMultipart({
+      ...identity,
+      parts: [{ partNumber: 1, etag: '"part-1"' }],
+      signal: abort.signal,
+    })
+    await objectStorage.abortMultipart({ ...identity, signal: abort.signal })
+    await objectStorage.headObject({
+      bucket: identity.bucket,
+      key: identity.key,
+      signal: abort.signal,
+    })
+
+    expect(calls).toHaveLength(5)
+    expect(calls.map((call) => call.options)).toEqual(
+      Array.from({ length: 5 }, () => ({ abortSignal: abort.signal })),
+    )
+  })
+
   it('maps the caller-supplied ordered part manifest when completing', async () => {
     const { sender, calls } = fakeSender({
       $metadata: { httpStatusCode: 200 },
@@ -337,18 +372,58 @@ describe('R2ObjectStorage pagination and response validation', () => {
       ContentLength: 42,
       ContentType: 'video/mp4',
       ETag: '"head-etag"',
-      Metadata: { private: 'must-not-be-returned' },
+      Metadata: {
+        mediaid: '01981d0c-ec80-7000-8000-000000000202',
+        userid: '01981d0c-ec80-7000-8000-000000000101',
+        private: 'must-not-be-returned',
+      },
     })
 
     await expect(
       storage(found.sender).headObject({ bucket: identity.bucket, key: identity.key }),
-    ).resolves.toEqual({ sizeBytes: 42, contentType: 'video/mp4', etag: '"head-etag"' })
+    ).resolves.toEqual({
+      sizeBytes: 42,
+      contentType: 'video/mp4',
+      etag: '"head-etag"',
+      metadata: {
+        mediaId: '01981d0c-ec80-7000-8000-000000000202',
+        userId: '01981d0c-ec80-7000-8000-000000000101',
+      },
+    })
     expect(found.calls[0]?.command).toBeInstanceOf(HeadObjectCommand)
 
     const missing = fakeSender(sdkError('NotFound', 404, 'private object-key details'))
     await expect(
       storage(missing.sender).headObject({ bucket: identity.bucket, key: identity.key }),
     ).resolves.toBeNull()
+  })
+
+  it('treats a HEAD response without an ETag as an unknown protocol fact', async () => {
+    const missingEtag = fakeSender({ ContentLength: 42, ContentType: 'video/mp4' })
+
+    await expect(
+      storage(missingEtag.sender).headObject({ bucket: identity.bucket, key: identity.key }),
+    ).rejects.toMatchObject({
+      operation: 'headObject',
+      code: 'PROTOCOL_ERROR',
+      certainty: 'ambiguous',
+      retryable: true,
+    })
+  })
+
+  it('classifies R2 ClientDisconnect as ambiguous and retryable', async () => {
+    const disconnected = fakeSender(sdkError('ClientDisconnect', 400, 'private request details'))
+
+    await expect(
+      storage(disconnected.sender).completeMultipart({
+        ...identity,
+        parts: [{ partNumber: 1, etag: '"part-1"' }],
+      }),
+    ).rejects.toMatchObject({
+      operation: 'completeMultipart',
+      certainty: 'ambiguous',
+      retryable: true,
+    })
   })
 
   it('never mistakes a missing bucket for a missing upload or object', async () => {

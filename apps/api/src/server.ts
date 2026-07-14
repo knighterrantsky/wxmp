@@ -12,7 +12,12 @@ import { systemClock } from './lib/clock.js'
 import { createSecureIdGenerator, type IdGenerator } from './lib/id.js'
 import { createProductionLogger } from './observability/logger.js'
 import { Metrics } from './observability/metrics.js'
+import { Aborter } from './uploads/aborter.js'
+import { Finalizer } from './uploads/finalizer.js'
 import { R2ObjectStorage } from './uploads/r2-object-storage.js'
+import { DeadlineScanner, Reconciler } from './uploads/reconciler.js'
+import { PostgresUploadConcurrency } from './uploads/upload-concurrency.js'
+import { UploadWorkerSupervisor } from './uploads/worker-supervisor.js'
 
 export interface DatabaseReadinessClient {
   query(text: string): Promise<unknown>
@@ -32,9 +37,15 @@ interface ServerPool {
   end(): Promise<void>
 }
 
+interface ServerWorkers {
+  start(): void
+  stop(): Promise<void>
+}
+
 interface PreparedServerRuntime {
   app: ServerApp
   pool: ServerPool
+  workers?: ServerWorkers
 }
 
 async function acquireReadinessClient(
@@ -120,6 +131,7 @@ export async function databaseIsReady(
 function configuredSecrets(config: RuntimeConfig): string[] {
   return [
     config.databaseUrl,
+    config.cursorSigningKey,
     config.wechat.appSecret,
     config.jwt.privateKey,
     config.jwt.publicKey,
@@ -192,6 +204,8 @@ export function createServerRuntime(config: RuntimeConfig) {
   )
   const ids = createSecureIdGenerator(systemClock)
   const objectStorage = new R2ObjectStorage(config.r2)
+  const metrics = new Metrics()
+  const uploadConcurrency = new PostgresUploadConcurrency({ pool: uploadLockPool })
   const app = buildApp({
     pool,
     readiness: {
@@ -201,7 +215,7 @@ export function createServerRuntime(config: RuntimeConfig) {
     clock: systemClock,
     ids,
     logger,
-    metrics: new Metrics(),
+    metrics,
     monitoringToken: config.server.monitoringToken,
     trustProxy: config.server.trustProxy,
     wechatAppId: config.wechat.appId,
@@ -209,10 +223,109 @@ export function createServerRuntime(config: RuntimeConfig) {
     tokenService: createConfiguredTokenService(config, ids),
     objectStorage,
     objectStorageBucket: config.r2.bucket,
-    uploadLockPool,
+    cursorSigningSecret: Buffer.from(config.cursorSigningKey, 'base64url'),
+    uploadConcurrency,
+  })
+  const finalizer = new Finalizer({
+    pool,
+    storage: objectStorage,
+    concurrency: uploadConcurrency,
+    clock: systemClock,
+    ids,
+    alerts: metrics,
+  })
+  const aborter = new Aborter({
+    pool,
+    storage: objectStorage,
+    concurrency: uploadConcurrency,
+    clock: systemClock,
+    ids,
+    alerts: metrics,
+  })
+  const reconciler = new Reconciler({
+    pool,
+    storage: objectStorage,
+    concurrency: uploadConcurrency,
+    clock: systemClock,
+    ids,
+    alerts: metrics,
+  })
+  const deadlineScanner = new DeadlineScanner({ pool, clock: systemClock, ids })
+  const recordTimes = (count: number, action: () => void): void => {
+    for (let index = 0; index < count; index += 1) action()
+  }
+  const backlog = async (status: 'aborting' | 'completing'): Promise<number> => {
+    const selected = await pool.query<{ count: string }>(
+      `select count(*)::text as count from media_app.upload_sessions where status = $1`,
+      [status],
+    )
+    const count = Number(selected.rows[0]?.count)
+    if (!Number.isSafeInteger(count) || count < 0) throw new Error('upload backlog is invalid')
+    return count
+  }
+  const workers = new UploadWorkerSupervisor({
+    logger,
+    jobs: [
+      {
+        name: 'upload-finalizer',
+        intervalMs: 1_000,
+        run: async (signal) => {
+          const result = await finalizer.runOnce(100, signal)
+          metrics.setFinalizerBacklog(await backlog('completing'))
+          recordTimes(result.retried, () => {
+            metrics.recordFinalizerRetry({ outcome: 'scheduled' })
+          })
+          recordTimes(result.succeeded, () => {
+            metrics.recordFinalizerRetry({ outcome: 'succeeded' })
+            metrics.recordReconciliation({ outcome: 'confirmed' })
+          })
+          recordTimes(result.repaired, () => {
+            metrics.recordReconciliation({ outcome: 'repaired' })
+          })
+          recordTimes(result.failed, () => {
+            metrics.recordReconciliation({ outcome: 'failed' })
+          })
+        },
+      },
+      {
+        name: 'upload-aborter',
+        intervalMs: 1_000,
+        run: async (signal) => {
+          const result = await aborter.runOnce(100, signal)
+          metrics.setAbortBacklog(await backlog('aborting'))
+          recordTimes(result.retried, () => {
+            metrics.recordAbortRetry({ outcome: 'scheduled' })
+          })
+          recordTimes(result.succeeded, () => {
+            metrics.recordAbortRetry({ outcome: 'succeeded' })
+          })
+        },
+      },
+      {
+        name: 'upload-deadline-scanner',
+        intervalMs: 5_000,
+        run: async (signal) => {
+          const result = await deadlineScanner.runOnce(100, signal)
+          recordTimes(result.scheduled, () => {
+            metrics.recordExpiredSession()
+          })
+        },
+      },
+      {
+        name: 'upload-initialization-reconciler',
+        intervalMs: 5 * 60_000,
+        run: async (signal) => {
+          const result = await reconciler.runOnce(100, signal)
+          recordTimes(result.settled, () => {
+            metrics.recordReconciliation({ outcome: 'failed' })
+          })
+        },
+      },
+    ],
   })
   return {
     app,
+    workers,
     pool: {
       async end() {
         await Promise.all([pool.end(), uploadLockPool.end()])
@@ -221,16 +334,31 @@ export function createServerRuntime(config: RuntimeConfig) {
   }
 }
 
-export function createResourceCloser(app: Pick<ServerApp, 'close'>, pool: ServerPool) {
+export function createResourceCloser(
+  app: Pick<ServerApp, 'close'>,
+  pool: ServerPool,
+  workers?: Pick<ServerWorkers, 'stop'>,
+) {
   let closing: Promise<void> | undefined
   return (): Promise<void> => {
     closing ??= (async () => {
       const failures: unknown[] = []
-      try {
-        await app.close()
-      } catch (error) {
-        failures.push(error)
+      const stopWorkers = async (): Promise<void> => {
+        if (workers === undefined) return
+        try {
+          await workers.stop()
+        } catch (error) {
+          failures.push(error)
+        }
       }
+      const closeApp = async (): Promise<void> => {
+        try {
+          await app.close()
+        } catch (error) {
+          failures.push(error)
+        }
+      }
+      await Promise.all([stopWorkers(), closeApp()])
       try {
         await pool.end()
       } catch (error) {
@@ -261,10 +389,11 @@ export async function startPreparedServer(
   server: Pick<RuntimeConfig['server'], 'host' | 'port'>,
   runtime: PreparedServerRuntime,
 ): Promise<{ close(): Promise<void> }> {
-  const closeResources = createResourceCloser(runtime.app, runtime.pool)
+  const closeResources = createResourceCloser(runtime.app, runtime.pool, runtime.workers)
   const removeShutdownHandlers = installShutdownHandlers(closeResources)
   try {
     await runtime.app.listen({ host: server.host, port: server.port })
+    runtime.workers?.start()
   } catch (error) {
     removeShutdownHandlers()
     await closeResources().catch(() => undefined)

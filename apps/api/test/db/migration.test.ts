@@ -51,7 +51,7 @@ describe('runMigrations', () => {
       'user_sessions',
       'users',
     ])
-    expect(bookkeeping.rows[0]?.count).toBe('1')
+    expect(bookkeeping.rows[0]?.count).toBe('2')
   })
 
   it('installs all documented enum types, version triggers, and explicit indexes', async () => {
@@ -99,9 +99,13 @@ describe('runMigrations', () => {
     expect(indexes.rows.map((row) => row.indexname)).toEqual([
       'ix_audit_entity',
       'ix_audit_request',
+      'ix_audit_retention',
+      'ix_audit_session',
       'ix_audit_time_brin',
       'ix_audit_user',
       'ix_idempotency_expiry',
+      'ix_idempotency_resource',
+      'ix_idempotency_stable_retention',
       'ix_media_storage_status',
       'ix_media_user_history',
       'ix_upload_abort_due',
@@ -109,10 +113,14 @@ describe('runMigrations', () => {
       'ix_upload_finalize_due',
       'ix_upload_parts_status',
       'ix_upload_reconcile_stuck',
+      'ix_upload_terminal_retention',
       'ix_upload_user_history',
       'ix_user_identities_user',
       'ix_user_sessions_active',
+      'ix_user_sessions_expired_retention',
       'ix_user_sessions_family',
+      'ix_user_sessions_revoked_retention',
+      'ix_user_sessions_rotated_from',
     ])
   })
 
@@ -164,7 +172,7 @@ describe('runMigrations', () => {
     const applied = await pool.query<{ count: string }>(
       'select count(*) from public.schema_migrations',
     )
-    expect(applied.rows[0]?.count).toBe('1')
+    expect(applied.rows[0]?.count).toBe('2')
   })
 
   it('checksums the original migration bytes and refuses any drift', async () => {
@@ -200,7 +208,7 @@ describe('runMigrations', () => {
       const applied = await contenderPool.query<{ count: string }>(
         'select count(*) from public.schema_migrations',
       )
-      expect(applied.rows[0]?.count).toBe('1')
+      expect(applied.rows[0]?.count).toBe('2')
     } finally {
       await Promise.all([brokenPool.end(), contenderPool.end()])
       await rm(brokenDirectory, { recursive: true, force: true })

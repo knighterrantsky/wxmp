@@ -8,6 +8,7 @@
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "db:migrate": "pnpm build && node dist/db/migrate.js",
+    "db:maintenance": "pnpm build && node dist/maintenance.js",
     "start": "node dist/server.js"
   },
   "dependencies": {

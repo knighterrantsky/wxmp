@@ -21,10 +21,17 @@ import type { Metrics } from './observability/metrics.js'
 import { registerProfileRoutes } from './profile/profile-routes.js'
 import { registerHealthRoutes } from './routes/health.js'
 import type { ObjectStorage } from './uploads/object-storage.js'
+import { SignedHistoryCursorCodec } from './uploads/cursor.js'
+import { PostgresUploadHistoryRepository } from './uploads/history-repository.js'
+import { UploadHistoryService } from './uploads/history-service.js'
 import { PostgresUploadRepository, type UploadRepository } from './uploads/upload-repository.js'
 import { registerUploadRoutes } from './uploads/upload-routes.js'
 import { PostgresUploadConcurrency } from './uploads/upload-concurrency.js'
-import { UploadService, type PartUploadConcurrency } from './uploads/upload-service.js'
+import {
+  UploadService,
+  type ExclusiveUploadConcurrency,
+  type PartUploadConcurrency,
+} from './uploads/upload-service.js'
 
 const UUID_V7 = new RegExp(UUID_V7_PATTERN)
 const REQUEST_TIMEOUT_MS = 180_000
@@ -53,8 +60,9 @@ export interface AppDependencies extends AppShellDependencies {
   authRepository?: AuthRepository
   objectStorage: ObjectStorage
   objectStorageBucket: string
+  cursorSigningSecret: Buffer
   uploadRepository?: UploadRepository
-  uploadConcurrency?: PartUploadConcurrency
+  uploadConcurrency?: PartUploadConcurrency & ExclusiveUploadConcurrency
   uploadLockPool?: Pool
 }
 
@@ -176,16 +184,22 @@ export function buildApp(deps: AppDependencies): FastifyInstance {
   const uploadRepository =
     deps.uploadRepository ??
     new PostgresUploadRepository({ pool: deps.pool, clock: deps.clock, ids: deps.ids })
+  const uploadConcurrency =
+    deps.uploadConcurrency ??
+    new PostgresUploadConcurrency({ pool: deps.uploadLockPool ?? deps.pool })
   const uploads = new UploadService({
     bucket: deps.objectStorageBucket,
     clock: deps.clock,
     ids: deps.ids,
     repository: uploadRepository,
     storage: deps.objectStorage,
-    concurrency:
-      deps.uploadConcurrency ??
-      new PostgresUploadConcurrency({ pool: deps.uploadLockPool ?? deps.pool }),
+    concurrency: uploadConcurrency,
+    exclusiveConcurrency: uploadConcurrency,
   })
-  registerUploadRoutes(app, { uploads, tokens: deps.tokenService })
+  const history = new UploadHistoryService({
+    repository: new PostgresUploadHistoryRepository({ pool: deps.pool }),
+    cursor: new SignedHistoryCursorCodec({ secret: deps.cursorSigningSecret, clock: deps.clock }),
+  })
+  registerUploadRoutes(app, { uploads, history, tokens: deps.tokenService })
   return app
 }

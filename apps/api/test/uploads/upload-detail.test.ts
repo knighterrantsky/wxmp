@@ -331,4 +331,74 @@ describe('GET /v1/uploads/:uploadId', () => {
       },
     })
   })
+
+  it.each([
+    { elapsedMs: 90 * 86_400_000, retained: true },
+    { elapsedMs: 90 * 86_400_000 + 1, retained: false },
+  ])(
+    'keeps authoritative terminal progress after part retention at $elapsedMs ms',
+    async ({ elapsedMs, retained }) => {
+      const terminalAt = new Date(requestNow.getTime() - elapsedMs)
+      const availableUntil = new Date(terminalAt.getTime() + 90 * 86_400_000)
+      const seeded = await seedWritableUpload(migrationPool)
+      await migrationPool.query(
+        `update media_app.upload_parts
+            set status = 'verified', actual_size_bytes = expected_size_bytes,
+                checksum_sha256 = $2, r2_etag = 'terminal-part-etag',
+                uploaded_at = $3, verified_at = $3
+          where upload_session_id = $1`,
+        [uploadFixtureId, Buffer.alloc(32, 0x44), terminalAt],
+      )
+      await migrationPool.query(
+        `update media_app.upload_sessions
+            set status = 'completed', confirmed_size_bytes = expected_size_bytes,
+                confirmed_part_count = expected_part_count, completed_at = $2
+          where id = $1`,
+        [uploadFixtureId, terminalAt],
+      )
+      await migrationPool.query(
+        `update media_app.media_objects
+            set storage_status = 'ready', verified_content_type = declared_content_type,
+                verified_size_bytes = declared_size_bytes, object_etag = 'terminal-object-etag',
+                uploaded_at = $2
+          where id = $1`,
+        [mediaFixtureId, terminalAt],
+      )
+      if (!retained) {
+        await migrationPool.query(
+          `delete from media_app.upload_parts where upload_session_id = $1`,
+          [uploadFixtureId],
+        )
+      }
+      const app = fixtureApp()
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/v1/uploads/${uploadFixtureId}`,
+        headers: { authorization: 'Bearer owner-access-token' },
+      })
+
+      expect(response.statusCode, response.body).toBe(200)
+      expect(response.json()).toMatchObject({
+        data: {
+          upload: {
+            status: 'uploaded',
+            progress: {
+              confirmedBytes: seeded.sizeBytes,
+              totalBytes: seeded.sizeBytes,
+              uploadedParts: 1,
+              totalParts: 1,
+              percent: 100,
+            },
+          },
+          partDetailsRetained: retained,
+          partsAvailableUntil: availableUntil.toISOString(),
+          pollAfterSeconds: null,
+        },
+      })
+      expect(response.json<{ data: { parts: unknown[] } }>().data.parts).toHaveLength(
+        retained ? 1 : 0,
+      )
+    },
+  )
 })

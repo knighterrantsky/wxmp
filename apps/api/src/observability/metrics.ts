@@ -3,18 +3,40 @@ import { Counter, Gauge, Histogram, Registry } from 'prom-client'
 type LoginOutcome = 'success' | 'error'
 type UploadInitializationOutcome = 'accepted' | 'rejected' | 'error'
 type PartOutcome = 'uploaded' | 'retried' | 'error' | 'checksumMismatch'
-type R2Operation = 'create' | 'uploadPart' | 'complete' | 'abort' | 'head' | 'listParts'
+type R2Operation =
+  'create' | 'uploadPart' | 'complete' | 'abort' | 'head' | 'listParts' | 'listMultipartUploads'
 type OperationOutcome = 'success' | 'error' | 'timeout'
 type FinalizerRetryOutcome = 'scheduled' | 'succeeded' | 'exhausted'
 type ReconciliationOutcome = 'confirmed' | 'repaired' | 'failed'
+type CriticalReconciliationCode =
+  | 'ACCESS_DENIED'
+  | 'INVALID_REQUEST'
+  | 'STORAGE_OBJECT_PRESENT'
+  | 'STORAGE_OBJECT_SIZE_MISMATCH'
+  | 'STORAGE_UNAVAILABLE'
 
 const LOGIN_OUTCOMES = ['success', 'error'] as const
 const INITIALIZATION_OUTCOMES = ['accepted', 'rejected', 'error'] as const
 const PART_OUTCOMES = ['uploaded', 'retried', 'error', 'checksumMismatch'] as const
-const R2_OPERATIONS = ['create', 'uploadPart', 'complete', 'abort', 'head', 'listParts'] as const
+const R2_OPERATIONS = [
+  'create',
+  'uploadPart',
+  'complete',
+  'abort',
+  'head',
+  'listParts',
+  'listMultipartUploads',
+] as const
 const OPERATION_OUTCOMES = ['success', 'error', 'timeout'] as const
 const FINALIZER_RETRY_OUTCOMES = ['scheduled', 'succeeded', 'exhausted'] as const
 const RECONCILIATION_OUTCOMES = ['confirmed', 'repaired', 'failed'] as const
+const CRITICAL_RECONCILIATION_CODES = [
+  'ACCESS_DENIED',
+  'INVALID_REQUEST',
+  'STORAGE_OBJECT_PRESENT',
+  'STORAGE_OBJECT_SIZE_MISMATCH',
+  'STORAGE_UNAVAILABLE',
+] as const
 
 function assertMetricLabel(value: string, allowed: readonly string[]): void {
   if (!allowed.includes(value)) throw new Error('Metric label is outside its whitelist')
@@ -41,7 +63,10 @@ export class Metrics {
   readonly #r2Errors: Counter<'operation' | 'outcome'>
   readonly #finalizerBacklog: Gauge
   readonly #finalizerRetries: Counter<'outcome'>
+  readonly #abortBacklog: Gauge
+  readonly #abortRetries: Counter<'outcome'>
   readonly #reconciliation: Counter<'outcome'>
+  readonly #criticalReconciliation: Counter<'code'>
   readonly #completingTimeouts: Counter
   readonly #expiredSessions: Counter
 
@@ -129,10 +154,27 @@ export class Metrics {
       labelNames: ['outcome'],
       registers: [this.#registry],
     })
+    this.#abortBacklog = new Gauge({
+      name: 'wx_upload_abort_backlog',
+      help: 'Upload sessions awaiting multipart cleanup.',
+      registers: [this.#registry],
+    })
+    this.#abortRetries = new Counter({
+      name: 'wx_upload_abort_retries_total',
+      help: 'Abort worker retry results.',
+      labelNames: ['outcome'],
+      registers: [this.#registry],
+    })
     this.#reconciliation = new Counter({
       name: 'wx_upload_reconciliation_total',
       help: 'Reconciliation results.',
       labelNames: ['outcome'],
+      registers: [this.#registry],
+    })
+    this.#criticalReconciliation = new Counter({
+      name: 'wx_upload_critical_reconciliation_total',
+      help: 'Critical private-storage reconciliation findings by bounded code.',
+      labelNames: ['code'],
       registers: [this.#registry],
     })
     this.#completingTimeouts = new Counter({
@@ -207,9 +249,24 @@ export class Metrics {
     this.#finalizerRetries.inc({ outcome: input.outcome })
   }
 
+  setAbortBacklog(value: number): void {
+    assertNonNegative(value, 'abort backlog')
+    this.#abortBacklog.set(value)
+  }
+
+  recordAbortRetry(input: { outcome: FinalizerRetryOutcome }): void {
+    assertMetricLabel(input.outcome, FINALIZER_RETRY_OUTCOMES)
+    this.#abortRetries.inc({ outcome: input.outcome })
+  }
+
   recordReconciliation(input: { outcome: ReconciliationOutcome }): void {
     assertMetricLabel(input.outcome, RECONCILIATION_OUTCOMES)
     this.#reconciliation.inc({ outcome: input.outcome })
+  }
+
+  criticalReconciliation(code: CriticalReconciliationCode): void {
+    assertMetricLabel(code, CRITICAL_RECONCILIATION_CODES)
+    this.#criticalReconciliation.inc({ code })
   }
 
   recordCompletingTimeout(): void {

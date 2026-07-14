@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto'
 import { finished } from 'node:stream/promises'
 
 import {
+  type AbortUploadResponse,
+  type CompleteUploadResponse,
   PART_SIZE_BYTES,
   planUploadParts,
   type InitializeUploadRequest,
@@ -20,6 +22,8 @@ import { buildObjectKey } from './object-key.js'
 import { inspectChunk } from './chunk-stream.js'
 import type { InitializeUploadDraft, UploadRepository } from './upload-repository.js'
 import type {
+  AbortUploadRouteInput,
+  CompleteUploadRouteInput,
   GetUploadDetailInput,
   InitializeUploadInput,
   UploadPartInput,
@@ -76,6 +80,10 @@ export interface PartUploadConcurrency {
     partNumber: number
     userId: string
   }): Promise<UploadPartLease>
+}
+
+export interface ExclusiveUploadConcurrency {
+  acquireExclusiveUpload(input: { uploadId: string; waitMs?: number }): Promise<UploadPartLease>
 }
 
 async function drain(stream: UploadPartInput['chunk']): Promise<void> {
@@ -161,6 +169,7 @@ export class UploadService implements UploadRouteService {
   readonly #repository: UploadRepository
   readonly #storage: ObjectStorage
   readonly #concurrency: PartUploadConcurrency
+  readonly #exclusiveConcurrency: ExclusiveUploadConcurrency | undefined
   readonly #createMultipartTimeoutMs: number
   readonly #uploadPartTimeoutMs: number
 
@@ -171,6 +180,7 @@ export class UploadService implements UploadRouteService {
     repository: UploadRepository
     storage: ObjectStorage
     concurrency: PartUploadConcurrency
+    exclusiveConcurrency?: ExclusiveUploadConcurrency
     createMultipartTimeoutMs?: number
     uploadPartTimeoutMs?: number
   }) {
@@ -180,6 +190,7 @@ export class UploadService implements UploadRouteService {
     this.#repository = deps.repository
     this.#storage = deps.storage
     this.#concurrency = deps.concurrency
+    this.#exclusiveConcurrency = deps.exclusiveConcurrency
     this.#createMultipartTimeoutMs = deps.createMultipartTimeoutMs ?? CREATE_MULTIPART_TIMEOUT_MS
     this.#uploadPartTimeoutMs = deps.uploadPartTimeoutMs ?? UPLOAD_PART_TIMEOUT_MS
     if (
@@ -260,47 +271,148 @@ export class UploadService implements UploadRouteService {
       throw publicError('IDEMPOTENCY_IN_PROGRESS', 409, true)
     }
 
-    let r2UploadId: string
-    const controller = new AbortController()
-    const timeout = setTimeout(() => {
-      controller.abort()
-    }, this.#createMultipartTimeoutMs)
-    timeout.unref()
-    try {
-      const created = await this.#storage.createMultipart({
-        bucket: draft.bucket,
-        key: draft.objectKey,
-        contentType: draft.mimeType,
-        metadata: { mediaid: draft.mediaId, userid: draft.userId },
-        signal: controller.signal,
+    if (this.#exclusiveConcurrency === undefined) {
+      throw new ApiError({
+        code: 'INTERNAL_ERROR',
+        message: 'INTERNAL_ERROR',
+        retryable: true,
+        statusCode: 500,
       })
-      r2UploadId = created.uploadId
-    } catch (error) {
-      if (error instanceof ObjectStorageError && error.certainty === 'definite') {
-        try {
-          await this.#repository.failInitialization({ draft, code: 'STORAGE_UNAVAILABLE' })
-        } catch {
-          // The first transaction remains the source of truth. Reconciliation will
-          // settle this linked initiating session if the failure transaction did not commit.
-        }
-      }
+    }
+    let initializationLease: UploadPartLease
+    try {
+      initializationLease = await this.#exclusiveConcurrency.acquireExclusiveUpload({
+        uploadId: draft.uploadId,
+        waitMs: 8_000,
+      })
+    } catch {
       throw publicError('STORAGE_UNAVAILABLE', 503, true)
-    } finally {
-      clearTimeout(timeout)
     }
 
     try {
-      await this.#repository.completeInitialization({ draft, r2UploadId })
-    } catch (error) {
-      if (
-        error instanceof ApiError &&
-        (error.code === 'USER_DISABLED' || error.code === 'UNAUTHORIZED')
-      ) {
-        throw error
+      let r2UploadId: string
+      const controller = new AbortController()
+      const timeout = setTimeout(() => {
+        controller.abort()
+      }, this.#createMultipartTimeoutMs)
+      timeout.unref()
+      try {
+        const created = await this.#storage.createMultipart({
+          bucket: draft.bucket,
+          key: draft.objectKey,
+          contentType: draft.mimeType,
+          metadata: { mediaid: draft.mediaId, userid: draft.userId },
+          signal: controller.signal,
+        })
+        r2UploadId = created.uploadId
+      } catch (error) {
+        if (error instanceof ObjectStorageError && error.certainty === 'definite') {
+          try {
+            await this.#repository.failInitialization({
+              draft,
+              fence: beginning.fence,
+              code: 'STORAGE_UNAVAILABLE',
+            })
+          } catch {
+            // The first transaction remains the source of truth. Reconciliation will
+            // settle this linked initiating session if the failure transaction did not commit.
+          }
+        }
+        throw publicError('STORAGE_UNAVAILABLE', 503, true)
+      } finally {
+        clearTimeout(timeout)
       }
-      throw publicError('STORAGE_UNAVAILABLE', 503, true)
+
+      try {
+        await this.#repository.completeInitialization({
+          draft,
+          r2UploadId,
+          fence: beginning.fence,
+        })
+      } catch (error) {
+        if (
+          error instanceof ApiError &&
+          (error.code === 'USER_DISABLED' || error.code === 'UNAUTHORIZED')
+        ) {
+          throw error
+        }
+        throw publicError('STORAGE_UNAVAILABLE', 503, true)
+      }
+      return { data, replayed: false }
+    } finally {
+      await initializationLease.release()
     }
-    return { data, replayed: false }
+  }
+
+  async complete(input: CompleteUploadRouteInput): Promise<{
+    data: CompleteUploadResponse['data']
+    replayed: boolean
+  }> {
+    if (!IDEMPOTENCY_KEY_PATTERN.test(input.idempotencyKey)) {
+      throw publicError('VALIDATION_ERROR', 422)
+    }
+    if (this.#exclusiveConcurrency === undefined) {
+      throw new ApiError({
+        code: 'INTERNAL_ERROR',
+        message: 'INTERNAL_ERROR',
+        retryable: true,
+        statusCode: 500,
+      })
+    }
+    const lease = await this.#exclusiveConcurrency.acquireExclusiveUpload({
+      uploadId: input.uploadId,
+      waitMs: 8_000,
+    })
+    try {
+      const result = await this.#repository.completeUpload({
+        ...input,
+        requestHash: createHash('sha256')
+          .update(JSON.stringify({ uploadId: input.uploadId }), 'utf8')
+          .digest(),
+      })
+      if (result.kind === 'expired') {
+        throw new ApiError({
+          code: 'UPLOAD_EXPIRED',
+          message: 'UPLOAD_EXPIRED',
+          idempotencyReplayed: result.replayed,
+          statusCode: 410,
+        })
+      }
+      return { data: result.data, replayed: result.replayed }
+    } finally {
+      await lease.release()
+    }
+  }
+
+  async abort(input: AbortUploadRouteInput): Promise<{
+    data: AbortUploadResponse['data']
+    replayed: boolean
+  }> {
+    if (!IDEMPOTENCY_KEY_PATTERN.test(input.idempotencyKey)) {
+      throw publicError('VALIDATION_ERROR', 422)
+    }
+    if (this.#exclusiveConcurrency === undefined) {
+      throw new ApiError({
+        code: 'INTERNAL_ERROR',
+        message: 'INTERNAL_ERROR',
+        retryable: true,
+        statusCode: 500,
+      })
+    }
+    const lease = await this.#exclusiveConcurrency.acquireExclusiveUpload({
+      uploadId: input.uploadId,
+      waitMs: 8_000,
+    })
+    try {
+      return await this.#repository.abortUpload({
+        ...input,
+        requestHash: createHash('sha256')
+          .update(JSON.stringify({ uploadId: input.uploadId, reason: input.reason }), 'utf8')
+          .digest(),
+      })
+    } finally {
+      await lease.release()
+    }
   }
 
   async uploadPart(input: UploadPartInput): Promise<UploadPartResponse['data']> {

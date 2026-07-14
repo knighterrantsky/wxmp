@@ -15,6 +15,7 @@ function runtimeConfig(
   return {
     nodeEnv: override.nodeEnv ?? 'development',
     databaseUrl: 'postgresql://runtime:private@127.0.0.1/database',
+    cursorSigningKey: 'QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI',
     wechat: {
       authMode: 'stub',
       appId: 'wx-development-app',
@@ -135,5 +136,44 @@ describe('server resource lifecycle', () => {
     ).rejects.toBe(listenFailure)
     expect(app.close).toHaveBeenCalledOnce()
     expect(pool.end).toHaveBeenCalledOnce()
+  })
+
+  it('starts workers only after listen and waits for them before ending pools', async () => {
+    const order: string[] = []
+    const app = {
+      listen: vi.fn(() => {
+        order.push('listen')
+        return Promise.resolve()
+      }),
+      close: vi.fn(() => {
+        order.push('app-close')
+        return Promise.resolve()
+      }),
+    }
+    const workers = {
+      start: vi.fn(() => {
+        order.push('workers-start')
+      }),
+      stop: vi.fn(() => {
+        order.push('workers-stop')
+        return Promise.resolve()
+      }),
+    }
+    const pool = {
+      end: vi.fn(() => {
+        order.push('pool-end')
+        return Promise.resolve()
+      }),
+    }
+
+    const running = await startPreparedServer(
+      { host: '127.0.0.1', port: 3000 },
+      { app, pool, workers },
+    )
+    expect(order).toEqual(['listen', 'workers-start'])
+
+    await running.close()
+
+    expect(order).toEqual(['listen', 'workers-start', 'workers-stop', 'app-close', 'pool-end'])
   })
 })

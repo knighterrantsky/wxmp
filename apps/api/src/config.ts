@@ -6,6 +6,7 @@ export type NodeEnvironment = 'development' | 'test' | 'production'
 export interface RuntimeConfig {
   nodeEnv: NodeEnvironment
   databaseUrl: string
+  cursorSigningKey: string
   wechat: {
     authMode: 'real' | 'stub'
     appId: string
@@ -49,6 +50,8 @@ const PLACEHOLDER_PATTERN =
 const ROLE_PATTERN = /^[A-Za-z_][A-Za-z0-9_$]{0,62}$/
 const BUCKET_PATTERN = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/
 const SERVER_HOSTS = ['127.0.0.1', '0.0.0.0', '::1', '::'] as const
+const BASE64URL_SECRET_PATTERN = /^[A-Za-z0-9_-]+$/u
+const TEST_CURSOR_SIGNING_KEY = 'QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI'
 
 function invalid(name: string): never {
   throw new Error(`Invalid configuration: ${name}`)
@@ -80,6 +83,13 @@ function databaseUrl(env: Environment, name: string): string {
   } catch {
     invalid(name)
   }
+  return value
+}
+
+function cursorSigningKey(value: string, name: string): string {
+  if (!BASE64URL_SECRET_PATTERN.test(value)) invalid(name)
+  const decoded = Buffer.from(value, 'base64url')
+  if (decoded.length < 32 || decoded.toString('base64url') !== value) invalid(name)
   return value
 }
 
@@ -212,6 +222,10 @@ export function loadRuntimeConfig(env: Environment): RuntimeConfig {
     return {
       nodeEnv,
       databaseUrl: runtimeDatabaseUrl,
+      cursorSigningKey: cursorSigningKey(
+        env['CURSOR_SIGNING_KEY'] ?? TEST_CURSOR_SIGNING_KEY,
+        'CURSOR_SIGNING_KEY',
+      ),
       wechat: {
         authMode,
         appId: env['WECHAT_APP_ID'] ?? '',
@@ -239,6 +253,10 @@ export function loadRuntimeConfig(env: Environment): RuntimeConfig {
   const appSecret = required(env, 'WECHAT_APP_SECRET')
   const privateKey = required(env, 'JWT_PRIVATE_KEY')
   const publicKey = required(env, 'JWT_PUBLIC_KEY')
+  const historyCursorKey = cursorSigningKey(
+    required(env, 'CURSOR_SIGNING_KEY'),
+    'CURSOR_SIGNING_KEY',
+  )
   const r2EndpointValue = required(env, 'R2_ENDPOINT')
   const bucket = required(env, 'R2_BUCKET')
   const accessKeyId = required(env, 'R2_ACCESS_KEY_ID')
@@ -256,6 +274,13 @@ export function loadRuntimeConfig(env: Environment): RuntimeConfig {
     }
 
     validateEd25519Keys(privateKey, publicKey)
+    if (
+      historyCursorKey === TEST_CURSOR_SIGNING_KEY ||
+      PLACEHOLDER_PATTERN.test(historyCursorKey) ||
+      PLACEHOLDER_PATTERN.test(Buffer.from(historyCursorKey, 'base64url').toString('utf8'))
+    ) {
+      invalid('CURSOR_SIGNING_KEY')
+    }
 
     const r2Endpoint = endpointUrl(r2EndpointValue, 'R2_ENDPOINT')
     const r2Hostname = r2Endpoint.hostname.toLowerCase()
@@ -286,6 +311,7 @@ export function loadRuntimeConfig(env: Environment): RuntimeConfig {
   return {
     nodeEnv,
     databaseUrl: runtimeDatabaseUrl,
+    cursorSigningKey: historyCursorKey,
     wechat: {
       authMode,
       appId,

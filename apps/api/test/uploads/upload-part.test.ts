@@ -162,6 +162,8 @@ function failFirstPartConfirmation(repository: UploadRepository): UploadReposito
     },
     scheduleValidationAbort: (input) => repository.scheduleValidationAbort(input),
     getDetail: (input) => repository.getDetail(input),
+    completeUpload: (input) => repository.completeUpload(input),
+    abortUpload: (input) => repository.abortUpload(input),
   }
 }
 

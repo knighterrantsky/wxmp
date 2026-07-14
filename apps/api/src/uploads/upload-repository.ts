@@ -1,6 +1,9 @@
 import { timingSafeEqual } from 'node:crypto'
 
 import type {
+  AbortUploadRequest,
+  AbortUploadResponse,
+  CompleteUploadResponse,
   ErrorCode,
   InitializeUploadRequest,
   InitializeUploadResponse,
@@ -14,6 +17,11 @@ import type { AuthRequestContext } from '../auth/auth-repository.js'
 import { ApiError, PUBLIC_ERROR_MESSAGES } from '../http/errors.js'
 import type { Clock } from '../lib/clock.js'
 import type { IdGenerator } from '../lib/id.js'
+import {
+  projectPublicStatus,
+  type MediaStorageStatus,
+  type UploadSessionStatus,
+} from './public-status.js'
 
 export type InitializeUploadData = InitializeUploadResponse['data']
 
@@ -41,7 +49,7 @@ export interface InitializeUploadDraft {
 }
 
 export type BeginInitializationResult =
-  | { kind: 'created' }
+  | { kind: 'created'; fence: bigint }
   | { kind: 'replay_success'; data: InitializeUploadData }
   | {
       kind: 'replay_failure'
@@ -54,16 +62,23 @@ export type BeginInitializationResult =
 
 export interface UploadRepository {
   beginInitialization(draft: InitializeUploadDraft): Promise<BeginInitializationResult>
-  completeInitialization(input: { draft: InitializeUploadDraft; r2UploadId: string }): Promise<void>
+  completeInitialization(input: {
+    draft: InitializeUploadDraft
+    r2UploadId: string
+    fence: bigint
+  }): Promise<void>
   failInitialization(input: {
     draft: InitializeUploadDraft
     code: 'STORAGE_UNAVAILABLE'
+    fence: bigint
   }): Promise<void>
   assertPartOwnership(input: { userId: string; uploadId: string }): Promise<void>
   preparePart(input: PrepareUploadPartInput): Promise<PreparedUploadPart>
   confirmPart(input: ConfirmUploadPartInput): Promise<UploadPartResponse['data']>
   scheduleValidationAbort(input: ScheduleValidationAbortInput): Promise<void>
   getDetail(input: { userId: string; uploadId: string }): Promise<UploadDetailResponse['data']>
+  completeUpload(input: CompleteUploadInput): Promise<CompleteUploadResult>
+  abortUpload(input: AbortUploadInput): Promise<AbortUploadResult>
 }
 
 export interface PartRequestContext extends AuthRequestContext {
@@ -109,6 +124,34 @@ export interface ScheduleValidationAbortInput {
   prepared: PreparedPartIdentity
   context: PartRequestContext
   failureCode: 'FILE_TOO_SMALL' | 'MIME_MISMATCH'
+}
+
+export interface UploadLifecycleInput {
+  userId: string
+  sessionId: string
+  uploadId: string
+  idempotencyKey: string
+  requestHash: Buffer
+  context: AuthRequestContext
+}
+
+export type CompleteUploadInput = UploadLifecycleInput
+
+export interface AbortUploadInput extends UploadLifecycleInput {
+  reason: AbortUploadRequest['reason']
+}
+
+export type CompleteUploadResult =
+  | {
+      kind: 'accepted'
+      data: CompleteUploadResponse['data']
+      replayed: boolean
+    }
+  | { kind: 'expired'; replayed: boolean }
+
+export interface AbortUploadResult {
+  data: AbortUploadResponse['data']
+  replayed: boolean
 }
 
 interface IdempotencyRow {
@@ -170,6 +213,11 @@ interface UploadDetailRow {
   confirmed_size_bytes: string
   confirmed_part_count: number
   expires_at: Date | string
+  next_finalize_at: Date | string | null
+  next_abort_at: Date | string | null
+  completed_at: Date | string | null
+  aborted_at: Date | string | null
+  expired_at: Date | string | null
   failure_code: string | null
   failed_at: Date | string | null
   created_at: Date | string
@@ -182,6 +230,23 @@ interface UploadDetailPartRow {
   expected_size_bytes: number
   status: 'pending' | 'uploaded' | 'verified'
   checksum_sha256: Buffer | null
+}
+
+interface LifecycleUploadRow {
+  media_object_id: string
+  status: string
+  expected_size_bytes: string
+  expected_part_count: number
+  confirmed_size_bytes: string
+  confirmed_part_count: number
+  expires_at: Date | string
+}
+
+interface LifecyclePartRow {
+  part_number: number
+  status: 'pending' | 'uploaded' | 'verified'
+  expected_size_bytes: number
+  actual_size_bytes: number | null
 }
 
 function rollback(client: PoolClient): Promise<void> {
@@ -202,13 +267,18 @@ function apiError(
 function uploadError(
   code:
     | 'FIRST_PART_REQUIRED'
+    | 'IDEMPOTENCY_IN_PROGRESS'
+    | 'IDEMPOTENCY_KEY_REUSED'
     | 'PART_NUMBER_INVALID'
+    | 'PARTS_INCOMPLETE'
     | 'UPLOAD_EXPIRED'
+    | 'UPLOAD_NOT_ABORTABLE'
     | 'UPLOAD_NOT_FOUND'
     | 'UPLOAD_NOT_WRITABLE',
   statusCode: number,
+  options: { details?: Record<string, unknown>; retryable?: boolean } = {},
 ): ApiError {
-  return new ApiError({ code, message: code, statusCode })
+  return new ApiError({ code, message: code, statusCode, ...options })
 }
 
 function assertActiveUser(user: Pick<UserRow, 'status'> | undefined): void {
@@ -236,14 +306,33 @@ function detailedProgress(input: {
   }
 }
 
-function publicUploadStatus(uploadStatus: string, mediaStatus: string) {
-  if (uploadStatus === 'completing') return 'finalizing' as const
-  if (uploadStatus === 'aborting') return 'cancelling' as const
-  if (uploadStatus === 'completed' && mediaStatus === 'ready') return 'uploaded' as const
-  if (uploadStatus === 'aborted') return 'aborted' as const
-  if (uploadStatus === 'expired') return 'expired' as const
-  if (uploadStatus === 'failed' || mediaStatus === 'failed') return 'upload_failed' as const
-  return 'uploading' as const
+const PART_DETAIL_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000
+
+function terminalAt(row: UploadDetailRow): Date | null {
+  const value =
+    row.upload_status === 'completed'
+      ? row.completed_at
+      : row.upload_status === 'aborted'
+        ? row.aborted_at
+        : row.upload_status === 'expired'
+          ? row.expired_at
+          : row.upload_status === 'failed'
+            ? row.failed_at
+            : null
+  return value === null ? null : asDate(value)
+}
+
+function pollAfterSeconds(row: UploadDetailRow, status: string, now: Date): number | null {
+  if (status === 'uploading') return 2
+  const schedule =
+    status === 'finalizing'
+      ? row.next_finalize_at
+      : status === 'cancelling'
+        ? row.next_abort_at
+        : null
+  if (schedule === null) return null
+  const seconds = Math.ceil((asDate(schedule).getTime() - now.getTime()) / 1_000)
+  return Math.max(2, Math.min(30, seconds))
 }
 
 const PUBLIC_FAILURE_CODES = new Set<ErrorCode>([
@@ -288,6 +377,65 @@ function replayData(value: unknown): InitializeUploadData {
   return value as InitializeUploadData
 }
 
+function lifecycleReplayRow(
+  row: IdempotencyRow,
+  requestHash: Buffer,
+  uploadId: string,
+): 'in_progress' | 'key_reused' | IdempotencyRow {
+  if (!sameHash(row.request_hash, requestHash) || row.resource_id !== uploadId) {
+    return 'key_reused'
+  }
+  if (row.status === 'in_progress') return 'in_progress'
+  return row
+}
+
+function completeReplayData(value: unknown, uploadId: string): CompleteUploadResponse['data'] {
+  if (!isRecord(value) || !isRecord(value['upload'])) {
+    throw new Error('complete idempotency response is invalid')
+  }
+  const upload = value['upload']
+  const progress = upload['progress']
+  if (
+    upload['id'] !== uploadId ||
+    upload['status'] !== 'finalizing' ||
+    !isRecord(progress) ||
+    !Number.isSafeInteger(progress['confirmedBytes']) ||
+    !Number.isSafeInteger(progress['totalBytes']) ||
+    typeof progress['percent'] !== 'number' ||
+    !Number.isSafeInteger(value['pollAfterSeconds'])
+  ) {
+    throw new Error('complete idempotency response is invalid')
+  }
+  return {
+    upload: {
+      id: uploadId,
+      status: 'finalizing',
+      progress: {
+        confirmedBytes: Number(progress['confirmedBytes']),
+        totalBytes: Number(progress['totalBytes']),
+        percent: progress['percent'],
+      },
+    },
+    pollAfterSeconds: Number(value['pollAfterSeconds']),
+  }
+}
+
+function abortReplayData(value: unknown, uploadId: string): AbortUploadResponse['data'] {
+  if (
+    !isRecord(value) ||
+    !isRecord(value['upload']) ||
+    value['upload']['id'] !== uploadId ||
+    value['upload']['status'] !== 'cancelling' ||
+    !Number.isSafeInteger(value['pollAfterSeconds'])
+  ) {
+    throw new Error('abort idempotency response is invalid')
+  }
+  return {
+    upload: { id: uploadId, status: 'cancelling' },
+    pollAfterSeconds: Number(value['pollAfterSeconds']),
+  }
+}
+
 function replayResult(row: IdempotencyRow, requestHash: Buffer): BeginInitializationResult {
   if (!sameHash(row.request_hash, requestHash)) return { kind: 'key_reused' }
   if (row.status === 'in_progress') return { kind: 'in_progress' }
@@ -324,6 +472,27 @@ export class PostgresUploadRepository implements UploadRepository {
     const client = await this.#pool.connect()
     try {
       await client.query('begin')
+      const selectedUser = await client.query<UserRow>(
+        `select status, nickname, nickname_confirmed_at
+           from media_app.users where id = $1 for no key update`,
+        [draft.userId],
+      )
+      const user = selectedUser.rows[0]
+      if (user === undefined || user.status === 'deleted') {
+        throw apiError('UNAUTHORIZED', 401)
+      }
+      if (user.status === 'disabled') throw apiError('USER_DISABLED', 403)
+      if (user.nickname_confirmed_at === null || user.nickname === null) {
+        throw apiError('NICKNAME_REQUIRED', 428)
+      }
+      const selectedSession = await client.query(
+        `select 1
+           from media_app.user_sessions
+          where id = $1 and user_id = $2
+          for key share`,
+        [draft.sessionId, draft.userId],
+      )
+      if (selectedSession.rowCount !== 1) throw apiError('UNAUTHORIZED', 401)
       const inserted = await client.query(
         `insert into media_app.idempotency_records(
            id, principal_type, principal_id, operation, idempotency_key,
@@ -357,19 +526,6 @@ export class PostgresUploadRepository implements UploadRepository {
         existingResult = replayResult(row, draft.requestHash)
       }
 
-      const selectedUser = await client.query<UserRow>(
-        `select status, nickname, nickname_confirmed_at
-           from media_app.users where id = $1 for no key update`,
-        [draft.userId],
-      )
-      const user = selectedUser.rows[0]
-      if (user === undefined || user.status === 'deleted') {
-        throw apiError('UNAUTHORIZED', 401)
-      }
-      if (user.status === 'disabled') throw apiError('USER_DISABLED', 403)
-      if (user.nickname_confirmed_at === null || user.nickname === null) {
-        throw apiError('NICKNAME_REQUIRED', 428)
-      }
       if (existingResult !== undefined) {
         await client.query('commit')
         return existingResult
@@ -423,12 +579,13 @@ export class PostgresUploadRepository implements UploadRepository {
           draft.createdAt,
         ],
       )
-      const linkedIdempotency = await client.query(
+      const linkedIdempotency = await client.query<{ row_version: string }>(
         `update media_app.idempotency_records
             set resource_type = 'upload_session', resource_id = $4, locked_until = $5
           where principal_type = 'user' and principal_id = $1
             and operation = 'upload.initialize' and idempotency_key = $2
-            and request_hash = $3 and status = 'in_progress'`,
+            and request_hash = $3 and status = 'in_progress'
+          returning row_version::text`,
         [
           draft.userId,
           draft.idempotencyKey,
@@ -437,7 +594,8 @@ export class PostgresUploadRepository implements UploadRepository {
           new Date(this.#clock.now().getTime() + 60_000),
         ],
       )
-      if (linkedIdempotency.rowCount !== 1) {
+      const fenceValue = linkedIdempotency.rows[0]?.row_version
+      if (fenceValue === undefined) {
         throw new Error('upload initialization idempotency link was not updated')
       }
       await this.#insertAudit(client, {
@@ -450,7 +608,7 @@ export class PostgresUploadRepository implements UploadRepository {
         },
       })
       await client.query('commit')
-      return { kind: 'created' }
+      return { kind: 'created', fence: BigInt(fenceValue) }
     } catch (error) {
       await rollback(client)
       throw error
@@ -462,17 +620,26 @@ export class PostgresUploadRepository implements UploadRepository {
   async completeInitialization(input: {
     draft: InitializeUploadDraft
     r2UploadId: string
+    fence: bigint
   }): Promise<void> {
     const client = await this.#pool.connect()
     const now = this.#clock.now()
     try {
       await client.query('begin')
-      const state = await this.#lockInitialization(client, input.draft)
       const selectedUser = await client.query<Pick<UserRow, 'status'>>(
         `select status from media_app.users where id = $1 for share`,
         [input.draft.userId],
       )
       assertActiveUser(selectedUser.rows[0])
+      const selectedSession = await client.query(
+        `select 1
+           from media_app.user_sessions
+          where id = $1 and user_id = $2
+          for key share`,
+        [input.draft.sessionId, input.draft.userId],
+      )
+      if (selectedSession.rowCount !== 1) throw apiError('UNAUTHORIZED', 401)
+      const state = await this.#lockInitialization(client, input.draft, input.fence)
       if (
         state.mediaStatus !== 'pending_upload' ||
         state.uploadStatus !== 'initiating' ||
@@ -504,7 +671,8 @@ export class PostgresUploadRepository implements UploadRepository {
                 response_body = $5::jsonb, expires_at = $6
           where principal_type = 'user' and principal_id = $1
             and operation = 'upload.initialize' and idempotency_key = $2
-            and resource_id = $3 and status = 'in_progress' and request_hash = $4`,
+            and resource_id = $3 and status = 'in_progress' and request_hash = $4
+            and row_version = $7`,
         [
           input.draft.userId,
           input.draft.idempotencyKey,
@@ -512,6 +680,7 @@ export class PostgresUploadRepository implements UploadRepository {
           input.draft.requestHash,
           JSON.stringify(input.draft.data),
           new Date(now.getTime() + 7 * 24 * 60 * 60 * 1_000),
+          input.fence.toString(),
         ],
       )
       if (completedIdempotency.rowCount !== 1) {
@@ -534,12 +703,26 @@ export class PostgresUploadRepository implements UploadRepository {
   async failInitialization(input: {
     draft: InitializeUploadDraft
     code: 'STORAGE_UNAVAILABLE'
+    fence: bigint
   }): Promise<void> {
     const client = await this.#pool.connect()
     const now = this.#clock.now()
     try {
       await client.query('begin')
-      const state = await this.#lockInitialization(client, input.draft)
+      const selectedUser = await client.query<Pick<UserRow, 'status'>>(
+        `select status from media_app.users where id = $1 for share`,
+        [input.draft.userId],
+      )
+      assertActiveUser(selectedUser.rows[0])
+      const selectedSession = await client.query(
+        `select 1
+           from media_app.user_sessions
+          where id = $1 and user_id = $2
+          for key share`,
+        [input.draft.sessionId, input.draft.userId],
+      )
+      if (selectedSession.rowCount !== 1) throw apiError('UNAUTHORIZED', 401)
+      const state = await this.#lockInitialization(client, input.draft, input.fence)
       if (
         state.uploadStatus === 'failed' &&
         state.mediaStatus === 'failed' &&
@@ -579,13 +762,14 @@ export class PostgresUploadRepository implements UploadRepository {
                 response_body = $4::jsonb, expires_at = $5
           where principal_type = 'user' and principal_id = $1
             and operation = 'upload.initialize' and idempotency_key = $2
-            and resource_id = $3 and status = 'in_progress'`,
+            and resource_id = $3 and status = 'in_progress' and row_version = $6`,
         [
           input.draft.userId,
           input.draft.idempotencyKey,
           input.draft.uploadId,
           JSON.stringify({ code: input.code, retryable: true }),
           new Date(now.getTime() + 7 * 24 * 60 * 60 * 1_000),
+          input.fence.toString(),
         ],
       )
       if (failedIdempotency.rowCount !== 1) {
@@ -597,6 +781,268 @@ export class PostgresUploadRepository implements UploadRepository {
         metadata: { code: input.code },
       })
       await client.query('commit')
+    } catch (error) {
+      await rollback(client)
+      throw error
+    } finally {
+      client.release()
+    }
+  }
+
+  async completeUpload(input: CompleteUploadInput): Promise<CompleteUploadResult> {
+    const client = await this.#pool.connect()
+    const now = this.#clock.now()
+    try {
+      await client.query('begin')
+      const selectedUser = await client.query<Pick<UserRow, 'status'>>(
+        `select status from media_app.users where id = $1 for share`,
+        [input.userId],
+      )
+      assertActiveUser(selectedUser.rows[0])
+      const selectedSession = await client.query(
+        `select 1
+           from media_app.user_sessions
+          where id = $1 and user_id = $2
+          for key share`,
+        [input.sessionId, input.userId],
+      )
+      if (selectedSession.rowCount !== 1) throw apiError('UNAUTHORIZED', 401)
+      const upload = await this.#lockLifecycleUpload(client, input.userId, input.uploadId)
+      const parts = await client.query<LifecyclePartRow>(
+        `select part_number, status, expected_size_bytes, actual_size_bytes
+           from media_app.upload_parts
+          where upload_session_id = $1
+          order by part_number
+          for update`,
+        [input.uploadId],
+      )
+      const inserted = await this.#insertLifecycleIdempotency(client, {
+        ...input,
+        operation: 'upload.complete',
+        now,
+      })
+      let replay: 'in_progress' | 'key_reused' | IdempotencyRow | undefined
+      if (!inserted) {
+        const existing = await this.#lockLifecycleIdempotency(client, {
+          userId: input.userId,
+          operation: 'upload.complete',
+          idempotencyKey: input.idempotencyKey,
+        })
+        replay = lifecycleReplayRow(existing, input.requestHash, input.uploadId)
+      }
+      if (replay === 'key_reused') throw uploadError('IDEMPOTENCY_KEY_REUSED', 409)
+      if (replay === 'in_progress') {
+        throw uploadError('IDEMPOTENCY_IN_PROGRESS', 409, { retryable: true })
+      }
+      if (replay !== undefined) {
+        if (replay.status === 'completed' && replay.response_status === 202) {
+          const data = completeReplayData(replay.response_body, input.uploadId)
+          await client.query('commit')
+          return { kind: 'accepted', data, replayed: true }
+        }
+        if (
+          replay.status === 'failed' &&
+          replay.response_status === 410 &&
+          isRecord(replay.response_body) &&
+          replay.response_body['code'] === 'UPLOAD_EXPIRED'
+        ) {
+          await client.query('commit')
+          return { kind: 'expired', replayed: true }
+        }
+        throw new Error('complete idempotency record is in an invalid state')
+      }
+
+      if (upload.status !== 'uploading') throw uploadError('UPLOAD_NOT_WRITABLE', 409)
+      if (now.getTime() >= asDate(upload.expires_at).getTime()) {
+        const expired = await client.query(
+          `update media_app.upload_sessions
+              set status = 'aborting', abort_reason = 'expired',
+                  abort_attempt_count = 0, next_abort_at = $2,
+                  last_abort_error_code = null, last_abort_error_at = null,
+                  last_activity_at = $2
+            where id = $1 and status = 'uploading'`,
+          [input.uploadId, now],
+        )
+        if (expired.rowCount !== 1) throw uploadError('UPLOAD_NOT_WRITABLE', 409)
+        await this.#settleLifecycleIdempotency(client, {
+          userId: input.userId,
+          operation: 'upload.complete',
+          idempotencyKey: input.idempotencyKey,
+          requestHash: input.requestHash,
+          uploadId: input.uploadId,
+          status: 'failed',
+          responseStatus: 410,
+          responseBody: { code: 'UPLOAD_EXPIRED', retryable: false },
+          now,
+        })
+        await this.#insertPartAudit(client, {
+          context: { ...input.context, sessionId: input.sessionId },
+          eventType: 'upload.expiry_scheduled',
+          uploadId: input.uploadId,
+          userId: input.userId,
+          metadata: { source: 'complete' },
+        })
+        await client.query('commit')
+        return { kind: 'expired', replayed: false }
+      }
+
+      const byNumber = new Map(parts.rows.map((part) => [part.part_number, part]))
+      const missingPartNumbers: number[] = []
+      for (let partNumber = 1; partNumber <= upload.expected_part_count; partNumber += 1) {
+        const part = byNumber.get(partNumber)
+        if (
+          part === undefined ||
+          (part.status !== 'uploaded' && part.status !== 'verified') ||
+          part.actual_size_bytes !== part.expected_size_bytes
+        ) {
+          missingPartNumbers.push(partNumber)
+        }
+      }
+      if (
+        missingPartNumbers.length > 0 ||
+        Number(upload.confirmed_size_bytes) !== Number(upload.expected_size_bytes) ||
+        upload.confirmed_part_count !== upload.expected_part_count
+      ) {
+        throw uploadError('PARTS_INCOMPLETE', 409, {
+          details: {
+            missingPartNumbers:
+              missingPartNumbers.length > 0
+                ? missingPartNumbers
+                : Array.from({ length: upload.expected_part_count }, (_, index) => index + 1),
+          },
+        })
+      }
+
+      const totalBytes = Number(upload.expected_size_bytes)
+      const data: CompleteUploadResponse['data'] = {
+        upload: {
+          id: input.uploadId,
+          status: 'finalizing',
+          progress: { confirmedBytes: totalBytes, totalBytes, percent: 100 },
+        },
+        pollAfterSeconds: 2,
+      }
+      const completing = await client.query(
+        `update media_app.upload_sessions
+            set status = 'completing', finalize_attempt_count = 0,
+                next_finalize_at = $2, last_finalize_error_code = null,
+                last_finalize_error_at = null, last_activity_at = $2
+          where id = $1 and status = 'uploading'`,
+        [input.uploadId, now],
+      )
+      if (completing.rowCount !== 1) throw uploadError('UPLOAD_NOT_WRITABLE', 409)
+      await this.#settleLifecycleIdempotency(client, {
+        userId: input.userId,
+        operation: 'upload.complete',
+        idempotencyKey: input.idempotencyKey,
+        requestHash: input.requestHash,
+        uploadId: input.uploadId,
+        status: 'completed',
+        responseStatus: 202,
+        responseBody: data,
+        now,
+      })
+      await this.#insertPartAudit(client, {
+        context: { ...input.context, sessionId: input.sessionId },
+        eventType: 'upload.finalization_scheduled',
+        uploadId: input.uploadId,
+        userId: input.userId,
+        metadata: { partCount: upload.expected_part_count },
+      })
+      await client.query('commit')
+      return { kind: 'accepted', data, replayed: false }
+    } catch (error) {
+      await rollback(client)
+      throw error
+    } finally {
+      client.release()
+    }
+  }
+
+  async abortUpload(input: AbortUploadInput): Promise<AbortUploadResult> {
+    const client = await this.#pool.connect()
+    const now = this.#clock.now()
+    try {
+      await client.query('begin')
+      const selectedUser = await client.query<Pick<UserRow, 'status'>>(
+        `select status from media_app.users where id = $1 for share`,
+        [input.userId],
+      )
+      assertActiveUser(selectedUser.rows[0])
+      const selectedSession = await client.query(
+        `select 1
+           from media_app.user_sessions
+          where id = $1 and user_id = $2
+          for key share`,
+        [input.sessionId, input.userId],
+      )
+      if (selectedSession.rowCount !== 1) throw apiError('UNAUTHORIZED', 401)
+      const upload = await this.#lockLifecycleUpload(client, input.userId, input.uploadId)
+      const inserted = await this.#insertLifecycleIdempotency(client, {
+        ...input,
+        operation: 'upload.abort',
+        now,
+      })
+      let replay: 'in_progress' | 'key_reused' | IdempotencyRow | undefined
+      if (!inserted) {
+        const existing = await this.#lockLifecycleIdempotency(client, {
+          userId: input.userId,
+          operation: 'upload.abort',
+          idempotencyKey: input.idempotencyKey,
+        })
+        replay = lifecycleReplayRow(existing, input.requestHash, input.uploadId)
+      }
+      if (replay === 'key_reused') throw uploadError('IDEMPOTENCY_KEY_REUSED', 409)
+      if (replay === 'in_progress') {
+        throw uploadError('IDEMPOTENCY_IN_PROGRESS', 409, { retryable: true })
+      }
+      if (replay !== undefined) {
+        if (replay.status !== 'completed' || replay.response_status !== 202) {
+          throw new Error('abort idempotency record is in an invalid state')
+        }
+        const data = abortReplayData(replay.response_body, input.uploadId)
+        await client.query('commit')
+        return { data, replayed: true }
+      }
+      if (upload.status !== 'initiating' && upload.status !== 'uploading') {
+        throw uploadError('UPLOAD_NOT_ABORTABLE', 409)
+      }
+
+      const data: AbortUploadResponse['data'] = {
+        upload: { id: input.uploadId, status: 'cancelling' },
+        pollAfterSeconds: 2,
+      }
+      const reason = now.getTime() >= asDate(upload.expires_at).getTime() ? 'expired' : input.reason
+      const aborting = await client.query(
+        `update media_app.upload_sessions
+            set status = 'aborting', abort_reason = $2,
+                abort_attempt_count = 0, next_abort_at = $3,
+                last_abort_error_code = null, last_abort_error_at = null,
+                last_activity_at = $3
+          where id = $1 and status in ('initiating', 'uploading')`,
+        [input.uploadId, reason, now],
+      )
+      if (aborting.rowCount !== 1) throw uploadError('UPLOAD_NOT_ABORTABLE', 409)
+      await this.#settleLifecycleIdempotency(client, {
+        userId: input.userId,
+        operation: 'upload.abort',
+        idempotencyKey: input.idempotencyKey,
+        requestHash: input.requestHash,
+        uploadId: input.uploadId,
+        status: 'completed',
+        responseStatus: 202,
+        responseBody: data,
+        now,
+      })
+      await this.#insertPartAudit(client, {
+        context: { ...input.context, sessionId: input.sessionId },
+        eventType: 'upload.abort_scheduled',
+        uploadId: input.uploadId,
+        userId: input.userId,
+        metadata: { reason },
+      })
+      await client.query('commit')
+      return { data, replayed: false }
     } catch (error) {
       await rollback(client)
       throw error
@@ -937,38 +1383,42 @@ export class PostgresUploadRepository implements UploadRepository {
               u.status as upload_status, m.storage_status as media_status,
               m.original_filename, m.kind, m.declared_content_type,
               u.expected_size_bytes::text, u.expected_part_count,
-              coalesce(a.confirmed_size_bytes, 0)::text as confirmed_size_bytes,
-              coalesce(a.confirmed_part_count, 0)::integer as confirmed_part_count,
-              u.expires_at, u.failure_code, u.failed_at, u.created_at,
+              u.confirmed_size_bytes::text, u.confirmed_part_count,
+              u.expires_at, u.next_finalize_at, u.next_abort_at,
+              u.completed_at, u.aborted_at, u.expired_at,
+              u.failure_code, u.failed_at, u.created_at,
               greatest(u.updated_at, m.updated_at, u.last_activity_at) as updated_at
          from media_app.upload_sessions u
          join media_app.media_objects m on m.id = u.media_object_id
-         left join lateral (
-           select coalesce(sum(p.actual_size_bytes), 0) as confirmed_size_bytes,
-                  count(*)::integer as confirmed_part_count
-             from media_app.upload_parts p
-            where p.upload_session_id = u.id
-              and p.status in ('uploaded', 'verified')
-         ) a on true
         where u.id = $1 and u.user_id = $2`,
         [input.uploadId, input.userId],
       )
       const row = selected.rows[0]
       if (row === undefined) throw uploadError('UPLOAD_NOT_FOUND', 404)
-      const selectedParts = await client.query<UploadDetailPartRow>(
-        `select part_number, offset_bytes::text, expected_size_bytes,
-              status, checksum_sha256
-         from media_app.upload_parts
-        where upload_session_id = $1
-        order by part_number`,
-        [input.uploadId],
-      )
       const totalBytes = Number(row.expected_size_bytes)
       const confirmedBytes = Number(row.confirmed_size_bytes)
       if (!Number.isSafeInteger(totalBytes) || !Number.isSafeInteger(confirmedBytes)) {
         throw new Error('upload progress is invalid')
       }
-      const status = publicUploadStatus(row.upload_status, row.media_status)
+      const status = projectPublicStatus(
+        row.upload_status as UploadSessionStatus,
+        row.media_status as MediaStorageStatus,
+      )
+      const terminal = terminalAt(row)
+      const partsAvailableUntil =
+        terminal === null ? null : new Date(terminal.getTime() + PART_DETAIL_RETENTION_MS)
+      const partDetailsRetained =
+        partsAvailableUntil === null || this.#clock.now().getTime() <= partsAvailableUntil.getTime()
+      const selectedParts = partDetailsRetained
+        ? await client.query<UploadDetailPartRow>(
+            `select part_number, offset_bytes::text, expected_size_bytes,
+                    status, checksum_sha256
+               from media_app.upload_parts
+              where upload_session_id = $1
+              order by part_number`,
+            [input.uploadId],
+          )
+        : { rows: [] }
       const common = {
         id: row.upload_id,
         mediaId: row.media_id,
@@ -1006,8 +1456,8 @@ export class PostgresUploadRepository implements UploadRepository {
             }
       const data: UploadDetailResponse['data'] = {
         upload,
-        partDetailsRetained: true,
-        partsAvailableUntil: null,
+        partDetailsRetained,
+        partsAvailableUntil: partsAvailableUntil?.toISOString() ?? null,
         parts: selectedParts.rows.map((part) => ({
           partNumber: part.part_number,
           offsetBytes: Number(part.offset_bytes),
@@ -1015,7 +1465,7 @@ export class PostgresUploadRepository implements UploadRepository {
           status: part.status,
           sha256: part.checksum_sha256?.toString('hex') ?? null,
         })),
-        pollAfterSeconds: ['uploading', 'finalizing', 'cancelling'].includes(status) ? 2 : null,
+        pollAfterSeconds: pollAfterSeconds(row, status, this.#clock.now()),
       }
       await client.query('commit')
       return data
@@ -1025,6 +1475,127 @@ export class PostgresUploadRepository implements UploadRepository {
     } finally {
       client.release()
     }
+  }
+
+  async #lockLifecycleUpload(
+    client: PoolClient,
+    userId: string,
+    uploadId: string,
+  ): Promise<LifecycleUploadRow> {
+    const media = await client.query<{ id: string }>(
+      `select m.id
+         from media_app.media_objects m
+        where m.user_id = $1
+          and exists (
+            select 1 from media_app.upload_sessions u
+             where u.id = $2 and u.media_object_id = m.id and u.user_id = $1
+          )
+        for update`,
+      [userId, uploadId],
+    )
+    const mediaId = media.rows[0]?.id
+    if (mediaId === undefined) throw uploadError('UPLOAD_NOT_FOUND', 404)
+    const upload = await client.query<LifecycleUploadRow>(
+      `select media_object_id, status, expected_size_bytes::text,
+              expected_part_count, confirmed_size_bytes::text,
+              confirmed_part_count, expires_at
+         from media_app.upload_sessions
+        where id = $1 and media_object_id = $2 and user_id = $3
+        for update`,
+      [uploadId, mediaId, userId],
+    )
+    const row = upload.rows[0]
+    if (row === undefined) throw uploadError('UPLOAD_NOT_FOUND', 404)
+    return row
+  }
+
+  async #insertLifecycleIdempotency(
+    client: PoolClient,
+    input: UploadLifecycleInput & {
+      operation: 'upload.abort' | 'upload.complete'
+      now: Date
+    },
+  ): Promise<boolean> {
+    const inserted = await client.query(
+      `insert into media_app.idempotency_records(
+         id, principal_type, principal_id, operation, idempotency_key,
+         request_hash, status, locked_until, resource_type, resource_id,
+         expires_at, created_at, updated_at
+       ) values ($1, 'user', $2, $3, $4, $5, 'in_progress', $6,
+                 'upload_session', $7, $8, $9, $9)
+       on conflict (principal_type, principal_id, operation, idempotency_key) do nothing
+       returning id`,
+      [
+        this.#ids.next(),
+        input.userId,
+        input.operation,
+        input.idempotencyKey,
+        input.requestHash,
+        new Date(input.now.getTime() + 60_000),
+        input.uploadId,
+        new Date(input.now.getTime() + 7 * 24 * 60 * 60 * 1_000),
+        input.now,
+      ],
+    )
+    return inserted.rowCount === 1
+  }
+
+  async #lockLifecycleIdempotency(
+    client: PoolClient,
+    input: {
+      userId: string
+      operation: 'upload.abort' | 'upload.complete'
+      idempotencyKey: string
+    },
+  ): Promise<IdempotencyRow> {
+    const existing = await client.query<IdempotencyRow>(
+      `select request_hash, status, resource_id, response_status, response_body
+         from media_app.idempotency_records
+        where principal_type = 'user' and principal_id = $1
+          and operation = $2 and idempotency_key = $3
+        for update`,
+      [input.userId, input.operation, input.idempotencyKey],
+    )
+    const row = existing.rows[0]
+    if (row === undefined) throw new Error('idempotency conflict could not be loaded')
+    return row
+  }
+
+  async #settleLifecycleIdempotency(
+    client: PoolClient,
+    input: {
+      userId: string
+      operation: 'upload.abort' | 'upload.complete'
+      idempotencyKey: string
+      requestHash: Buffer
+      uploadId: string
+      status: 'completed' | 'failed'
+      responseStatus: 202 | 410
+      responseBody:
+        Record<string, unknown> | AbortUploadResponse['data'] | CompleteUploadResponse['data']
+      now: Date
+    },
+  ): Promise<void> {
+    const settled = await client.query(
+      `update media_app.idempotency_records
+          set status = $6, locked_until = null, response_status = $7,
+              response_body = $8::jsonb, expires_at = $9
+        where principal_type = 'user' and principal_id = $1
+          and operation = $2 and idempotency_key = $3
+          and request_hash = $4 and resource_id = $5 and status = 'in_progress'`,
+      [
+        input.userId,
+        input.operation,
+        input.idempotencyKey,
+        input.requestHash,
+        input.uploadId,
+        input.status,
+        input.responseStatus,
+        JSON.stringify(input.responseBody),
+        new Date(input.now.getTime() + 7 * 24 * 60 * 60 * 1_000),
+      ],
+    )
+    if (settled.rowCount !== 1) throw new Error('lifecycle idempotency result was not settled')
   }
 
   async #aggregateProgress(
@@ -1080,6 +1651,7 @@ export class PostgresUploadRepository implements UploadRepository {
   async #lockInitialization(
     client: PoolClient,
     draft: InitializeUploadDraft,
+    fence: bigint,
   ): Promise<LockedInitializationState> {
     const media = await client.query<{ storage_status: string }>(
       `select storage_status
@@ -1107,9 +1679,9 @@ export class PostgresUploadRepository implements UploadRepository {
         where principal_type = 'user' and principal_id = $1
           and operation = 'upload.initialize' and idempotency_key = $2
           and resource_type = 'upload_session' and resource_id = $3
-          and request_hash = $4
+          and request_hash = $4 and row_version = $5
         for update`,
-      [draft.userId, draft.idempotencyKey, draft.uploadId, draft.requestHash],
+      [draft.userId, draft.idempotencyKey, draft.uploadId, draft.requestHash, fence.toString()],
     )
     const idempotencyRow = idempotency.rows[0]
     if (idempotencyRow === undefined) {

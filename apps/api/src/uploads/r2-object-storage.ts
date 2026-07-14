@@ -70,6 +70,7 @@ const ACCESS_DENIED_NAMES = new Set([
   'SignatureDoesNotMatch',
 ])
 const NOT_FOUND_NAMES = new Set(['NoSuchBucket', 'NoSuchKey', 'NoSuchUpload', 'NotFound'])
+const AMBIGUOUS_CLIENT_ERROR_NAMES = new Set(['ClientDisconnect'])
 const NETWORK_CODES = new Set([
   'ECONNREFUSED',
   'ECONNRESET',
@@ -144,6 +145,9 @@ function classifiedCode(error: unknown): {
         NETWORK_CODES.has(value) || /(?:Network|Networking|Socket|Connection)/iu.test(value),
     )
   ) {
+    return { code: 'NETWORK', certainty: 'ambiguous', retryable: true }
+  }
+  if (labels.some((value) => AMBIGUOUS_CLIENT_ERROR_NAMES.has(value))) {
     return { code: 'NETWORK', certainty: 'ambiguous', retryable: true }
   }
   if (
@@ -250,6 +254,21 @@ function optionalStorageString(
   return requiredStorageString(value, operation, maximumLength)
 }
 
+function whitelistedHeadMetadata(
+  value: unknown,
+  operation: ObjectStorageOperation,
+): { mediaId?: string; userId?: string } | undefined {
+  if (value === undefined) return undefined
+  const metadata = record(value, operation)
+  const mediaId = optionalStorageString(metadata['mediaid'], operation, 128)
+  const userId = optionalStorageString(metadata['userid'], operation, 128)
+  if (mediaId === undefined && userId === undefined) return undefined
+  return {
+    ...(mediaId === undefined ? {} : { mediaId }),
+    ...(userId === undefined ? {} : { userId }),
+  }
+}
+
 function truncated(value: unknown, operation: ObjectStorageOperation): boolean {
   if (value === undefined) return false
   if (typeof value !== 'boolean') throw protocolError(operation)
@@ -311,6 +330,7 @@ export class R2ObjectStorage implements ObjectStorage {
   async listMultipartUploads(input: {
     bucket: string
     prefix: string
+    signal?: AbortSignal
   }): Promise<{ key: string; uploadId: string; initiatedAt?: Date }[]> {
     const operation = 'listMultipartUploads'
     const results: { key: string; uploadId: string; initiatedAt?: Date }[] = []
@@ -331,6 +351,7 @@ export class R2ObjectStorage implements ObjectStorage {
             ...(keyMarker === undefined ? {} : { KeyMarker: keyMarker }),
             ...(uploadIdMarker === undefined ? {} : { UploadIdMarker: uploadIdMarker }),
           }),
+          input.signal,
         ),
         operation,
       )
@@ -395,6 +416,7 @@ export class R2ObjectStorage implements ObjectStorage {
     bucket: string
     key: string
     uploadId: string
+    signal?: AbortSignal
   }): Promise<{ partNumber: number; etag: string; sizeBytes: number }[]> {
     const operation = 'listParts'
     const results: { partNumber: number; etag: string; sizeBytes: number }[] = []
@@ -414,6 +436,7 @@ export class R2ObjectStorage implements ObjectStorage {
             UploadId: input.uploadId,
             ...(partNumberMarker === undefined ? {} : { PartNumberMarker: partNumberMarker }),
           }),
+          input.signal,
         ),
         operation,
       )
@@ -462,6 +485,7 @@ export class R2ObjectStorage implements ObjectStorage {
     key: string
     uploadId: string
     parts: { partNumber: number; etag: string }[]
+    signal?: AbortSignal
   }): Promise<{ etag: string }> {
     const operation = 'completeMultipart'
     const parts = input.parts.map((part) => ({
@@ -477,22 +501,28 @@ export class R2ObjectStorage implements ObjectStorage {
           UploadId: input.uploadId,
           MultipartUpload: { Parts: parts },
         }),
+        input.signal,
       ),
       operation,
     )
     return { etag: requiredEtag(output['ETag'], operation) }
   }
 
-  async abortMultipart(input: { bucket: string; key: string; uploadId: string }): Promise<void> {
+  async abortMultipart(input: {
+    bucket: string
+    key: string
+    uploadId: string
+    signal?: AbortSignal
+  }): Promise<void> {
     const operation = 'abortMultipart'
     try {
-      await this.#client.send(
-        new AbortMultipartUploadCommand({
-          Bucket: input.bucket,
-          Key: input.key,
-          UploadId: input.uploadId,
-        }),
-      )
+      const command = new AbortMultipartUploadCommand({
+        Bucket: input.bucket,
+        Key: input.key,
+        UploadId: input.uploadId,
+      })
+      if (input.signal === undefined) await this.#client.send(command)
+      else await this.#client.send(command, { abortSignal: input.signal })
     } catch (error) {
       if (isMissing(error, new Set(['NoSuchUpload', 'NotFound']))) return
       throw classifiedError(operation, error)
@@ -502,11 +532,16 @@ export class R2ObjectStorage implements ObjectStorage {
   async headObject(input: {
     bucket: string
     key: string
-  }): Promise<{ sizeBytes: number; contentType?: string; etag?: string } | null> {
+    signal?: AbortSignal
+  }): ReturnType<ObjectStorage['headObject']> {
     const operation = 'headObject'
     let raw: unknown
     try {
-      raw = await this.#client.send(new HeadObjectCommand({ Bucket: input.bucket, Key: input.key }))
+      const command = new HeadObjectCommand({ Bucket: input.bucket, Key: input.key })
+      raw =
+        input.signal === undefined
+          ? await this.#client.send(command)
+          : await this.#client.send(command, { abortSignal: input.signal })
     } catch (error) {
       if (isMissing(error, new Set(['NoSuchKey', 'NotFound']))) return null
       throw classifiedError(operation, error)
@@ -516,11 +551,13 @@ export class R2ObjectStorage implements ObjectStorage {
     const size = output['ContentLength']
     if (!Number.isSafeInteger(size) || Number(size) < 0) throw protocolError(operation)
     const contentType = optionalStorageString(output['ContentType'], operation, 256)
-    const etag = output['ETag'] === undefined ? undefined : requiredEtag(output['ETag'], operation)
+    const etag = requiredEtag(output['ETag'], operation)
+    const metadata = whitelistedHeadMetadata(output['Metadata'], operation)
     return {
       sizeBytes: Number(size),
       ...(contentType === undefined ? {} : { contentType }),
-      ...(etag === undefined ? {} : { etag }),
+      etag,
+      ...(metadata === undefined ? {} : { metadata }),
     }
   }
 

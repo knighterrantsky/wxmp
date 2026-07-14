@@ -160,6 +160,9 @@ function uploadService(
     concurrency: {
       acquirePart: () => Promise.reject(new Error('part upload is outside this test')),
     },
+    exclusiveConcurrency: {
+      acquireExclusiveUpload: () => Promise.resolve({ release: () => Promise.resolve(undefined) }),
+    },
     ...options,
   })
 }
@@ -384,8 +387,8 @@ describe('upload initialization saga', () => {
       const [primaryResult, retryResult] = await Promise.allSettled([primary, retry])
       expect(primaryResult.status).toBe('fulfilled')
       expect(retryResult).toMatchObject({
-        status: 'rejected',
-        reason: { code: 'IDEMPOTENCY_IN_PROGRESS', statusCode: 409 },
+        status: 'fulfilled',
+        value: { replayed: true },
       })
       for (const result of [primaryResult, retryResult]) {
         if (result.status === 'rejected') {
@@ -668,6 +671,10 @@ describe('upload initialization saga', () => {
       concurrency: {
         acquirePart: () => Promise.reject(new Error('part upload is outside this test')),
       },
+      exclusiveConcurrency: {
+        acquireExclusiveUpload: () =>
+          Promise.resolve({ release: () => Promise.resolve(undefined) }),
+      },
     })
     const key = idempotencyKey(27)
 
@@ -842,6 +849,8 @@ function uploadRouteApp(
     initialize: initializeUpload,
     uploadPart: () => Promise.reject(new Error('part upload is outside this test')),
     getDetail: () => Promise.reject(new Error('upload detail is outside this test')),
+    complete: () => Promise.reject(new Error('complete upload is outside this test')),
+    abort: () => Promise.reject(new Error('abort upload is outside this test')),
   }
   const verifyAccessToken = vi
     .fn<AccessTokenVerifier['verifyAccessToken']>()

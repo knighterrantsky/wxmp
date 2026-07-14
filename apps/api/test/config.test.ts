@@ -16,6 +16,7 @@ const productionEnv = {
   WECHAT_CODE2SESSION_ENDPOINT: 'https://api.weixin.qq.com/sns/jscode2session',
   JWT_PRIVATE_KEY: privateKey.export({ format: 'pem', type: 'pkcs8' }).toString(),
   JWT_PUBLIC_KEY: publicKey.export({ format: 'pem', type: 'spki' }).toString(),
+  CURSOR_SIGNING_KEY: 'cHJvZHVjdGlvbi1jdXJzb3Itc2lnbmluZy1zZWNyZXQtMzJieXRlcyEh',
   R2_ENDPOINT: 'https://0123456789abcdef.r2.cloudflarestorage.com',
   R2_BUCKET: 'private-media-production',
   R2_ACCESS_KEY_ID: 'r2-production-access-key-id',
@@ -171,6 +172,8 @@ describe('runtime production safety', () => {
     ['R2_FORCE_PATH_STYLE', 'true'],
     ['JWT_PRIVATE_KEY', 'temporary-development-key'],
     ['JWT_PUBLIC_KEY', 'temporary-development-key'],
+    ['CURSOR_SIGNING_KEY', 'change-me'],
+    ['CURSOR_SIGNING_KEY', 'QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI'],
     ['HOST', 'api.internal.example'],
     ['PORT', '0'],
     ['PORT', '65536'],
@@ -204,6 +207,19 @@ describe('runtime production safety', () => {
     ).toThrow(/JWT_PUBLIC_KEY/)
   })
 
+  it('rejects a base64url-encoded placeholder cursor signing key', () => {
+    const encodedPlaceholder = Buffer.from('change-me-change-me-change-me-change-me').toString(
+      'base64url',
+    )
+
+    expect(() =>
+      loadRuntimeConfig({
+        ...productionEnv,
+        CURSOR_SIGNING_KEY: encodedPlaceholder,
+      }),
+    ).toThrow(/CURSOR_SIGNING_KEY/)
+  })
+
   it('requires every external production setting', () => {
     for (const name of [
       'DATABASE_URL',
@@ -211,6 +227,7 @@ describe('runtime production safety', () => {
       'WECHAT_APP_SECRET',
       'JWT_PRIVATE_KEY',
       'JWT_PUBLIC_KEY',
+      'CURSOR_SIGNING_KEY',
       'R2_ENDPOINT',
       'R2_BUCKET',
       'R2_ACCESS_KEY_ID',

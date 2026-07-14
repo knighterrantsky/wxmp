@@ -50,6 +50,16 @@ export interface MultipartIdentity {
   uploadId: string
 }
 
+export interface ObjectStorageHeadResult {
+  sizeBytes: number
+  contentType?: string
+  etag?: string
+  metadata?: {
+    mediaId?: string
+    userId?: string
+  }
+}
+
 export interface ObjectStorage {
   ready(signal?: AbortSignal): Promise<boolean>
   createMultipart(input: {
@@ -59,7 +69,7 @@ export interface ObjectStorage {
     metadata: Record<string, string>
     signal?: AbortSignal
   }): Promise<{ uploadId: string }>
-  listMultipartUploads(input: { bucket: string; prefix: string }): Promise<
+  listMultipartUploads(input: { bucket: string; prefix: string; signal?: AbortSignal }): Promise<
     {
       key: string
       uploadId: string
@@ -75,7 +85,7 @@ export interface ObjectStorage {
     body: Readable
     signal?: AbortSignal
   }): Promise<{ etag: string }>
-  listParts(input: MultipartIdentity): Promise<
+  listParts(input: MultipartIdentity & { signal?: AbortSignal }): Promise<
     {
       partNumber: number
       etag: string
@@ -85,11 +95,13 @@ export interface ObjectStorage {
   completeMultipart(
     input: MultipartIdentity & {
       parts: { partNumber: number; etag: string }[]
+      signal?: AbortSignal
     },
   ): Promise<{ etag: string }>
-  abortMultipart(input: MultipartIdentity): Promise<void>
+  abortMultipart(input: MultipartIdentity & { signal?: AbortSignal }): Promise<void>
   headObject(input: {
     bucket: string
     key: string
-  }): Promise<{ sizeBytes: number; contentType?: string; etag?: string } | null>
+    signal?: AbortSignal
+  }): Promise<ObjectStorageHeadResult | null>
 }

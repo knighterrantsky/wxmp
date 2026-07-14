@@ -29,6 +29,7 @@ export interface FakeDependencyOverrides {
   authRepository?: AuthRepository
   objectStorage?: ObjectStorage
   objectStorageBucket?: string
+  cursorSigningSecret?: Buffer
   uploadRepository?: UploadRepository
   uploadConcurrency?: AppDependencies['uploadConcurrency']
   uploadLockPool?: AppDependencies['uploadLockPool']
@@ -110,6 +111,7 @@ export function fakeDependencies(overrides: FakeDependencyOverrides = {}): FakeD
     tokenService: overrides.tokenService ?? defaultTokenService,
     objectStorage,
     objectStorageBucket: overrides.objectStorageBucket ?? 'private-test-bucket',
+    cursorSigningSecret: overrides.cursorSigningSecret ?? Buffer.alloc(32, 0x42),
     ...(overrides.authRepository === undefined ? {} : { authRepository: overrides.authRepository }),
     ...(overrides.uploadRepository === undefined
       ? {}

@@ -2,14 +2,27 @@ import type { Readable } from 'node:stream'
 
 import multipart from '@fastify/multipart'
 import {
+  AbortUploadRequestSchema,
+  AbortUploadResponseSchema,
+  CompleteUploadRequestSchema,
+  CompleteUploadResponseSchema,
   InitializeUploadResponseSchema,
   PART_SIZE_BYTES,
   UploadDetailResponseSchema,
+  UploadHistoryQuerySchema,
+  UploadHistoryResponseSchema,
   UploadPartParamsSchema,
   UploadPartResponseSchema,
   UploadPathParamsSchema,
+  type AbortUploadRequest,
+  type AbortUploadResponse,
+  type CompleteUploadRequest,
+  type CompleteUploadResponse,
   type InitializeUploadResponse,
+  type Pagination,
   type UploadDetailResponse,
+  type UploadHistoryQuery,
+  type UploadHistoryResponse,
   type UploadPartResponse,
 } from '@wx-upload/contracts'
 import type { FastifyInstance } from 'fastify'
@@ -20,7 +33,7 @@ import {
   requestAuthContext,
   type AccessTokenVerifier,
 } from '../auth/auth-routes.js'
-import { sendData } from '../http/envelope.js'
+import { sendData, sendListData } from '../http/envelope.js'
 import { ApiError } from '../http/errors.js'
 import { rateLimitPolicy } from '../http/security.js'
 import type { InitializeUploadCandidate } from './media-policy.js'
@@ -74,6 +87,22 @@ export interface GetUploadDetailInput {
   uploadId: string
 }
 
+export interface CompleteUploadRouteInput {
+  userId: string
+  sessionId: string
+  uploadId: string
+  idempotencyKey: string
+  context: {
+    requestId: string
+    sourceIp: string
+    userAgent?: string
+  }
+}
+
+export interface AbortUploadRouteInput extends CompleteUploadRouteInput {
+  reason: AbortUploadRequest['reason']
+}
+
 export interface UploadRouteService {
   initialize(input: InitializeUploadInput): Promise<{
     data: InitializeUploadResponse['data']
@@ -81,6 +110,21 @@ export interface UploadRouteService {
   }>
   uploadPart(input: UploadPartInput): Promise<UploadPartResponse['data']>
   getDetail(input: GetUploadDetailInput): Promise<UploadDetailResponse['data']>
+  complete(input: CompleteUploadRouteInput): Promise<{
+    data: CompleteUploadResponse['data']
+    replayed: boolean
+  }>
+  abort(input: AbortUploadRouteInput): Promise<{
+    data: AbortUploadResponse['data']
+    replayed: boolean
+  }>
+}
+
+export interface UploadHistoryRouteService {
+  list(input: { userId: string; query: UploadHistoryQuery }): Promise<{
+    data: UploadHistoryResponse['data']
+    pagination: Pagination
+  }>
 }
 
 interface UploadPartParams {
@@ -265,6 +309,53 @@ function publicDetailData(data: UploadDetailResponse['data']): UploadDetailRespo
   }
 }
 
+function publicCompleteData(data: CompleteUploadResponse['data']): CompleteUploadResponse['data'] {
+  return {
+    upload: {
+      id: data.upload.id,
+      status: 'finalizing',
+      progress: {
+        confirmedBytes: data.upload.progress.confirmedBytes,
+        totalBytes: data.upload.progress.totalBytes,
+        percent: data.upload.progress.percent,
+      },
+    },
+    pollAfterSeconds: data.pollAfterSeconds,
+  }
+}
+
+function publicAbortData(data: AbortUploadResponse['data']): AbortUploadResponse['data'] {
+  return {
+    upload: { id: data.upload.id, status: 'cancelling' },
+    pollAfterSeconds: data.pollAfterSeconds,
+  }
+}
+
+function publicHistoryData(data: UploadHistoryResponse['data']): UploadHistoryResponse['data'] {
+  return {
+    items: data.items.map((item) => {
+      const common = {
+        id: item.id,
+        mediaId: item.mediaId,
+        status: item.status,
+        fileName: item.fileName,
+        sizeBytes: item.sizeBytes,
+        progress: {
+          confirmedBytes: item.progress.confirmedBytes,
+          totalBytes: item.progress.totalBytes,
+          percent: item.progress.percent,
+        },
+        failure: item.failure,
+        createdAt: item.createdAt,
+        updatedAt: item.updatedAt,
+      }
+      return item.kind === 'image'
+        ? { ...common, kind: item.kind, mimeType: item.mimeType }
+        : { ...common, kind: item.kind, mimeType: item.mimeType }
+    }),
+  }
+}
+
 function idempotencyKey(header: string | string[] | undefined): string {
   if (header === undefined) {
     throw new ApiError({
@@ -285,7 +376,11 @@ function idempotencyKey(header: string | string[] | undefined): string {
 
 export function registerUploadRoutes(
   app: FastifyInstance,
-  deps: { uploads: UploadRouteService; tokens: AccessTokenVerifier },
+  deps: {
+    uploads: UploadRouteService
+    tokens: AccessTokenVerifier
+    history?: UploadHistoryRouteService
+  },
 ): void {
   const authenticate = createAccessTokenPreHandler(deps.tokens)
 
@@ -322,6 +417,29 @@ export function registerUploadRoutes(
     },
   )
 
+  const history = deps.history
+  if (history !== undefined) {
+    app.get<{ Querystring: UploadHistoryQuery }>(
+      '/v1/uploads',
+      {
+        config: { rateLimit: rateLimitPolicy('history') },
+        preHandler: authenticate,
+        schema: {
+          querystring: UploadHistoryQuerySchema,
+          response: { 200: UploadHistoryResponseSchema },
+        },
+      },
+      async (request, reply) => {
+        const identity = authenticatedRequestIdentity(request)
+        const result = await history.list({
+          userId: identity.userId,
+          query: request.query,
+        })
+        return sendListData(reply, publicHistoryData(result.data), result.pagination)
+      },
+    )
+  }
+
   app.get<{ Params: UploadPathParams }>(
     '/v1/uploads/:uploadId',
     {
@@ -339,6 +457,75 @@ export function registerUploadRoutes(
         uploadId: request.params.uploadId,
       })
       return sendData(reply, publicDetailData(data))
+    },
+  )
+
+  app.post<{ Body: CompleteUploadRequest; Params: UploadPathParams }>(
+    '/v1/uploads/:uploadId/complete',
+    {
+      config: { rateLimit: rateLimitPolicy('ordinary') },
+      preHandler: authenticate,
+      schema: {
+        params: UploadPathParamsSchema,
+        body: CompleteUploadRequestSchema,
+        response: { 202: CompleteUploadResponseSchema },
+      },
+    },
+    async (request, reply) => {
+      const identity = authenticatedRequestIdentity(request)
+      try {
+        const result = await deps.uploads.complete({
+          ...identity,
+          uploadId: request.params.uploadId,
+          idempotencyKey: idempotencyKey(request.headers['idempotency-key']),
+          context: requestAuthContext(request),
+        })
+        if (result.replayed) reply.header('Idempotency-Replayed', 'true')
+        return await sendData(reply, publicCompleteData(result.data), 202)
+      } catch (error) {
+        if (error instanceof ApiError && error.idempotencyReplayed) {
+          reply.header('Idempotency-Replayed', 'true')
+        }
+        if (error instanceof ApiError && error.code === 'IDEMPOTENCY_IN_PROGRESS') {
+          reply.header('Retry-After', '1')
+        }
+        throw error
+      }
+    },
+  )
+
+  app.post<{ Body: AbortUploadRequest; Params: UploadPathParams }>(
+    '/v1/uploads/:uploadId/abort',
+    {
+      config: { rateLimit: rateLimitPolicy('ordinary') },
+      preHandler: authenticate,
+      schema: {
+        params: UploadPathParamsSchema,
+        body: AbortUploadRequestSchema,
+        response: { 202: AbortUploadResponseSchema },
+      },
+    },
+    async (request, reply) => {
+      const identity = authenticatedRequestIdentity(request)
+      try {
+        const result = await deps.uploads.abort({
+          ...identity,
+          uploadId: request.params.uploadId,
+          reason: request.body.reason,
+          idempotencyKey: idempotencyKey(request.headers['idempotency-key']),
+          context: requestAuthContext(request),
+        })
+        if (result.replayed) reply.header('Idempotency-Replayed', 'true')
+        return await sendData(reply, publicAbortData(result.data), 202)
+      } catch (error) {
+        if (error instanceof ApiError && error.idempotencyReplayed) {
+          reply.header('Idempotency-Replayed', 'true')
+        }
+        if (error instanceof ApiError && error.code === 'IDEMPOTENCY_IN_PROGRESS') {
+          reply.header('Retry-After', '1')
+        }
+        throw error
+      }
     },
   )
 

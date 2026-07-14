@@ -187,8 +187,14 @@ describe('applyRoleGrants', () => {
     ).rejects.toMatchObject({ code: '42501' })
 
     await expect(
-      maintenancePool.query('select count(*) from media_app.upload_sessions'),
-    ).resolves.toMatchObject({ rowCount: 1 })
+      maintenancePool.query(
+        `select id, status, completed_at, aborted_at, expired_at, failed_at
+           from media_app.upload_sessions where false`,
+      ),
+    ).resolves.toMatchObject({ rowCount: 0 })
+    await expect(
+      maintenancePool.query('select r2_upload_id from media_app.upload_sessions where false'),
+    ).rejects.toMatchObject({ code: '42501' })
     await expect(
       maintenancePool.query('delete from media_app.upload_sessions where false'),
     ).rejects.toMatchObject({ code: '42501' })
