@@ -50,6 +50,7 @@ export class ApiError extends Error {
   readonly code: ErrorCode
   readonly statusCode: number
   readonly retryable: boolean
+  readonly idempotencyReplayed: boolean
   readonly details?: Record<string, unknown>
 
   constructor(options: {
@@ -57,6 +58,7 @@ export class ApiError extends Error {
     message: string
     statusCode: number
     retryable?: boolean
+    idempotencyReplayed?: boolean
     details?: Record<string, unknown>
   }) {
     super(PUBLIC_ERROR_MESSAGES[options.code])
@@ -64,6 +66,7 @@ export class ApiError extends Error {
     this.code = options.code
     this.statusCode = options.statusCode
     this.retryable = options.retryable ?? false
+    this.idempotencyReplayed = options.idempotencyReplayed ?? false
     if (options.details !== undefined) this.details = options.details
   }
 }
@@ -167,6 +170,9 @@ export function toApiErrorEnvelope(
   reply: FastifyReply,
 ): FastifyReply {
   const safe = classifyError(error)
+  if ((safe.statusCode === 429 || safe.statusCode === 503) && !reply.hasHeader('Retry-After')) {
+    reply.header('Retry-After', '1')
+  }
   const publicError = {
     code: safe.code,
     message: safe.message,

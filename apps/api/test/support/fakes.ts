@@ -8,6 +8,8 @@ import type { TokenService } from '../../src/auth/token-service.js'
 import { WechatStubGateway } from '../../src/auth/wechat-stub-gateway.js'
 import type { WechatGateway } from '../../src/auth/wechat-gateway.js'
 import { Metrics } from '../../src/observability/metrics.js'
+import type { ObjectStorage } from '../../src/uploads/object-storage.js'
+import type { UploadRepository } from '../../src/uploads/upload-repository.js'
 
 export interface FakeDependencyOverrides {
   databaseReady?: boolean
@@ -25,6 +27,9 @@ export interface FakeDependencyOverrides {
   wechatGateway?: WechatGateway
   tokenService?: TokenService
   authRepository?: AuthRepository
+  objectStorage?: ObjectStorage
+  objectStorageBucket?: string
+  uploadRepository?: UploadRepository
 }
 
 export interface FakeDependencies extends AppDependencies {
@@ -61,6 +66,17 @@ export function fakeDependencies(overrides: FakeDependencyOverrides = {}): FakeD
     }),
     hashRefreshToken: (token) => createHash('sha256').update(token, 'utf8').digest(),
   }
+  const defaultObjectStorage: ObjectStorage = {
+    ready: () => Promise.resolve(overrides.objectStorageReady ?? true),
+    createMultipart: () => Promise.resolve({ uploadId: 'private-test-multipart-id' }),
+    listMultipartUploads: () => Promise.resolve([]),
+    uploadPart: () => Promise.resolve({ etag: 'private-test-etag' }),
+    listParts: () => Promise.resolve([]),
+    completeMultipart: () => Promise.resolve({ etag: 'private-test-etag' }),
+    abortMultipart: () => Promise.resolve(),
+    headObject: () => Promise.resolve(null),
+  }
+  const objectStorage = overrides.objectStorage ?? defaultObjectStorage
 
   return {
     pool: overrides.pool ?? new Pool(),
@@ -73,7 +89,9 @@ export function fakeDependencies(overrides: FakeDependencyOverrides = {}): FakeD
       async objectStorage(signal) {
         probes.objectStorageCalls += 1
         probes.objectStorageSignals.push(signal)
-        return objectStorageProbe(signal)
+        return overrides.objectStorageProbe === undefined
+          ? objectStorage.ready(signal)
+          : objectStorageProbe(signal)
       },
     },
     clock: overrides.clock ?? { now: () => new Date('2026-07-15T01:00:00.000Z') },
@@ -87,7 +105,12 @@ export function fakeDependencies(overrides: FakeDependencyOverrides = {}): FakeD
     wechatAppId: overrides.wechatAppId ?? 'wx-test-app',
     wechatGateway: overrides.wechatGateway ?? new WechatStubGateway(),
     tokenService: overrides.tokenService ?? defaultTokenService,
+    objectStorage,
+    objectStorageBucket: overrides.objectStorageBucket ?? 'private-test-bucket',
     ...(overrides.authRepository === undefined ? {} : { authRepository: overrides.authRepository }),
+    ...(overrides.uploadRepository === undefined
+      ? {}
+      : { uploadRepository: overrides.uploadRepository }),
     probes,
   }
 }

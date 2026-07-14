@@ -12,6 +12,7 @@ import { systemClock } from './lib/clock.js'
 import { createSecureIdGenerator, type IdGenerator } from './lib/id.js'
 import { createProductionLogger } from './observability/logger.js'
 import { Metrics } from './observability/metrics.js'
+import { R2ObjectStorage } from './uploads/r2-object-storage.js'
 
 export interface DatabaseReadinessClient {
   query(text: string): Promise<unknown>
@@ -176,12 +177,12 @@ export function createServerRuntime(config: RuntimeConfig) {
     logger.error({ err: error, errorCode: 'POSTGRES_IDLE_CLIENT_ERROR' }, 'database pool error')
   })
   const ids = createSecureIdGenerator(systemClock)
+  const objectStorage = new R2ObjectStorage(config.r2)
   const app = buildApp({
     pool,
     readiness: {
       database: (signal) => databaseIsReady(pool, signal),
-      // Task 5 replaces this fail-closed placeholder with an authenticated R2 HEAD probe.
-      objectStorage: () => Promise.resolve(false),
+      objectStorage: (signal) => objectStorage.ready(signal),
     },
     clock: systemClock,
     ids,
@@ -192,6 +193,8 @@ export function createServerRuntime(config: RuntimeConfig) {
     wechatAppId: config.wechat.appId,
     wechatGateway: createConfiguredWechatGateway(config.wechat),
     tokenService: createConfiguredTokenService(config, ids),
+    objectStorage,
+    objectStorageBucket: config.r2.bucket,
   })
   return { app, pool }
 }

@@ -20,6 +20,10 @@ import type { IdGenerator } from './lib/id.js'
 import type { Metrics } from './observability/metrics.js'
 import { registerProfileRoutes } from './profile/profile-routes.js'
 import { registerHealthRoutes } from './routes/health.js'
+import type { ObjectStorage } from './uploads/object-storage.js'
+import { PostgresUploadRepository, type UploadRepository } from './uploads/upload-repository.js'
+import { registerUploadRoutes } from './uploads/upload-routes.js'
+import { UploadService } from './uploads/upload-service.js'
 
 const UUID_V7 = new RegExp(UUID_V7_PATTERN)
 
@@ -42,6 +46,9 @@ export interface AppDependencies extends AppShellDependencies {
   wechatGateway: WechatGateway
   tokenService: TokenService
   authRepository?: AuthRepository
+  objectStorage: ObjectStorage
+  objectStorageBucket: string
+  uploadRepository?: UploadRepository
 }
 
 function clientRequestId(value: string | string[] | undefined): string | undefined {
@@ -124,5 +131,16 @@ export function buildApp(deps: AppDependencies): FastifyInstance {
   })
   registerAuthRoutes(app, { auth, tokens: deps.tokenService })
   registerProfileRoutes(app, { auth, tokens: deps.tokenService })
+  const uploadRepository =
+    deps.uploadRepository ??
+    new PostgresUploadRepository({ pool: deps.pool, clock: deps.clock, ids: deps.ids })
+  const uploads = new UploadService({
+    bucket: deps.objectStorageBucket,
+    clock: deps.clock,
+    ids: deps.ids,
+    repository: uploadRepository,
+    storage: deps.objectStorage,
+  })
+  registerUploadRoutes(app, { uploads, tokens: deps.tokenService })
   return app
 }
