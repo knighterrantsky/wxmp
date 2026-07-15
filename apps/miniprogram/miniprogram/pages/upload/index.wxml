@@ -1,0 +1,99 @@
+<view class="page-shell">
+  <view class="hero-card">
+    <text class="eyebrow">PRIVATE MEDIA</text>
+    <text class="title">私密素材上传</text>
+    <text class="subtitle">图片与视频将通过你的专属账号上传到私有存储，不提供公开访问。</text>
+  </view>
+
+  <view class="card {{nicknameConfirmed ? 'confirmed-card' : ''}}">
+    <block wx:if="{{nicknameConfirmed}}">
+      <text class="section-title">昵称已确认</text>
+      <text class="confirmed-name">{{nickname}}</text>
+      <text class="help-text">后续素材会记录此昵称，你也可以授权后重新选择并再次确认。</text>
+    </block>
+    <block wx:else>
+      <text class="section-title">先确认微信昵称</text>
+      <text class="help-text">昵称用于标识你上传的素材，仅作为显示名称，不代表实名认证。授权完成后，微信会在昵称输入框中展示候选昵称。</text>
+    </block>
+
+    <text class="privacy-declaration">上线前，开发者还必须在微信公众平台后台的《小程序用户隐私保护指引》中声明昵称收集，否则微信昵称选择能力不会生效。</text>
+
+    <view wx:if="{{!nicknamePrivacyAuthorized}}">
+      <button
+        wx:if="{{!nicknamePrivacyPromptVisible}}"
+        class="primary-button"
+        bindtap="onRequestNicknamePrivacy"
+        loading="{{nicknamePrivacyRequesting}}"
+        disabled="{{nicknamePrivacyRequesting}}"
+      >
+        申请微信昵称授权
+      </button>
+      <view class="privacy-panel" wx:else>
+        <text class="privacy-title">微信昵称使用授权</text>
+        <text class="help-text">同意后才会启用微信昵称输入能力；暂不授权不会保存本次昵称。首次使用时，开始上传前仍需确认昵称。</text>
+        <button class="privacy-contract-button" bindtap="onOpenNicknamePrivacyContract">
+          查看隐私保护指引
+        </button>
+        <button
+          id="nickname-privacy-agree"
+          class="primary-button"
+          open-type="agreePrivacyAuthorization"
+          bindagreeprivacyauthorization="onAgreeNicknamePrivacy"
+        >
+          同意隐私指引并继续
+        </button>
+        <button class="privacy-cancel-button" bindtap="onRejectNicknamePrivacy">
+          暂不授权
+        </button>
+      </view>
+    </view>
+
+    <view wx:if="{{nicknamePrivacyAuthorized}}">
+      <form bindsubmit="onConfirmNickname">
+        <input
+          class="nickname-input {{nicknameConfirmed ? 'compact' : ''}}"
+          name="nickname"
+          type="nickname"
+          value="{{nicknameDraft}}"
+          placeholder="{{nicknameConfirmed ? '重新选择微信昵称' : '选择微信昵称'}}"
+          bindinput="onNicknameInput"
+          bindblur="onNicknameReviewStart"
+          bindnicknamereview="onNicknameReview"
+        />
+        <button
+          wx:if="{{!nicknameConfirmed}}"
+          class="primary-button"
+          form-type="submit"
+          loading="{{nicknameSaving}}"
+          disabled="{{nicknameSaving}}"
+        >
+          确认使用此昵称
+        </button>
+        <button
+          wx:else
+          class="secondary-button"
+          form-type="submit"
+          loading="{{nicknameSaving}}"
+          disabled="{{nicknameSaving}}"
+        >
+          确认更新昵称
+        </button>
+      </form>
+      <text class="notice-text" wx:if="{{nicknameReviewPending}}">微信正在审核昵称，审核通过后才会保存。</text>
+    </view>
+    <text class="error-text" wx:if="{{nicknameError}}">{{nicknameError}}</text>
+  </view>
+
+  <view class="card upload-card">
+    <text class="section-title">上传素材</text>
+    <text class="help-text">支持图片和视频，单个文件不超过 200MB。选择后还会展示清单并请你二次确认。</text>
+    <button
+      class="upload-button"
+      bindtap="onChooseMedia"
+      disabled="{{nicknamePrivacyPromptVisible || nicknamePrivacyRequesting}}"
+    >
+      选择图片或视频
+    </button>
+    <text class="notice-text" wx:if="{{!nicknameConfirmed}}">可以先选择素材；开始上传前仍需确认昵称。</text>
+  </view>
+</view>

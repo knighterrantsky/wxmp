@@ -3,6 +3,7 @@ export * from './envelope.js'
 export * from './errors.js'
 export * from './profile.js'
 export * from './upload.js'
+export * from './validation.js'
 
 import {
   LogoutRequestSchema,

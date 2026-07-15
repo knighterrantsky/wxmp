@@ -1,0 +1,7 @@
+{
+  "appid": "wx_your_miniprogram_appid",
+  "projectname": "wx-private-media-upload-local",
+  "setting": {
+    "compileHotReLoad": true
+  }
+}

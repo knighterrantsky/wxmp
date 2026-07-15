@@ -1,0 +1,13 @@
+page {
+  box-sizing: border-box;
+  min-height: 100%;
+  background: #f5f7fa;
+  color: #172033;
+  font-family: system-ui, sans-serif;
+}
+
+view,
+button,
+input {
+  box-sizing: border-box;
+}

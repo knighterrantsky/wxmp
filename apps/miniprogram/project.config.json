@@ -1,0 +1,15 @@
+{
+  "appid": "touristappid",
+  "compileType": "miniprogram",
+  "libVersion": "trial",
+  "miniprogramRoot": "miniprogram/",
+  "projectname": "wx-private-media-upload",
+  "setting": {
+    "coverView": true,
+    "es6": true,
+    "minified": true,
+    "postcss": true,
+    "useCompilerPlugins": ["typescript"],
+    "urlCheck": true
+  }
+}

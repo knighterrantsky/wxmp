@@ -1,0 +1,11 @@
+{
+  "pages": ["pages/upload/index"],
+  "window": {
+    "backgroundColor": "#f5f7fa",
+    "backgroundTextStyle": "light",
+    "navigationBarBackgroundColor": "#ffffff",
+    "navigationBarTextStyle": "black",
+    "navigationBarTitleText": "素材上传"
+  },
+  "sitemapLocation": "sitemap.json"
+}

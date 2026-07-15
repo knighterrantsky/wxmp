@@ -1,0 +1,9 @@
+{
+  "desc": "私有素材上传小程序",
+  "rules": [
+    {
+      "action": "disallow",
+      "page": "*"
+    }
+  ]
+}

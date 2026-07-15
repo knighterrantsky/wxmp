@@ -1,0 +1,17 @@
+{
+  "name": "@wx-upload/miniprogram",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate:config": "node --experimental-strip-types scripts/generate-config.ts",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@wx-upload/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "miniprogram-api-typings": "5.2.1"
+  }
+}
