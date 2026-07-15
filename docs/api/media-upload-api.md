@@ -567,7 +567,7 @@ Authorization: Bearer <access-token>
 
 终态上传摘要和 `uploadId` 长期保留。活跃会话的 `partsAvailableUntil=null`；进入终态时设置为 `terminalAt + 90 days`。截止后 `partDetailsRetained=false`、`partsAvailableUntil` 保持原截止时间且 `parts=[]`，详情与历史记录仍返回 `200`。
 
-冷启动时只有原微信临时路径仍可读取，并且所有已上传分片的本地 SHA-256 与这里返回的哈希逐片匹配，才能继续旧会话。路径失效或任一不匹配时，客户端必须以 `reason=replaced` 中止旧上传，让用户重新选择、二次确认并调用 `POST /v1/uploads` 创建新记录；重新选择的文件不能拼接到旧会话。
+客户端按会话独立保存最多 5 条断点元数据，任何文件失败都不得覆盖其他会话的 `uploadId` 或幂等键；冷启动时依次恢复。只有原微信临时路径仍可读取，并且所有已上传分片的本地 SHA-256 与这里返回的哈希逐片匹配，才能继续旧会话。路径失效或任一不匹配时，客户端必须以 `reason=replaced` 中止旧上传，让用户重新选择、二次确认并调用 `POST /v1/uploads` 创建新记录；重新选择的文件不能拼接到旧会话。
 
 ### 6.4 完成上传
 

@@ -1,0 +1,17 @@
+.git
+.github
+.worktrees
+**/.DS_Store
+.env
+.env.*
+**/.env
+**/.env.*
+**/*.crt
+**/*.key
+**/*.pem
+**/coverage
+**/dist
+**/node_modules
+apps/miniprogram
+deploy
+docs

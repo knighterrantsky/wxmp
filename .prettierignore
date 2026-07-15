@@ -3,3 +3,5 @@ dist/
 coverage/
 docs/
 pnpm-lock.yaml
+apps/miniprogram/miniprogram/config.generated.ts
+apps/miniprogram/miniprogram/miniprogram_npm/

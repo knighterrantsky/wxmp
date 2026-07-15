@@ -1,6 +1,28 @@
+\getenv migration_password POSTGRES_MIGRATION_PASSWORD
+\getenv runtime_password POSTGRES_RUNTIME_PASSWORD
+\getenv maintenance_password POSTGRES_MAINTENANCE_PASSWORD
+
+\if :{?migration_password}
+\else
+  \echo 'POSTGRES_MIGRATION_PASSWORD is required'
+  \quit
+\endif
+
+\if :{?runtime_password}
+\else
+  \echo 'POSTGRES_RUNTIME_PASSWORD is required'
+  \quit
+\endif
+
+\if :{?maintenance_password}
+\else
+  \echo 'POSTGRES_MAINTENANCE_PASSWORD is required'
+  \quit
+\endif
+
 CREATE ROLE wx_migrate
   LOGIN
-  PASSWORD 'wx_migrate_local'
+  PASSWORD :'migration_password'
   NOSUPERUSER
   NOCREATEDB
   NOCREATEROLE
@@ -8,7 +30,7 @@ CREATE ROLE wx_migrate
 
 CREATE ROLE wx_runtime
   LOGIN
-  PASSWORD 'wx_runtime_local'
+  PASSWORD :'runtime_password'
   NOSUPERUSER
   NOCREATEDB
   NOCREATEROLE
@@ -16,7 +38,7 @@ CREATE ROLE wx_runtime
 
 CREATE ROLE wx_maintenance
   LOGIN
-  PASSWORD 'wx_maintenance_local'
+  PASSWORD :'maintenance_password'
   NOSUPERUSER
   NOCREATEDB
   NOCREATEROLE

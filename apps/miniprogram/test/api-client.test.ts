@@ -496,7 +496,10 @@ describe('createWechatRuntime', () => {
     await expect(runtime.login()).rejects.toThrow('WeChat login failed')
     await expect(
       runtime.request({ method: 'GET', url: 'https://api.example.com/health/live' }),
-    ).rejects.toThrow('WeChat request failed')
+    ).rejects.toMatchObject({
+      message: 'WeChat request failed',
+      networkError: true,
+    })
     await expect(runtime.login()).rejects.not.toThrow(/secret-runtime-details/)
   })
 

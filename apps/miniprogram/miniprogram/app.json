@@ -1,11 +1,14 @@
 {
-  "pages": ["pages/upload/index"],
+  "pages": ["pages/upload/index", "pages/history/index"],
   "window": {
     "backgroundColor": "#f5f7fa",
     "backgroundTextStyle": "light",
     "navigationBarBackgroundColor": "#ffffff",
     "navigationBarTextStyle": "black",
     "navigationBarTitleText": "素材上传"
+  },
+  "networkTimeout": {
+    "uploadFile": 180000
   },
   "sitemapLocation": "sitemap.json"
 }

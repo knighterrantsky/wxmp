@@ -1,0 +1,35 @@
+<view class="history-shell">
+  <view class="history-header">
+    <text class="history-title">上传记录</text>
+    <text class="history-subtitle">这里只展示你自己的私密素材写入状态，不提供内容访问入口。</text>
+  </view>
+
+  <view class="history-empty" wx:if="{{!loading && !records.length && !error}}">
+    <text class="empty-title">还没有上传记录</text>
+    <text class="empty-copy">完成一次素材上传后，记录会显示在这里。</text>
+  </view>
+
+  <view class="history-list" wx:if="{{records.length}}">
+    <view class="history-item" wx:for="{{records}}" wx:key="id" wx:for-item="item">
+      <view class="item-heading">
+        <text class="item-name">{{item.fileName}}</text>
+        <text class="status-pill tone-{{item.tone}}">{{item.statusLabel}}</text>
+      </view>
+      <text class="item-meta">{{item.kindLabel}} · {{item.sizeLabel}}</text>
+      <view class="history-progress">
+        <view class="history-progress-fill" style="width: {{item.percent}}%;"></view>
+      </view>
+      <view class="progress-row">
+        <text>上传进度</text>
+        <text>{{item.percent}}%</text>
+      </view>
+      <text class="failure-copy" wx:if="{{item.failureMessage}}">{{item.failureMessage}}</text>
+      <text class="time-copy">创建于 {{item.createdAtLabel}} · 更新于 {{item.updatedAtLabel}}</text>
+    </view>
+  </view>
+
+  <text class="loading-copy" wx:if="{{loading || refreshing}}">正在加载记录…</text>
+  <text class="loading-copy" wx:if="{{loadingMore}}">正在加载更多…</text>
+  <text class="end-copy" wx:if="{{records.length && !hasMore && !loading}}">没有更多记录了</text>
+  <text class="error-copy" wx:if="{{error}}">{{error}}</text>
+</view>

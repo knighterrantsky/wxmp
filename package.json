@@ -12,7 +12,8 @@
     "format:check": "prettier --check .",
     "lint": "eslint .",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm -r test",
+    "test": "pnpm -r --workspace-concurrency=1 test",
+    "test:e2e:local": "pnpm --filter @wx-upload/api exec vitest run test/e2e/private-upload-flow.test.ts && pnpm --filter @wx-upload/miniprogram exec vitest run test/e2e/upload-flow.test.ts",
     "build": "pnpm -r build"
   },
   "devDependencies": {

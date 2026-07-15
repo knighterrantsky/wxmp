@@ -8,6 +8,7 @@ import {
   type NicknamePrivacyAuthorizationRuntime,
   type NicknameProfileApi,
   type NicknameFlowSnapshot,
+  type UploadPageData,
   uploadPageDefinition,
 } from '../miniprogram/pages/upload/index.js'
 
@@ -142,9 +143,16 @@ describe('explicit WeChat nickname privacy authorization', () => {
     const { controller } = fixture()
     const chooseMedia = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
     const host = {
-      data: controller.snapshot(),
+      data: {
+        ...controller.snapshot(),
+        selectedFiles: [],
+        selectedTotalBytes: 0,
+        selectedTotalLabel: '0 B',
+        selectionError: null,
+        uploadBatchRunning: false,
+      } as UploadPageData,
       nicknameFlow: controller,
-      setData(data: Partial<NicknameFlowSnapshot>) {
+      setData(data: Partial<UploadPageData & NicknameFlowSnapshot>) {
         this.data = { ...this.data, ...data }
       },
     }
@@ -340,10 +348,10 @@ describe('nickname page contract', () => {
     )
     expect(wxml).toMatch(/bindtap=["']onOpenNicknamePrivacyContract["']/u)
     expect(wxml).toMatch(/bindtap=["']onRejectNicknamePrivacy["']/u)
-    expect(wxml).toMatch(/后台.*隐私保护指引.*声明.*昵称收集/su)
+    expect(wxml).not.toMatch(/上线前|开发者还必须/u)
     expect(wxml).toMatch(/wx:if=["']\{\{nicknamePrivacyAuthorized\}\}["'][^>]*>\s*<form/su)
     expect(wxml).toMatch(
-      /<button[^>]+class=["']upload-button["'][^>]+disabled=["']\{\{nicknamePrivacyPromptVisible \|\| nicknamePrivacyRequesting\}\}["']/u,
+      /<button[^>]+class=["']upload-button["'][^>]+disabled=["']\{\{nicknamePrivacyPromptVisible \|\| nicknamePrivacyRequesting(?: \|\| uploadBatchRunning)?\}\}["']/u,
     )
     expect(pageSource).not.toMatch(/onNeedPrivacyAuthorization|NicknamePrivacyResolve/u)
   })

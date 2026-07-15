@@ -1,19 +1,37 @@
 import {
+  AbortUploadResponseDataSchema,
+  CompleteUploadResponseDataSchema,
   ErrorEnvelopeSchema,
+  InitializeUploadResponseDataSchema,
+  ListResponseMetaSchema,
   ProfileResponseDataSchema,
   ResponseMetaSchema,
   TokenPairSchema,
+  UUID_V7_PATTERN,
   WechatLoginResponseDataSchema,
+  UploadDetailResponseDataSchema,
+  UploadHistoryQuerySchema,
+  UploadHistoryResponseDataSchema,
   matchesSchema,
+  type AbortUploadRequest,
+  type AbortUploadResponse,
   type ApiError,
+  type CompleteUploadResponse,
   type ErrorCode,
+  type InitializeUploadRequest,
+  type InitializeUploadResponse,
   type NicknameRequest,
+  type Pagination,
   type PublicUser,
   type RefreshTokenResponse,
+  type UploadDetailResponse,
+  type UploadHistoryQuery,
+  type UploadHistoryResponse,
   type WechatLoginResponse,
 } from '@wx-upload/contracts'
 
 import type { HttpRequest, WechatRuntime } from '../runtime/wechat-runtime.js'
+import { normalizeHttpOrigin } from '../runtime/http-origin.js'
 
 export interface ApiSessionSnapshot {
   accessToken: string
@@ -44,6 +62,15 @@ export interface AuthorizedRequest<T = unknown> {
   decode?: (value: unknown) => T
 }
 
+interface InternalAuthorizedRequest<T = unknown> extends AuthorizedRequest<T> {
+  decodeEnvelope?: (value: unknown) => T
+}
+
+export interface UploadHistoryPage {
+  readonly items: UploadHistoryResponse['data']['items']
+  readonly pagination: Pagination
+}
+
 export class ApiClientError extends Error {
   readonly statusCode: number
   readonly code: ErrorCode
@@ -71,24 +98,7 @@ export function isApiClientError(error: unknown): error is ApiClientError {
 }
 
 function normalizeOrigin(baseUrl: string): string {
-  let url: URL
-  try {
-    url = new URL(baseUrl)
-  } catch {
-    throw new TypeError('API base URL must be an absolute origin')
-  }
-
-  if (
-    (url.protocol !== 'https:' && url.protocol !== 'http:') ||
-    url.username !== '' ||
-    url.password !== '' ||
-    url.pathname !== '/' ||
-    url.search !== '' ||
-    url.hash !== ''
-  ) {
-    throw new TypeError('API base URL must contain only an HTTP(S) origin')
-  }
-  return url.origin
+  return normalizeHttpOrigin(baseUrl, 'API base URL')
 }
 
 function assertRequestPath(path: string): void {
@@ -152,6 +162,15 @@ function decodeSuccess<T>(body: unknown, decode?: (value: unknown) => T): T {
   }
 }
 
+function decodeEnvelopeSuccess<T>(body: unknown, decode: (value: unknown) => T): T {
+  try {
+    return decode(body)
+  } catch (error) {
+    if (error instanceof ApiClientError) throw error
+    throw invalidResponseError()
+  }
+}
+
 function decodeLoginData(value: unknown): WechatLoginResponse['data'] {
   if (!matchesSchema(WechatLoginResponseDataSchema, value)) throw invalidResponseError()
   return value
@@ -165,6 +184,74 @@ function decodeTokenPair(value: unknown): RefreshTokenResponse['data'] {
 function decodeProfileData(value: unknown): { user: PublicUser } {
   if (!matchesSchema(ProfileResponseDataSchema, value)) throw invalidResponseError()
   return value
+}
+
+function decodeInitializeUploadData(value: unknown): InitializeUploadResponse['data'] {
+  if (!matchesSchema(InitializeUploadResponseDataSchema, value)) throw invalidResponseError()
+  return value
+}
+
+function decodeUploadDetailData(value: unknown, uploadId: string): UploadDetailResponse['data'] {
+  if (!matchesSchema(UploadDetailResponseDataSchema, value) || value.upload.id !== uploadId) {
+    throw invalidResponseError()
+  }
+  return value
+}
+
+function decodeCompleteUploadData(
+  value: unknown,
+  uploadId: string,
+): CompleteUploadResponse['data'] {
+  if (!matchesSchema(CompleteUploadResponseDataSchema, value) || value.upload.id !== uploadId) {
+    throw invalidResponseError()
+  }
+  return value
+}
+
+function decodeAbortUploadData(value: unknown, uploadId: string): AbortUploadResponse['data'] {
+  if (!matchesSchema(AbortUploadResponseDataSchema, value) || value.upload.id !== uploadId) {
+    throw invalidResponseError()
+  }
+  return value
+}
+
+function decodeUploadHistoryEnvelope(value: unknown): UploadHistoryPage {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ['data', 'meta']) ||
+    !matchesSchema(UploadHistoryResponseDataSchema, value['data']) ||
+    !matchesSchema(ListResponseMetaSchema, value['meta'])
+  ) {
+    throw invalidResponseError()
+  }
+  return {
+    items: value['data'].items,
+    pagination: value['meta'].pagination,
+  }
+}
+
+const UUID_V7 = new RegExp(UUID_V7_PATTERN, 'u')
+
+function assertUuidV7(value: string, name: 'uploadId' | 'idempotency key'): void {
+  if (!UUID_V7.test(value)) throw new TypeError(`${name} must be a UUIDv7`)
+}
+
+function uploadHistoryPath(query: UploadHistoryQuery): string {
+  if (!matchesSchema(UploadHistoryQuerySchema, query)) {
+    throw new TypeError('Upload history query is invalid')
+  }
+
+  const parameters: string[] = []
+  if (query.limit !== undefined) parameters.push(`limit=${String(query.limit)}`)
+  if (query.status !== undefined) parameters.push(`status=${encodeURIComponent(query.status)}`)
+  if (query.cursor !== undefined) {
+    try {
+      parameters.push(`cursor=${encodeURIComponent(query.cursor)}`)
+    } catch {
+      throw new TypeError('Upload history query is invalid')
+    }
+  }
+  return parameters.length === 0 ? '/v1/uploads' : `/v1/uploads?${parameters.join('&')}`
 }
 
 function jsonHeaders(data: unknown, headers?: Record<string, string>): Record<string, string> {
@@ -235,8 +322,91 @@ export class ApiClient implements AuthenticationApi {
     ).then(({ user }) => user)
   }
 
+  initializeUpload(
+    request: InitializeUploadRequest,
+    idempotencyKey: string,
+    session: AuthorizedSession,
+  ): Promise<InitializeUploadResponse['data']> {
+    assertUuidV7(idempotencyKey, 'idempotency key')
+    return this.authorizedRequest<InitializeUploadResponse['data']>(
+      {
+        method: 'POST',
+        path: '/v1/uploads',
+        headers: { 'Idempotency-Key': idempotencyKey },
+        data: request,
+        decode: decodeInitializeUploadData,
+      },
+      session,
+    )
+  }
+
+  getUpload(uploadId: string, session: AuthorizedSession): Promise<UploadDetailResponse['data']> {
+    assertUuidV7(uploadId, 'uploadId')
+    return this.authorizedRequest<UploadDetailResponse['data']>(
+      {
+        method: 'GET',
+        path: `/v1/uploads/${uploadId}`,
+        decode: (value) => decodeUploadDetailData(value, uploadId),
+      },
+      session,
+    )
+  }
+
+  getUploadHistory(
+    query: UploadHistoryQuery,
+    session: AuthorizedSession,
+  ): Promise<UploadHistoryPage> {
+    return this.#authorizedRequest<UploadHistoryPage>(
+      {
+        method: 'GET',
+        path: uploadHistoryPath(query),
+        decodeEnvelope: decodeUploadHistoryEnvelope,
+      },
+      session,
+    )
+  }
+
+  completeUpload(
+    uploadId: string,
+    idempotencyKey: string,
+    session: AuthorizedSession,
+  ): Promise<CompleteUploadResponse['data']> {
+    assertUuidV7(uploadId, 'uploadId')
+    assertUuidV7(idempotencyKey, 'idempotency key')
+    return this.authorizedRequest<CompleteUploadResponse['data']>(
+      {
+        method: 'POST',
+        path: `/v1/uploads/${uploadId}/complete`,
+        headers: { 'Idempotency-Key': idempotencyKey },
+        data: {},
+        decode: (value) => decodeCompleteUploadData(value, uploadId),
+      },
+      session,
+    )
+  }
+
+  abortUpload(
+    uploadId: string,
+    reason: AbortUploadRequest['reason'],
+    idempotencyKey: string,
+    session: AuthorizedSession,
+  ): Promise<AbortUploadResponse['data']> {
+    assertUuidV7(uploadId, 'uploadId')
+    assertUuidV7(idempotencyKey, 'idempotency key')
+    return this.authorizedRequest<AbortUploadResponse['data']>(
+      {
+        method: 'POST',
+        path: `/v1/uploads/${uploadId}/abort`,
+        headers: { 'Idempotency-Key': idempotencyKey },
+        data: { reason },
+        decode: (value) => decodeAbortUploadData(value, uploadId),
+      },
+      session,
+    )
+  }
+
   async #authorizedRequest<T>(
-    request: AuthorizedRequest<T>,
+    request: InternalAuthorizedRequest<T>,
     session: AuthorizedSession,
   ): Promise<T> {
     const current = await session.ensureSession()
@@ -258,7 +428,7 @@ export class ApiClient implements AuthenticationApi {
     })
   }
 
-  async #request<T>(request: AuthorizedRequest<T>): Promise<T> {
+  async #request<T>(request: InternalAuthorizedRequest<T>): Promise<T> {
     assertRequestPath(request.path)
     const response = await this.#runtime.request<unknown>({
       method: request.method,
@@ -269,6 +439,8 @@ export class ApiClient implements AuthenticationApi {
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw decodeError(response.statusCode, response.data)
     }
-    return decodeSuccess(response.data, request.decode)
+    return request.decodeEnvelope === undefined
+      ? decodeSuccess(response.data, request.decode)
+      : decodeEnvelopeSuccess(response.data, request.decodeEnvelope)
   }
 }

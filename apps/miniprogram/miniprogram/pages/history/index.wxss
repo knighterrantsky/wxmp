@@ -1,0 +1,140 @@
+page {
+  min-height: 100%;
+  background: #f3f6f4;
+  color: #18332b;
+}
+
+.history-shell {
+  box-sizing: border-box;
+  min-height: 100vh;
+  padding: 32rpx 28rpx 64rpx;
+}
+
+.history-header {
+  display: flex;
+  flex-direction: column;
+  padding: 38rpx 34rpx;
+  border-radius: 28rpx;
+  background: linear-gradient(145deg, #173d32 0%, #28654f 100%);
+  color: #ffffff;
+}
+
+.history-title {
+  font-size: 44rpx;
+  font-weight: 700;
+}
+
+.history-subtitle {
+  margin-top: 14rpx;
+  color: rgba(255, 255, 255, 0.76);
+  font-size: 24rpx;
+  line-height: 1.65;
+}
+
+.history-list,
+.history-empty {
+  margin-top: 24rpx;
+}
+
+.history-item,
+.history-empty {
+  margin-bottom: 20rpx;
+  padding: 28rpx;
+  border: 1rpx solid rgba(28, 74, 59, 0.1);
+  border-radius: 22rpx;
+  background: #ffffff;
+  box-shadow: 0 10rpx 30rpx rgba(27, 65, 52, 0.06);
+}
+
+.item-heading,
+.progress-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.item-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  font-size: 28rpx;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-pill {
+  margin-left: 18rpx;
+  padding: 7rpx 14rpx;
+  border-radius: 999rpx;
+  background: #edf2ef;
+  color: #61746d;
+  font-size: 21rpx;
+}
+
+.tone-progress,
+.tone-success {
+  background: #e7f5ee;
+  color: #16704c;
+}
+
+.tone-warning {
+  background: #fff5df;
+  color: #8b641e;
+}
+
+.tone-error {
+  background: #fbeceb;
+  color: #ad4339;
+}
+
+.item-meta,
+.time-copy,
+.empty-copy,
+.loading-copy,
+.end-copy {
+  display: block;
+  margin-top: 12rpx;
+  color: #71817b;
+  font-size: 22rpx;
+}
+
+.history-progress {
+  height: 10rpx;
+  margin-top: 22rpx;
+  overflow: hidden;
+  border-radius: 999rpx;
+  background: #dfe8e3;
+}
+
+.history-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #1f6b50 0%, #48a779 100%);
+}
+
+.progress-row {
+  margin-top: 10rpx;
+  color: #61746d;
+  font-size: 21rpx;
+}
+
+.failure-copy,
+.error-copy {
+  display: block;
+  margin-top: 14rpx;
+  color: #b3463c;
+  font-size: 23rpx;
+}
+
+.empty-title {
+  font-size: 28rpx;
+  font-weight: 650;
+}
+
+.loading-copy,
+.end-copy,
+.error-copy {
+  margin: 24rpx 0;
+  text-align: center;
+}

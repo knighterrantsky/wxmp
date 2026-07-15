@@ -6,6 +6,11 @@ import {
   setWechatStorage,
   type WxStorageSource,
 } from './wx-storage.js'
+import {
+  uploadFileWithWechatRuntime,
+  type WechatUploadRuntime,
+  type WxUploadSource,
+} from './wx-upload.js'
 
 export interface HttpRequest {
   method: 'GET' | 'POST' | 'PUT'
@@ -38,13 +43,24 @@ export interface WechatStorageRuntime {
  * Core runtime capabilities. Task-specific media, file, and upload capabilities
  * can extend this interface without coupling session code to those APIs.
  */
-export interface WechatRuntime extends WechatAuthRuntime, WechatHttpRuntime, WechatStorageRuntime {}
+export interface WechatRuntime extends WechatAuthRuntime, WechatHttpRuntime, WechatStorageRuntime {
+  uploadFile?: WechatUploadRuntime['uploadFile']
+}
 
-export type WechatRuntimeSource = WxLoginSource & WxRequestSource & WxStorageSource
+export type WechatRuntimeSource = WxLoginSource &
+  WxRequestSource &
+  WxStorageSource &
+  Partial<WxUploadSource>
 
+export function createWechatRuntime(
+  source?: WechatRuntimeSource & WxUploadSource,
+): WechatRuntime & WechatUploadRuntime
+export function createWechatRuntime(source: WechatRuntimeSource): WechatRuntime
 export function createWechatRuntime(
   source: WechatRuntimeSource = wx as unknown as WechatRuntimeSource,
 ): WechatRuntime {
+  const uploadSource =
+    source.uploadFile === undefined ? undefined : (source as WechatRuntimeSource & WxUploadSource)
   return {
     login: () => loginWithWechatRuntime(source),
     request: <T>(request: HttpRequest, decode?: (value: unknown) => T) =>
@@ -57,5 +73,10 @@ export function createWechatRuntime(
     removeStorage: (key: string) => {
       removeWechatStorage(source, key)
     },
+    ...(uploadSource === undefined
+      ? {}
+      : {
+          uploadFile: (request) => uploadFileWithWechatRuntime(uploadSource, request),
+        }),
   }
 }

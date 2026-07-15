@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "miniprogram",
+    "tsBuildInfoFile": "dist/.runtime.tsbuildinfo",
+    "types": ["miniprogram-api-typings"]
+  },
+  "include": ["miniprogram/**/*.ts"],
+  "exclude": ["dist", "node_modules"]
+}

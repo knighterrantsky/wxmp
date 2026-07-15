@@ -1,5 +1,13 @@
 import type { NicknameRequest, PublicUser } from '@wx-upload/contracts'
 
+import {
+  MediaValidationError,
+  validateMediaSelection,
+  type MediaSelectionCandidate,
+  type ValidatedMedia,
+} from '../../core/media-validation.js'
+import { WechatMediaSelectionError } from '../../runtime/wx-media.js'
+
 export interface NicknameProfileApi {
   updateNickname(request: NicknameRequest): Promise<PublicUser>
 }
@@ -36,6 +44,41 @@ export interface NicknameFlowSnapshot {
   readonly nicknameReviewPending: boolean
   readonly canChooseMedia: true
   readonly canCreateUpload: boolean
+}
+
+export type UploadUiStatus =
+  'ready' | 'queued' | 'uploading' | 'paused' | 'finalizing' | 'uploaded' | 'failed'
+
+export interface UploadUiEvent {
+  readonly sourcePath: string
+  readonly status: Exclude<UploadUiStatus, 'ready'>
+  readonly bytes: number
+  readonly percent: number
+}
+
+export interface SelectedFileView {
+  readonly id: string
+  readonly fileName: string
+  readonly kindLabel: '图片' | '视频'
+  readonly sizeLabel: string
+  readonly sizeBytes: number
+  readonly status: UploadUiStatus
+  readonly statusLabel: string
+  readonly bytes: number
+  readonly percent: number
+}
+
+export interface UploadPageData extends NicknameFlowSnapshot {
+  readonly selectedFiles: readonly SelectedFileView[]
+  readonly selectedTotalBytes: number
+  readonly selectedTotalLabel: string
+  readonly selectionError: string | null
+  readonly uploadBatchRunning: boolean
+}
+
+export interface MediaUploadPageService {
+  chooseMedia(): Promise<readonly MediaSelectionCandidate[]>
+  start(files: readonly ValidatedMedia[], onUpdate: (event: UploadUiEvent) => void): Promise<void>
 }
 
 function normalizedNickname(value: string): string {
@@ -346,14 +389,186 @@ interface UploadApplicationGlobalData {
   profileApi?: NicknameProfileApi
   publicUser?: PublicUser
   ensureSession?: () => Promise<PublicUser>
+  mediaUpload?: MediaUploadPageService
   chooseMedia?: () => Promise<void>
 }
 
 interface UploadPageHost {
-  data: NicknameFlowSnapshot
-  setData(data: Partial<NicknameFlowSnapshot>): void
+  data: UploadPageData
+  setData(data: Partial<UploadPageData>): void
   nicknameFlow?: NicknameFlowController
   nicknameInteracted?: boolean
+  selectedMedia?: readonly ValidatedMedia[]
+}
+
+const EMPTY_UPLOAD_PAGE_DATA = {
+  selectedFiles: [],
+  selectedTotalBytes: 0,
+  selectedTotalLabel: '0 B',
+  selectionError: null,
+  uploadBatchRunning: false,
+} as const satisfies Omit<UploadPageData, keyof NicknameFlowSnapshot>
+
+const UPLOAD_STATUS_LABELS: Readonly<Record<UploadUiStatus, string>> = {
+  ready: '等待确认',
+  queued: '排队中',
+  uploading: '上传中',
+  paused: '已暂停',
+  finalizing: '正在写入私有存储',
+  uploaded: '已上传',
+  failed: '上传失败',
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1_024) return `${String(bytes)} B`
+  const units = ['KB', 'MB', 'GB'] as const
+  let value = bytes / 1_024
+  let unitIndex = 0
+  while (value >= 1_024 && unitIndex < units.length - 1) {
+    value /= 1_024
+    unitIndex += 1
+  }
+  const digits = value >= 100 ? 0 : value >= 10 ? 1 : 2
+  const unit = units[unitIndex]
+  if (unit === undefined) return `${String(bytes)} B`
+  return `${value.toFixed(digits).replace(/\.0+$/u, '')} ${unit}`
+}
+
+function selectionErrorMessage(error: unknown): string | null {
+  if (error instanceof WechatMediaSelectionError && error.code === 'CANCELLED') return null
+  if (error instanceof MediaValidationError) {
+    switch (error.code) {
+      case 'FILE_TOO_SMALL':
+        return '单个文件至少需要 12 B'
+      case 'FILE_TOO_LARGE':
+        return '单个文件不能超过 200 MB'
+      case 'SELECTION_LIMIT_EXCEEDED':
+        return '一次最多选择 9 个文件'
+      case 'DUPLICATE_SOURCE_PATH':
+        return '请勿重复选择同一素材'
+      case 'UNSUPPORTED_MEDIA_TYPE':
+      case 'MIME_EXTENSION_MISMATCH':
+      case 'KIND_MISMATCH':
+        return '仅支持指定格式的图片和视频'
+      case 'FILE_UNREADABLE':
+        return '所选文件已失效，请重新选择'
+      case 'SELECTION_EMPTY':
+      case 'INVALID_FILE_SIZE':
+        return '所选素材无效，请重新选择'
+    }
+  }
+  return '素材选择失败，请重试'
+}
+
+function selectedFileViews(files: readonly ValidatedMedia[]): SelectedFileView[] {
+  return files.map((file, index) => ({
+    id: `selected-${String(index + 1)}`,
+    fileName: file.fileName,
+    kindLabel: file.kind === 'image' ? '图片' : '视频',
+    sizeLabel: formatBytes(file.sizeBytes),
+    sizeBytes: file.sizeBytes,
+    status: 'ready',
+    statusLabel: UPLOAD_STATUS_LABELS.ready,
+    bytes: 0,
+    percent: 0,
+  }))
+}
+
+function queuedFileViews(files: readonly SelectedFileView[]): SelectedFileView[] {
+  return files.map((file) => ({
+    ...file,
+    status: 'queued',
+    statusLabel: UPLOAD_STATUS_LABELS.queued,
+    bytes: 0,
+    percent: 0,
+  }))
+}
+
+function applyUploadEvent(page: UploadPageHost, event: UploadUiEvent): void {
+  const selectedMedia = page.selectedMedia ?? []
+  const index = selectedMedia.findIndex((file) => file.sourcePath === event.sourcePath)
+  if (index < 0) return
+  const current = page.data.selectedFiles[index]
+  const media = selectedMedia[index]
+  if (current === undefined || media === undefined) return
+
+  const bytes = Number.isFinite(event.bytes)
+    ? Math.max(current.bytes, Math.min(media.sizeBytes, Math.max(0, event.bytes)))
+    : current.bytes
+  const percent = Number.isFinite(event.percent)
+    ? Math.max(current.percent, Math.min(100, Math.max(0, event.percent)))
+    : current.percent
+  const updated = page.data.selectedFiles.map((file, itemIndex) =>
+    itemIndex === index
+      ? {
+          ...file,
+          status: event.status,
+          statusLabel: UPLOAD_STATUS_LABELS[event.status],
+          bytes,
+          percent,
+        }
+      : file,
+  )
+  page.setData({ selectedFiles: updated })
+}
+
+async function confirmAndStartUpload(page: UploadPageHost): Promise<void> {
+  const selected = page.selectedMedia ?? []
+  const service = applicationData().mediaUpload
+  if (selected.length === 0 || service === undefined || page.data.uploadBatchRunning) return
+
+  if (!controller(page).snapshot().canCreateUpload) {
+    if (typeof wx === 'object') {
+      void wx.showToast({ title: '请先确认昵称', icon: 'none' })
+    }
+    return
+  }
+  if (typeof wx !== 'object' || typeof wx.showModal !== 'function') {
+    page.setData({ selectionError: '当前微信版本无法确认上传，请升级后重试' })
+    return
+  }
+
+  const totalBytes = selected.reduce((sum, file) => sum + file.sizeBytes, 0)
+  let confirmation: { confirm?: boolean }
+  try {
+    confirmation = await wx.showModal({
+      title: '确认上传素材',
+      content: `共 ${String(selected.length)} 个文件，总计 ${formatBytes(totalBytes)}。确认后将上传到私有存储。`,
+      confirmText: '开始上传',
+      cancelText: '取消',
+    })
+  } catch {
+    page.setData({ selectionError: '上传确认未完成，请重试' })
+    return
+  }
+  if (confirmation.confirm !== true) return
+
+  page.setData({
+    selectedFiles: queuedFileViews(page.data.selectedFiles),
+    selectionError: null,
+    uploadBatchRunning: true,
+  })
+  try {
+    await service.start([...selected], (event) => {
+      applyUploadEvent(page, event)
+    })
+  } catch {
+    const failed = page.data.selectedFiles.map((file) =>
+      file.status === 'uploaded' || file.status === 'finalizing'
+        ? file
+        : {
+            ...file,
+            status: 'failed' as const,
+            statusLabel: UPLOAD_STATUS_LABELS.failed,
+          },
+    )
+    page.setData({
+      selectedFiles: failed,
+      selectionError: '部分素材上传失败，可稍后重试',
+    })
+  } finally {
+    page.setData({ uploadBatchRunning: false })
+  }
 }
 
 function unavailableProfileApi(): NicknameProfileApi {
@@ -381,7 +596,10 @@ function synchronize(page: UploadPageHost): void {
 }
 
 export const uploadPageDefinition = {
-  data: new NicknameFlowController(unavailableProfileApi()).snapshot(),
+  data: {
+    ...new NicknameFlowController(unavailableProfileApi()).snapshot(),
+    ...EMPTY_UPLOAD_PAGE_DATA,
+  } satisfies UploadPageData,
 
   onLoad(this: UploadPageHost): void {
     const application = applicationData()
@@ -415,7 +633,13 @@ export const uploadPageDefinition = {
 
   onRequestNicknamePrivacy(this: UploadPageHost): void {
     this.nicknameInteracted = true
-    controller(this).requestPrivacyAuthorization()
+    const flow = controller(this)
+    if (typeof wx !== 'object' || typeof wx.requirePrivacyAuthorize !== 'function') {
+      flow.privacyAuthorizationUnavailable()
+      synchronize(this)
+      return
+    }
+    flow.requestPrivacyAuthorization()
     synchronize(this)
   },
 
@@ -489,6 +713,7 @@ export const uploadPageDefinition = {
   },
 
   async onChooseMedia(this: UploadPageHost): Promise<void> {
+    if (this.data.uploadBatchRunning) return
     const privacy = controller(this).snapshot()
     if (privacy.nicknamePrivacyPromptVisible || privacy.nicknamePrivacyRequesting) {
       if (typeof wx === 'object') {
@@ -497,13 +722,54 @@ export const uploadPageDefinition = {
       return
     }
 
-    const chooseMedia = applicationData().chooseMedia
+    const application = applicationData()
+    const mediaUpload = application.mediaUpload
+    if (mediaUpload !== undefined) {
+      try {
+        const selected = validateMediaSelection(await mediaUpload.chooseMedia())
+        const totalBytes = selected.reduce((sum, file) => sum + file.sizeBytes, 0)
+        this.selectedMedia = Object.freeze(selected.map((file) => Object.freeze({ ...file })))
+        this.setData({
+          selectedFiles: selectedFileViews(selected),
+          selectedTotalBytes: totalBytes,
+          selectedTotalLabel: formatBytes(totalBytes),
+          selectionError: null,
+          uploadBatchRunning: false,
+        })
+      } catch (error) {
+        const message = selectionErrorMessage(error)
+        if (message !== null) {
+          this.selectedMedia = []
+          this.setData({
+            selectedFiles: [],
+            selectedTotalBytes: 0,
+            selectedTotalLabel: '0 B',
+            selectionError: message,
+            uploadBatchRunning: false,
+          })
+        }
+        return
+      }
+      await confirmAndStartUpload(this)
+      return
+    }
+    const chooseMedia = application.chooseMedia
     if (chooseMedia !== undefined) {
       await chooseMedia()
       return
     }
     if (typeof wx === 'object') {
       void wx.showToast({ title: '素材选择功能准备中', icon: 'none' })
+    }
+  },
+
+  async onStartSelectedUpload(this: UploadPageHost): Promise<void> {
+    await confirmAndStartUpload(this)
+  },
+
+  onOpenHistory(): void {
+    if (typeof wx === 'object' && typeof wx.navigateTo === 'function') {
+      void wx.navigateTo({ url: '/pages/history/index' })
     }
   },
 }

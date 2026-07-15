@@ -16,8 +16,6 @@
       <text class="help-text">昵称用于标识你上传的素材，仅作为显示名称，不代表实名认证。授权完成后，微信会在昵称输入框中展示候选昵称。</text>
     </block>
 
-    <text class="privacy-declaration">上线前，开发者还必须在微信公众平台后台的《小程序用户隐私保护指引》中声明昵称收集，否则微信昵称选择能力不会生效。</text>
-
     <view wx:if="{{!nicknamePrivacyAuthorized}}">
       <button
         wx:if="{{!nicknamePrivacyPromptVisible}}"
@@ -90,10 +88,45 @@
     <button
       class="upload-button"
       bindtap="onChooseMedia"
-      disabled="{{nicknamePrivacyPromptVisible || nicknamePrivacyRequesting}}"
+      disabled="{{nicknamePrivacyPromptVisible || nicknamePrivacyRequesting || uploadBatchRunning}}"
     >
-      选择图片或视频
+      {{selectedFiles.length ? '重新选择图片或视频' : '选择图片或视频'}}
     </button>
     <text class="notice-text" wx:if="{{!nicknameConfirmed}}">可以先选择素材；开始上传前仍需确认昵称。</text>
+    <view class="selection-panel" wx:if="{{selectedFiles.length}}">
+      <view class="selection-summary">
+        <text class="selection-title">已选择 {{selectedFiles.length}} 个文件</text>
+        <text class="selection-total">总计 {{selectedTotalLabel}}</text>
+      </view>
+      <view
+        class="selected-file"
+        wx:for="{{selectedFiles}}"
+        wx:key="id"
+        wx:for-item="item"
+      >
+        <view class="selected-file-heading">
+          <text class="selected-file-name">{{item.fileName}}</text>
+          <text class="selected-file-status status-{{item.status}}">{{item.statusLabel}}</text>
+        </view>
+        <text class="selected-file-meta">{{item.kindLabel}} · {{item.sizeLabel}}</text>
+        <view class="progress-track" wx:if="{{item.status !== 'ready' || item.percent > 0}}">
+          <view class="progress-fill" style="width: {{item.percent}}%;"></view>
+        </view>
+        <text class="progress-copy" wx:if="{{item.status !== 'ready' || item.percent > 0}}">
+          {{item.percent}}%
+        </text>
+      </view>
+      <button
+        class="primary-button start-upload-button"
+        bindtap="onStartSelectedUpload"
+        loading="{{uploadBatchRunning}}"
+        disabled="{{uploadBatchRunning || !nicknameConfirmed}}"
+      >
+        {{uploadBatchRunning ? '正在上传' : '确认并开始上传'}}
+      </button>
+    </view>
+    <text class="error-text" wx:if="{{selectionError}}">{{selectionError}}</text>
   </view>
+
+  <button class="history-button" bindtap="onOpenHistory">查看我的上传记录</button>
 </view>

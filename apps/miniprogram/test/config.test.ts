@@ -84,11 +84,63 @@ describe('mini-program API configuration', () => {
     expect(ignoreFile).toMatch(/^apps\/miniprogram\/miniprogram\/config\.generated\.ts$/mu)
   })
 
-  it('enables the native TypeScript compiler plugin for .ts mini-program sources', () => {
+  it('pins the privacy-capable base library and native TypeScript compiler', () => {
     const projectConfig = JSON.parse(
       readFileSync(resolve(import.meta.dirname, '../project.config.json'), 'utf8'),
-    ) as { setting?: { useCompilerPlugins?: unknown } }
+    ) as {
+      libVersion?: unknown
+      setting?: {
+        packNpmManually?: unknown
+        packNpmRelationList?: unknown
+        useCompilerPlugins?: unknown
+      }
+    }
 
+    expect(projectConfig.libVersion).toBe('2.32.3')
     expect(projectConfig.setting?.useCompilerPlugins).toEqual(['typescript'])
+    expect(projectConfig.setting?.packNpmManually).toBe(true)
+    expect(projectConfig.setting?.packNpmRelationList).toEqual([
+      {
+        packageJsonPath: './package.json',
+        miniprogramNpmDistDir: './miniprogram/',
+      },
+    ])
+  })
+
+  it('uses the same three-minute upload timeout in app and runtime configuration', () => {
+    const appConfig = JSON.parse(
+      readFileSync(resolve(import.meta.dirname, '../miniprogram/app.json'), 'utf8'),
+    ) as { networkTimeout?: { uploadFile?: unknown } }
+
+    expect(appConfig.networkTimeout?.uploadFile).toBe(180_000)
+  })
+
+  it('typechecks shipped mini-program source without Node global types', () => {
+    const runtimeTypecheck = JSON.parse(
+      readFileSync(resolve(import.meta.dirname, '../tsconfig.runtime.json'), 'utf8'),
+    ) as {
+      compilerOptions?: { types?: unknown }
+      include?: unknown
+    }
+    const packageJson = JSON.parse(
+      readFileSync(resolve(import.meta.dirname, '../package.json'), 'utf8'),
+    ) as { scripts?: { typecheck?: unknown } }
+
+    expect(runtimeTypecheck.compilerOptions?.types).toEqual(['miniprogram-api-typings'])
+    expect(runtimeTypecheck.include).toEqual(['miniprogram/**/*.ts'])
+    expect(packageJson.scripts?.typecheck).toContain('tsconfig.runtime.json')
+  })
+
+  it('exposes the private workspace contract through an npm-builder compatible main entry', () => {
+    const contractPackage = JSON.parse(
+      readFileSync(
+        resolve(import.meta.dirname, '../../../packages/contracts/package.json'),
+        'utf8',
+      ),
+    ) as { main?: unknown }
+    const ignoreFile = readFileSync(resolve(import.meta.dirname, '../../../.gitignore'), 'utf8')
+
+    expect(contractPackage.main).toBe('./dist/index.js')
+    expect(ignoreFile).toMatch(/^apps\/miniprogram\/miniprogram\/miniprogram_npm\/$/mu)
   })
 })

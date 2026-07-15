@@ -7,6 +7,9 @@ services:
       POSTGRES_DB: postgres
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres_local
+      POSTGRES_MIGRATION_PASSWORD: wx_migrate_local
+      POSTGRES_RUNTIME_PASSWORD: wx_runtime_local
+      POSTGRES_MAINTENANCE_PASSWORD: wx_maintenance_local
     ports:
       - '127.0.0.1:${POSTGRES_HOST_PORT:-55432}:5432'
     volumes:

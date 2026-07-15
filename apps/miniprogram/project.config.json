@@ -1,13 +1,20 @@
 {
   "appid": "touristappid",
   "compileType": "miniprogram",
-  "libVersion": "trial",
+  "libVersion": "2.32.3",
   "miniprogramRoot": "miniprogram/",
   "projectname": "wx-private-media-upload",
   "setting": {
     "coverView": true,
     "es6": true,
     "minified": true,
+    "packNpmManually": true,
+    "packNpmRelationList": [
+      {
+        "packageJsonPath": "./package.json",
+        "miniprogramNpmDistDir": "./miniprogram/"
+      }
+    ],
     "postcss": true,
     "useCompilerPlugins": ["typescript"],
     "urlCheck": true

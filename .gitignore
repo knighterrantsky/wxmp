@@ -10,3 +10,4 @@ coverage/
 
 apps/miniprogram/project.private.config.json
 apps/miniprogram/miniprogram/config.generated.ts
+apps/miniprogram/miniprogram/miniprogram_npm/
