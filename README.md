@@ -48,8 +48,9 @@ pnpm test:e2e:local
 
 上线前依次阅读：
 
-1. [生产密钥与部署](docs/runbooks/production-secrets.md)
-2. [监控与故障处理](docs/runbooks/monitoring.md)
-3. [真机手工验收](docs/runbooks/manual-acceptance.md)
+1. [GitHub Actions、GHCR 与生产自动部署](docs/runbooks/github-cicd.md)
+2. [生产密钥与部署](docs/runbooks/production-secrets.md)
+3. [监控与故障处理](docs/runbooks/monitoring.md)
+4. [真机手工验收](docs/runbooks/manual-acceptance.md)
 
 接口与数据结构分别以 [API 文档](docs/api/media-upload-api.md) 和 [数据库设计](docs/database/media-upload-database.md) 为准。

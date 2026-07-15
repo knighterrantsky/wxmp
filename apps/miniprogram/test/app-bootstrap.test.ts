@@ -2,6 +2,7 @@ import type { NicknameRequest, PublicUser } from '@wx-upload/contracts'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { ApplicationGlobalData } from '../miniprogram/app.js'
+import { API_BASE_URL } from '../miniprogram/config.generated.js'
 
 const publicUser: PublicUser = {
   id: '01981d0c-ec80-7000-8000-000000000101',
@@ -96,7 +97,7 @@ describe('real mini-program application bootstrap', () => {
     expect(login).toHaveBeenCalledOnce()
     expect(requests[0]).toMatchObject({
       method: 'POST',
-      url: 'https://api.local.invalid/v1/auth/wechat-login',
+      url: `${API_BASE_URL}/v1/auth/wechat-login`,
       data: { code: 'wx-code-one', deviceId: 'installation-000102030405060708090a0b0c0d0e0f' },
     })
     expect([...storage.keys()].sort()).toEqual(['apiSession', 'installationId'])
@@ -114,7 +115,7 @@ describe('real mini-program application bootstrap', () => {
     ).resolves.toEqual(confirmedUser)
     expect(requests[1]).toMatchObject({
       method: 'PUT',
-      url: 'https://api.local.invalid/v1/profile/nickname',
+      url: `${API_BASE_URL}/v1/profile/nickname`,
       header: { authorization: 'Bearer access-one', 'content-type': 'application/json' },
       data: nicknameRequest,
     })

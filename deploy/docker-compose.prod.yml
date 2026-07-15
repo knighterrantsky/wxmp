@@ -1,10 +1,7 @@
 name: wx-private-media-upload-production
 
 x-api-image: &api-image
-  image: wx-private-media-upload-api:${IMAGE_TAG:-latest}
-  build:
-    context: ..
-    dockerfile: deploy/api.Dockerfile
+  image: ${API_IMAGE:?API_IMAGE is required}:${IMAGE_TAG:?IMAGE_TAG is required}
 
 x-hardened-api: &hardened-api
   init: true

@@ -28,8 +28,10 @@ import {
 } from '../support/upload-fixture.js'
 
 const databaseConfig = loadDestructiveDatabaseTestConfig(process.env)
-const requestNow = new Date('2026-07-15T05:02:00.000Z')
-const detailUpdatedAt = new Date('2026-07-15T05:01:08.000Z')
+// The row-version trigger uses the real database clock. Keep the fixture's
+// explicit activity time ahead of it so this assertion cannot expire by date.
+const detailUpdatedAt = new Date(Date.now() + 60_000)
+const requestNow = new Date(detailUpdatedAt.getTime() + 60_000)
 const clock = { now: () => requestNow }
 const partSizes = [PART_SIZE_BYTES, PART_SIZE_BYTES, PART_SIZE_BYTES, 16]
 const totalBytes = partSizes.reduce((total, size) => total + size, 0)

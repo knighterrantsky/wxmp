@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   verify:
@@ -38,10 +38,10 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Use Node.js 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
 
@@ -88,6 +88,8 @@ jobs:
           R2_SECRET_ACCESS_KEY=config-only-secret-key \
           TLS_CERTIFICATE_FILE=/tmp/config-only-certificate.pem \
           TLS_PRIVATE_KEY_FILE=/tmp/config-only-private-key.pem \
+          API_IMAGE=ghcr.io/example/config-only-api \
+          IMAGE_TAG=config-only-image-tag \
           docker compose -f deploy/docker-compose.prod.yml config --quiet
 
       - name: Validate Nginx configuration
@@ -128,3 +130,85 @@ jobs:
       - name: Stop local dependencies
         if: always()
         run: docker compose -f deploy/docker-compose.yml down --volumes
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+
+    steps:
+      - name: Check out verified source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Compute lowercase GHCR image name
+        id: image
+        shell: bash
+        run: |
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          repository="${GITHUB_REPOSITORY#*/}"
+          repository="$(printf '%s' "$repository" | tr '[:upper:]' '[:lower:]')"
+          printf 'name=ghcr.io/%s/%s-api\n' "$owner" "$repository" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build immutable API image
+        env:
+          API_IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          docker build \
+            --file deploy/api.Dockerfile \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --tag "${API_IMAGE}:${GITHUB_SHA}" \
+            .
+
+      - name: Publish immutable and main tags
+        env:
+          API_IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          docker push "${API_IMAGE}:${GITHUB_SHA}"
+          docker tag "${API_IMAGE}:${GITHUB_SHA}" "${API_IMAGE}:main"
+          docker push "${API_IMAGE}:main"
+
+      - name: Log out from GHCR
+        if: always()
+        run: docker logout ghcr.io || true
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_PRODUCTION_DEPLOY == 'true'
+    needs: publish
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 20
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Check out the published release
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Deploy immutable release
+        run: ./deploy/scripts/deploy-release.sh "${{ needs.publish.outputs.image }}" "$GITHUB_SHA" "$GITHUB_WORKSPACE"
+
+      - name: Log out from GHCR
+        if: always()
+        run: docker logout ghcr.io || true
