@@ -89,6 +89,8 @@ jobs:
           TLS_CERTIFICATE_FILE=/tmp/config-only-certificate.pem \
           TLS_PRIVATE_KEY_FILE=/tmp/config-only-private-key.pem \
           API_IMAGE=ghcr.io/example/config-only-api \
+          POSTGRES_IMAGE=ghcr.io/example/config-only-postgres \
+          NGINX_IMAGE=ghcr.io/example/config-only-nginx \
           IMAGE_TAG=config-only-image-tag \
           docker compose -f deploy/docker-compose.prod.yml config --quiet
 
@@ -180,6 +182,17 @@ jobs:
           docker push "${API_IMAGE}:${GITHUB_SHA}"
           docker tag "${API_IMAGE}:${GITHUB_SHA}" "${API_IMAGE}:main"
           docker push "${API_IMAGE}:main"
+
+      - name: Mirror immutable production dependencies to GHCR
+        env:
+          API_IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          docker pull postgres:17-alpine
+          docker tag postgres:17-alpine "${API_IMAGE}:postgres-${GITHUB_SHA}"
+          docker push "${API_IMAGE}:postgres-${GITHUB_SHA}"
+          docker pull nginx:1.30.3-alpine
+          docker tag nginx:1.30.3-alpine "${API_IMAGE}:nginx-${GITHUB_SHA}"
+          docker push "${API_IMAGE}:nginx-${GITHUB_SHA}"
 
       - name: Log out from GHCR
         if: always()

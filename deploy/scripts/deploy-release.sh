@@ -14,6 +14,8 @@ fi
 api_image="$1"
 image_tag="$2"
 source_root="$3"
+postgres_image="${api_image}:postgres-${image_tag}"
+nginx_image="${api_image}:nginx-${image_tag}"
 deploy_root="${WX_UPLOAD_DEPLOY_ROOT:-/opt/wx-private-media-upload}"
 environment_file="${WX_UPLOAD_ENV_FILE:-/etc/wx-private-media-upload/production.env}"
 docker_bin="${WX_UPLOAD_DOCKER_BIN:-docker}"
@@ -83,7 +85,9 @@ if [[ ! -d "$release_directory" ]]; then
     "$source_root/deploy/scripts/deploy-release.sh" \
     "$staging_directory/deploy/scripts/deploy-release.sh"
 
-  API_IMAGE="$api_image" IMAGE_TAG="$image_tag" "$docker_bin" compose \
+  API_IMAGE="$api_image" IMAGE_TAG="$image_tag" \
+    POSTGRES_IMAGE="$postgres_image" NGINX_IMAGE="$nginx_image" \
+    "$docker_bin" compose \
     --project-name wx-private-media-upload-production \
     --env-file "$environment_file" \
     --file "$staging_directory/deploy/docker-compose.prod.yml" \
@@ -94,7 +98,9 @@ if [[ ! -d "$release_directory" ]]; then
 fi
 
 compose() {
-  API_IMAGE="$api_image" IMAGE_TAG="$image_tag" "$docker_bin" compose \
+  API_IMAGE="$api_image" IMAGE_TAG="$image_tag" \
+    POSTGRES_IMAGE="$postgres_image" NGINX_IMAGE="$nginx_image" \
+    "$docker_bin" compose \
     --project-name wx-private-media-upload-production \
     --env-file "$environment_file" \
     --file "$release_directory/deploy/docker-compose.prod.yml" \
@@ -111,8 +117,9 @@ install -m 0750 \
 
 state_file="$deploy_root/release.env"
 state_temporary="$deploy_root/.release.env.$image_tag"
-printf 'API_IMAGE=%s\nIMAGE_TAG=%s\nRELEASE_DIRECTORY=%s\n' \
-  "$api_image" "$image_tag" "$release_directory" > "$state_temporary"
+printf 'API_IMAGE=%s\nIMAGE_TAG=%s\nPOSTGRES_IMAGE=%s\nNGINX_IMAGE=%s\nRELEASE_DIRECTORY=%s\n' \
+  "$api_image" "$image_tag" "$postgres_image" "$nginx_image" "$release_directory" \
+  > "$state_temporary"
 chmod 0600 "$state_temporary"
 mv "$state_temporary" "$state_file"
 ln -sfn "$release_directory" "$deploy_root/current"

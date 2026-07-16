@@ -18,8 +18,12 @@ describe('production delivery configuration', () => {
     expect(compose).toContain(
       'image: ${API_IMAGE:?API_IMAGE is required}:${IMAGE_TAG:?IMAGE_TAG is required}',
     )
+    expect(compose).toContain('image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE is required}')
+    expect(compose).toContain('image: ${NGINX_IMAGE:?NGINX_IMAGE is required}')
     expect(compose).not.toMatch(/^\s+build:/mu)
     expect(compose).not.toContain('latest')
+    expect(compose).not.toContain('image: postgres:')
+    expect(compose).not.toContain('image: nginx:')
   })
 
   it('publishes only after verification and gates production deployment to its dedicated runner', () => {
@@ -33,7 +37,15 @@ describe('production delivery configuration', () => {
     expect(workflow).toContain('./deploy/scripts/deploy-release.sh')
     expect(workflow).toMatch(/sparse-checkout: \|\n\s+deploy/u)
     expect(workflow).toContain('org.opencontainers.image.source')
+    expect(workflow).toContain('"${API_IMAGE}:postgres-${GITHUB_SHA}"')
+    expect(workflow).toContain('"${API_IMAGE}:nginx-${GITHUB_SHA}"')
     expect(workflow).toContain('IMAGE_TAG=config-only-image-tag')
+    expect(workflow).toContain('POSTGRES_IMAGE=ghcr.io/example/config-only-postgres')
+    expect(workflow).toContain('NGINX_IMAGE=ghcr.io/example/config-only-nginx')
+
+    const deployScript = readFileSync(deployScriptPath, 'utf8')
+    expect(deployScript).toContain('POSTGRES_IMAGE="$postgres_image"')
+    expect(deployScript).toContain('NGINX_IMAGE="$nginx_image"')
   })
 
   it('pins the GitHub-maintained source actions to full commit SHAs', () => {

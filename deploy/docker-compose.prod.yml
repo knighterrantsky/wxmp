@@ -15,7 +15,7 @@ x-hardened-api: &hardened-api
 
 services:
   postgres:
-    image: postgres:17-alpine
+    image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE is required}
     environment:
       POSTGRES_DB: postgres
       POSTGRES_USER: postgres
@@ -86,7 +86,7 @@ services:
     restart: unless-stopped
 
   nginx:
-    image: nginx:1.30.3-alpine
+    image: ${NGINX_IMAGE:?NGINX_IMAGE is required}
     ports:
       - '${HTTPS_PORT:-443}:443'
     volumes:

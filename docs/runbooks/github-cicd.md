@@ -11,21 +11,21 @@ pull request / main push
 GitHub 托管 runner：格式、类型、测试、E2E、构建
         |
         v（仅 main 且验证全部成功）
-GitHub 托管 runner：构建 API 镜像并推送私有 GHCR
+GitHub 托管 runner：构建 API 镜像，并把固定版本的 PostgreSQL、Nginx 镜像同步到 GHCR
         |
         v（仅显式开启生产开关）
 服务器 self-hosted runner：按 40 位 commit SHA 拉取并运行 Compose
 ```
 
-服务器不再从源码构建 API。`main` 标签只方便查看，生产部署始终使用完整的 40 位 Git commit SHA；因此同一次发布可准确审计和回滚。
+服务器不再从源码构建 API，也不直接访问 Docker Hub。`main` 标签只方便查看；API、PostgreSQL 和 Nginx 的生产镜像均使用同一个完整的 40 位 Git commit SHA 关联，因此同一次发布可准确审计和回滚。
 
 这条 Docker 链路只交付后端 API。微信小程序代码仍需使用生产 `PUBLIC_API_BASE_URL` 生成配置，再通过微信开发者工具或后续单独配置的微信 CI 完成上传、审核和发布；小程序代码不部署到这台服务器。
 
 ## 2. GitHub 仓库准备
 
-1. 创建 private GitHub repository，把本地仓库推送上去。
+1. 创建 GitHub repository，把本地仓库推送上去。公开仓库只能存放代码和非敏感配置，所有生产密钥仍只保存在服务器。
 2. 在 `Settings -> Actions -> General -> Workflow permissions` 允许工作流读取源码并写入 packages。如果组织策略限制 `packages: write`，需要由组织管理员放行。
-3. 保持 GHCR package 为 private。第一次发布后，在 package 的 `Manage Actions access` 中确认当前 repository 具有读取权限。
+3. 第一次发布后，在 GHCR package 的 `Manage Actions access` 中确认当前 repository 具有读取权限。package 可以保持私有；服务器 runner 会使用当前工作流的短期 `GITHUB_TOKEN` 登录拉取。
 4. 建议保护 `main`，要求 `CI / verify` 成功后才能合并；同时限制直接 push 和对 `.github/workflows/**`、`deploy/**` 的未审核修改。
 5. 暂时不要创建 `ENABLE_PRODUCTION_DEPLOY`，这样 `publish` 会工作，但 `deploy` 会安全跳过。
 
@@ -61,7 +61,7 @@ sudo chown root:wxdeploy /etc/wx-private-media-upload/production.env
 sudo chmod 640 /etc/wx-private-media-upload/production.env
 ```
 
-其中 API 镜像名与 SHA 由流水线在进程环境中覆盖；其余占位值必须全部替换。TLS 文件必须先放到服务器并使用绝对路径。完整密钥要求见 [生产密钥与部署手册](production-secrets.md)。
+其中 API、PostgreSQL、Nginx 镜像名与 SHA 由流水线在进程环境中覆盖；其余占位值必须全部替换。TLS 文件必须先放到服务器并使用绝对路径。完整密钥要求见 [生产密钥与部署手册](production-secrets.md)。
 
 配置完成后只检查文件权限，不输出文件内容：
 
@@ -125,6 +125,9 @@ ENABLE_PRODUCTION_DEPLOY=true
 
 ```bash
 curl --fail https://api.rwseeding.com/health/live
+set -a
+. /opt/wx-private-media-upload/release.env
+set +a
 sudo -u wxdeploy docker compose \
   --project-name wx-private-media-upload-production \
   --env-file /etc/wx-private-media-upload/production.env \
@@ -151,12 +154,3 @@ docker logout ghcr.io
 ```
 
 该操作只回滚容器镜像和部署配置，不反向执行数据库 migration。数据库变更必须遵守 expand/contract 兼容策略。
-
-## 8. 当前尚需的外部信息
-
-本地仓库目前还没有 GitHub remote，因此无法完成以下两步：
-
-- 推送分支并实际产生 GHCR package；
-- 获取 repository 专属的 runner 注册 token。
-
-确定 GitHub 的 `<owner>/<repository>` 后即可继续，不需要重写当前流水线。
