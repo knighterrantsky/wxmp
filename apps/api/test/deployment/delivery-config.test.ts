@@ -49,7 +49,7 @@ describe('production delivery configuration', () => {
     expect(workflow).toContain('IMAGE_TAG=config-only-image-tag')
     expect(workflow).toContain('POSTGRES_IMAGE=ghcr.io/example/config-only-postgres')
     expect(workflow).toContain('NGINX_IMAGE=ghcr.io/example/config-only-nginx')
-    expect(workflow).toMatch(/  deploy:[\s\S]*?timeout-minutes: 35/u)
+    expect(workflow).toMatch(/ {2}deploy:[\s\S]*?timeout-minutes: 35/u)
 
     const deployScript = readFileSync(deployScriptPath, 'utf8')
     expect(deployScript).toContain('POSTGRES_IMAGE="$postgres_image"')
