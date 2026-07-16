@@ -42,7 +42,8 @@ describe('production delivery configuration', () => {
     expect(workflow).toContain('runs-on: [self-hosted, linux, x64, production]')
     expect(workflow).toContain('environment: production')
     expect(workflow).toContain('./deploy/scripts/deploy-release.sh')
-    expect(workflow).toMatch(/sparse-checkout: \|\n\s+deploy/u)
+    expect(workflow).toContain('production-deploy-${{ github.sha }}')
+    expect(workflow).toContain('actions/upload-artifact@')
     expect(workflow).toContain('org.opencontainers.image.source')
     expect(workflow).toContain('"${API_IMAGE}:postgres-${GITHUB_SHA}"')
     expect(workflow).toContain('"${API_IMAGE}:nginx-${GITHUB_SHA}"')
@@ -50,6 +51,10 @@ describe('production delivery configuration', () => {
     expect(workflow).toContain('POSTGRES_IMAGE=ghcr.io/example/config-only-postgres')
     expect(workflow).toContain('NGINX_IMAGE=ghcr.io/example/config-only-nginx')
     expect(workflow).toMatch(/ {2}deploy:[\s\S]*?timeout-minutes: 35/u)
+
+    const deployJob = workflow.slice(workflow.indexOf('\n  deploy:'))
+    expect(deployJob).toContain('actions/download-artifact@')
+    expect(deployJob).not.toContain('actions/checkout@')
 
     const deployScript = readFileSync(deployScriptPath, 'utf8')
     expect(deployScript).toContain('POSTGRES_IMAGE="$postgres_image"')

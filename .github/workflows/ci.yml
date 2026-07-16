@@ -194,6 +194,18 @@ jobs:
           docker tag nginx:1.30.3-alpine "${API_IMAGE}:nginx-${GITHUB_SHA}"
           docker push "${API_IMAGE}:nginx-${GITHUB_SHA}"
 
+      - name: Package the verified production deployment bundle
+        run: tar --create --gzip --file "/tmp/production-deploy-${GITHUB_SHA}.tar.gz" deploy
+
+      - name: Upload the production deployment bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: production-deploy-${{ github.sha }}
+          path: /tmp/production-deploy-${{ github.sha }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
       - name: Log out from GHCR
         if: always()
         run: docker logout ghcr.io || true
@@ -205,17 +217,29 @@ jobs:
     timeout-minutes: 35
     environment: production
     permissions:
+      actions: read
       contents: read
       packages: read
 
     steps:
-      - name: Check out the published release
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Download the verified production deployment bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          persist-credentials: false
-          sparse-checkout: |
-            deploy
-          sparse-checkout-cone-mode: true
+          name: production-deploy-${{ github.sha }}
+          path: ${{ runner.temp }}/production-deploy-artifact
+
+      - name: Extract the immutable deployment bundle
+        id: bundle
+        env:
+          DEPLOY_ARCHIVE: ${{ runner.temp }}/production-deploy-artifact/production-deploy-${{ github.sha }}.tar.gz
+        run: |
+          release_source="${RUNNER_TEMP}/production-release-${GITHUB_SHA}"
+          rm -rf "$release_source"
+          mkdir -p "$release_source"
+          tar --extract --gzip --file "$DEPLOY_ARCHIVE" --directory "$release_source"
+          test -f "$release_source/deploy/docker-compose.prod.yml"
+          test -f "$release_source/deploy/scripts/deploy-release.sh"
+          printf 'source=%s\n' "$release_source" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate to GHCR
         env:
@@ -223,7 +247,9 @@ jobs:
         run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
 
       - name: Deploy immutable release
-        run: ./deploy/scripts/deploy-release.sh "${{ needs.publish.outputs.image }}" "$GITHUB_SHA" "$GITHUB_WORKSPACE"
+        run: |
+          cd "${{ steps.bundle.outputs.source }}"
+          bash ./deploy/scripts/deploy-release.sh "${{ needs.publish.outputs.image }}" "$GITHUB_SHA" "$PWD"
 
       - name: Log out from GHCR
         if: always()

@@ -11,13 +11,13 @@ pull request / main push
 GitHub 托管 runner：格式、类型、测试、E2E、构建
         |
         v（仅 main 且验证全部成功）
-GitHub 托管 runner：构建 API 镜像，并把固定版本的 PostgreSQL、Nginx 镜像同步到 GHCR
+GitHub 托管 runner：构建 API 镜像，把固定版本的 PostgreSQL、Nginx 镜像同步到 GHCR，并上传部署包
         |
         v（仅显式开启生产开关）
-服务器 self-hosted runner：按 40 位 commit SHA 拉取并运行 Compose
+服务器 self-hosted runner：下载小型部署包，按 40 位 commit SHA 拉取镜像并运行 Compose
 ```
 
-服务器不再从源码构建 API，也不直接访问 Docker Hub。`main` 标签只方便查看；API、PostgreSQL 和 Nginx 的生产镜像均使用同一个完整的 40 位 Git commit SHA 关联，因此同一次发布可准确审计和回滚。
+服务器不再检出源码、不从源码构建 API，也不直接访问 Docker Hub。经过验证的 `deploy` 目录以当前工作流的短期 artifact 交付，避免生产服务器依赖 GitHub repository fetch。`main` 标签只方便查看；API、PostgreSQL 和 Nginx 的生产镜像均使用同一个完整的 40 位 Git commit SHA 关联，因此同一次发布可准确审计和回滚。
 
 这条 Docker 链路只交付后端 API。微信小程序代码仍需使用生产 `PUBLIC_API_BASE_URL` 生成配置，再通过微信开发者工具或后续单独配置的微信 CI 完成上传、审核和发布；小程序代码不部署到这台服务器。
 
