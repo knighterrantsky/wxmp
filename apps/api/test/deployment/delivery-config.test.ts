@@ -31,6 +31,7 @@ describe('production delivery configuration', () => {
     expect(workflow).toContain('runs-on: [self-hosted, linux, x64, production]')
     expect(workflow).toContain('environment: production')
     expect(workflow).toContain('./deploy/scripts/deploy-release.sh')
+    expect(workflow).toMatch(/sparse-checkout: \|\n\s+deploy/u)
     expect(workflow).toContain('org.opencontainers.image.source')
     expect(workflow).toContain('IMAGE_TAG=config-only-image-tag')
   })
