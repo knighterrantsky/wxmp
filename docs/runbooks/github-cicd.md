@@ -137,7 +137,7 @@ sudo -u wxdeploy docker compose \
 
 ## 7. 失败与回滚
 
-部署脚本使用目录锁，避免两个发布并发执行；只有 Compose 配置校验、镜像拉取、数据库迁移和健康等待全部成功后，`current` 才会指向新 release。失败时先查看 GitHub job 和容器日志，不要跳过 migration。
+部署脚本使用进程级文件锁，避免两个发布并发执行，Job 即使被取消也不会遗留假锁；只有 Compose 配置校验、镜像拉取、数据库迁移和健康等待全部成功后，`current` 才会指向新 release。失败时先查看 GitHub job 和容器日志，不要跳过 migration。
 
 已经成功过的 release 会保存在 `/opt/wx-private-media-upload/releases/<commit-sha>`。应用回滚使用旧 SHA 和旧 release 配置：
 

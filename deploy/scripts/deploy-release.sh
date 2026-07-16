@@ -19,6 +19,7 @@ nginx_image="${api_image}:nginx-${image_tag}"
 deploy_root="${WX_UPLOAD_DEPLOY_ROOT:-/opt/wx-private-media-upload}"
 environment_file="${WX_UPLOAD_ENV_FILE:-/etc/wx-private-media-upload/production.env}"
 docker_bin="${WX_UPLOAD_DOCKER_BIN:-docker}"
+flock_bin="${WX_UPLOAD_FLOCK_BIN:-flock}"
 
 if [[ ! "$api_image" =~ ^ghcr\.io/[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$ ]]; then
   printf 'The API image must be a lowercase GHCR repository path.\n' >&2
@@ -48,12 +49,15 @@ fi
 source_root="$(cd "$source_root" && pwd -P)"
 release_root="$deploy_root/releases"
 release_directory="$release_root/$image_tag"
-lock_directory="$deploy_root/.deploy.lock"
+lock_file="$deploy_root/.deploy.lock"
 staging_directory=''
 
 install -d -m 0750 "$deploy_root" "$release_root" "$deploy_root/bin"
 
-if ! mkdir "$lock_directory" 2>/dev/null; then
+touch "$lock_file"
+chmod 0600 "$lock_file"
+exec 9>"$lock_file"
+if ! "$flock_bin" -n 9; then
   printf 'Another production deployment is already running.\n' >&2
   exit 75
 fi
@@ -62,7 +66,6 @@ cleanup() {
   if [[ -n "$staging_directory" && -d "$staging_directory" ]]; then
     rm -rf "$staging_directory"
   fi
-  rmdir "$lock_directory" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -78,7 +81,7 @@ if [[ ! -d "$release_directory" ]]; then
   install -m 0640 \
     "$source_root/deploy/nginx/default.conf" \
     "$staging_directory/deploy/nginx/default.conf"
-  install -m 0640 \
+  install -m 0644 \
     "$source_root/deploy/postgres/init-roles.sql" \
     "$staging_directory/deploy/postgres/init-roles.sql"
   install -m 0750 \

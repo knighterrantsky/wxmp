@@ -1,4 +1,11 @@
-import { chmodSync, mkdtempSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -42,10 +49,12 @@ describe('production delivery configuration', () => {
     expect(workflow).toContain('IMAGE_TAG=config-only-image-tag')
     expect(workflow).toContain('POSTGRES_IMAGE=ghcr.io/example/config-only-postgres')
     expect(workflow).toContain('NGINX_IMAGE=ghcr.io/example/config-only-nginx')
+    expect(workflow).toMatch(/  deploy:[\s\S]*?timeout-minutes: 35/u)
 
     const deployScript = readFileSync(deployScriptPath, 'utf8')
     expect(deployScript).toContain('POSTGRES_IMAGE="$postgres_image"')
     expect(deployScript).toContain('NGINX_IMAGE="$nginx_image"')
+    expect(deployScript).toContain('"$flock_bin" -n 9')
   })
 
   it('pins the GitHub-maintained source actions to full commit SHAs', () => {
@@ -90,12 +99,15 @@ describe('deployment release script', () => {
     const environmentFile = join(temporaryRoot, 'production.env')
     const dockerLog = join(temporaryRoot, 'docker.log')
     const fakeDocker = join(temporaryRoot, 'docker')
+    const fakeFlock = join(temporaryRoot, 'flock')
     const image = 'ghcr.io/example/wx-private-media-upload-api'
     const tag = 'a'.repeat(40)
 
     writeFileSync(environmentFile, 'POSTGRES_ADMIN_PASSWORD=test-only\n')
     writeFileSync(fakeDocker, '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$WX_UPLOAD_DOCKER_LOG"\n')
+    writeFileSync(fakeFlock, '#!/bin/sh\nexit 0\n')
     chmodSync(fakeDocker, 0o755)
+    chmodSync(fakeFlock, 0o755)
 
     const result = spawnSync('bash', [deployScriptPath, image, tag, repositoryRoot], {
       encoding: 'utf8',
@@ -104,6 +116,7 @@ describe('deployment release script', () => {
         WX_UPLOAD_DEPLOY_ROOT: deployRoot,
         WX_UPLOAD_ENV_FILE: environmentFile,
         WX_UPLOAD_DOCKER_BIN: fakeDocker,
+        WX_UPLOAD_FLOCK_BIN: fakeFlock,
         WX_UPLOAD_DOCKER_LOG: dockerLog,
       },
     })
@@ -113,6 +126,9 @@ describe('deployment release script', () => {
     expect(
       readFileSync(join(releaseDirectory, 'deploy/docker-compose.prod.yml'), 'utf8'),
     ).toContain('${API_IMAGE')
+    expect(statSync(join(releaseDirectory, 'deploy/postgres/init-roles.sql')).mode & 0o777).toBe(
+      0o644,
+    )
     expect(readlinkSync(join(deployRoot, 'current'))).toBe(releaseDirectory)
 
     const dockerCalls = readFileSync(dockerLog, 'utf8')
