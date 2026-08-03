@@ -16,6 +16,10 @@ const repositoryRoot = fileURLToPath(new URL('../../../../', import.meta.url))
 const productionComposePath = join(repositoryRoot, 'deploy/docker-compose.prod.yml')
 const workflowPath = join(repositoryRoot, '.github/workflows/ci.yml')
 const deployScriptPath = join(repositoryRoot, 'deploy/scripts/deploy-release.sh')
+const certificateDeployHookPath = join(
+  repositoryRoot,
+  'deploy/scripts/deploy-renewed-certificate.sh',
+)
 const bootstrapScriptPath = join(repositoryRoot, 'deploy/scripts/bootstrap-ubuntu.sh')
 
 describe('production delivery configuration', () => {
@@ -80,9 +84,27 @@ describe('production delivery configuration', () => {
     expect(bootstrap).toContain('docker.io')
     expect(bootstrap).toContain('docker-buildx')
     expect(bootstrap).toContain('docker-compose-v2')
+    expect(bootstrap).toContain('certbot')
+    expect(bootstrap).toContain('/etc/letsencrypt/renewal-hooks/deploy')
     expect(bootstrap).toContain('wxdeploy')
     expect(bootstrap).toContain('/swapfile')
     expect(bootstrap).not.toMatch(/curl[^\n]*\|\s*(?:ba)?sh/u)
+  })
+
+  it('deploys renewed certificates with validation, locking, rollback, and a health check', () => {
+    const hook = readFileSync(certificateDeployHookPath, 'utf8')
+
+    expect(hook).toContain('openssl x509')
+    expect(hook).toContain('-checkhost "$expected_domain"')
+    expect(hook).toContain('-checkend 604800')
+    expect(hook).toContain('sha256sum')
+    expect(hook).toContain('"$flock_bin" -w 300 9')
+    expect(hook).toContain('--force-recreate nginx')
+    expect(hook).toContain('restoring the previous certificate')
+    expect(hook).toContain('--retry-all-errors')
+    expect(hook).toContain("--noproxy '*'")
+    expect(hook).toContain('/health/live')
+    expect(hook).not.toContain('set -x')
   })
 })
 
@@ -134,6 +156,9 @@ describe('deployment release script', () => {
     expect(statSync(join(releaseDirectory, 'deploy/postgres/init-roles.sql')).mode & 0o777).toBe(
       0o644,
     )
+    expect(
+      statSync(join(releaseDirectory, 'deploy/scripts/deploy-renewed-certificate.sh')).mode & 0o777,
+    ).toBe(0o750)
     expect(readlinkSync(join(deployRoot, 'current'))).toBe(releaseDirectory)
 
     const dockerCalls = readFileSync(dockerLog, 'utf8')

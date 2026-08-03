@@ -63,10 +63,13 @@ function fixture() {
     } as UploadHistoryResponse['data'],
     pagination: { limit: 1, hasMore: false, nextCursor: null },
   })
+  const clearUploaded = vi
+    .fn<UploadHistoryRouteService['clearUploaded']>()
+    .mockResolvedValue({ clearedCount: 1 })
   const app = buildAppShell(fakeDependencies({ clock: { now: () => now } }))
-  registerUploadRoutes(app, { uploads: uploadStub(), history: { list }, tokens })
+  registerUploadRoutes(app, { uploads: uploadStub(), history: { list, clearUploaded }, tokens })
   apps.push(app)
-  return { app, list }
+  return { app, list, clearUploaded }
 }
 
 describe('GET /v1/uploads', () => {
@@ -113,5 +116,36 @@ describe('GET /v1/uploads', () => {
     expect(responses[60]?.statusCode).toBe(429)
     expect(responses[60]?.json()).toMatchObject({ error: { code: 'RATE_LIMITED' } })
     expect(list).toHaveBeenCalledTimes(60)
+  })
+})
+
+describe('POST /v1/uploads/history/clear-uploaded', () => {
+  it('clears only the authenticated user history through a strict public response', async () => {
+    const { app, clearUploaded } = fixture()
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/uploads/history/clear-uploaded',
+      headers: { authorization: 'Bearer valid-access-token' },
+      payload: {},
+    })
+
+    expect(response.statusCode, response.body).toBe(200)
+    expect(response.json()).toEqual({
+      data: { clearedCount: 1 },
+      meta: {
+        requestId: response.headers['x-request-id'],
+        serverTime: now.toISOString(),
+      },
+    })
+    expect(clearUploaded).toHaveBeenCalledOnce()
+    expect(clearUploaded.mock.calls[0]?.[0]).toMatchObject({
+      userId,
+      sessionId,
+      context: {
+        requestId: response.headers['x-request-id'],
+        sourceIp: '127.0.0.1',
+      },
+    })
   })
 })

@@ -36,6 +36,26 @@ page {
   margin-top: 24rpx;
 }
 
+.history-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 18rpx;
+}
+
+.clear-history-button {
+  width: auto;
+  margin: 0;
+  padding: 14rpx 4rpx 14rpx 24rpx;
+  border: 0;
+  background: transparent;
+  color: #8b514b;
+  font-size: 23rpx;
+}
+
+.clear-history-button::after {
+  border: 0;
+}
+
 .history-item,
 .history-empty {
   margin-bottom: 20rpx;
@@ -53,6 +73,13 @@ page {
   justify-content: space-between;
 }
 
+.item-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  margin-left: 18rpx;
+}
+
 .item-name {
   min-width: 0;
   flex: 1;
@@ -64,12 +91,27 @@ page {
 }
 
 .status-pill {
-  margin-left: 18rpx;
   padding: 7rpx 14rpx;
   border-radius: 999rpx;
   background: #edf2ef;
   color: #61746d;
   font-size: 21rpx;
+}
+
+.cancel-upload-button {
+  width: auto;
+  min-width: 88rpx;
+  margin: 0 0 0 12rpx;
+  padding: 16rpx 0 16rpx 16rpx;
+  border: 0;
+  background: transparent;
+  color: #8b514b;
+  font-size: 23rpx;
+  line-height: 1.2;
+}
+
+.cancel-upload-button::after {
+  border: 0;
 }
 
 .tone-progress,

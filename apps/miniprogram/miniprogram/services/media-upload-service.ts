@@ -30,13 +30,20 @@ export interface MediaUploadRunnerListeners {
   readonly onStatus: (event: MediaUploadRunnerStatusEvent) => void
 }
 
+export interface MediaUploadRunnerFactoryOptions {
+  readonly maxParallelParts: 1 | 2
+}
+
 export interface MediaUploadRunner {
   run(file: Readonly<ValidatedMedia>): Promise<UploadQueueRunnerResult>
   pause(): Promise<void>
   resume(): Promise<unknown>
 }
 
-export type MediaUploadRunnerFactory = (listeners: MediaUploadRunnerListeners) => MediaUploadRunner
+export type MediaUploadRunnerFactory = (
+  listeners: MediaUploadRunnerListeners,
+  options?: MediaUploadRunnerFactoryOptions,
+) => MediaUploadRunner
 
 export interface MediaSourceRuntime {
   isReadable(sourcePath: string): Promise<boolean>
@@ -49,7 +56,12 @@ export interface MediaUploadServiceOptions {
   readonly unfinishedServerSessionCount?: (() => number) | undefined
 }
 
-export type MediaUploadServiceErrorCode = 'ACTIVE_BATCH' | 'PAUSE_FAILED' | 'FOREGROUND_FAILED'
+export interface MediaUploadBatch {
+  readonly completion: Promise<void>
+}
+
+export type MediaUploadServiceErrorCode =
+  'ACTIVE_BATCH' | 'SOURCE_INVALID' | 'PAUSE_FAILED' | 'FOREGROUND_FAILED'
 
 export class MediaUploadServiceError extends Error {
   override readonly name = 'MediaUploadServiceError'
@@ -105,7 +117,7 @@ export class MediaUploadService {
   readonly #runnerFactory: MediaUploadRunnerFactory
   readonly #unfinishedServerSessionCount: (() => number) | undefined
   readonly #queue: UploadQueue<ValidatedMedia>
-  #active: ActiveUpload | undefined
+  readonly #active = new Set<ActiveUpload>()
   #batchListener: ((event: MediaUploadUiEvent) => void) | undefined
   #batchLocked = false
 
@@ -122,8 +134,8 @@ export class MediaUploadService {
     )
   }
 
-  async chooseMedia(): Promise<readonly MediaSelectionCandidate[]> {
-    const selected = await this.#picker.chooseMedia()
+  async chooseMedia(maxCount?: number): Promise<readonly MediaSelectionCandidate[]> {
+    const selected = await this.#picker.chooseMedia(maxCount)
     const candidates: MediaSelectionCandidate[] = []
     for (const file of selected) {
       candidates.push({
@@ -138,16 +150,27 @@ export class MediaUploadService {
     files: readonly ValidatedMedia[],
     onUpdate: (event: MediaUploadUiEvent) => void,
   ): Promise<void> {
-    if (this.#batchLocked) throw new MediaUploadServiceError('ACTIVE_BATCH')
-    if (this.#serverSessionCapacityReached()) {
-      throw new MediaUploadServiceError('ACTIVE_BATCH')
-    }
+    const batch = await this.begin(files, onUpdate)
+    await batch.completion
+  }
+
+  async begin(
+    files: readonly ValidatedMedia[],
+    onUpdate: (event: MediaUploadUiEvent) => void,
+  ): Promise<MediaUploadBatch> {
+    if (this.#batchUnavailable()) throw new MediaUploadServiceError('ACTIVE_BATCH')
+    await this.prepare(files)
+    if (this.#batchUnavailable()) throw new MediaUploadServiceError('ACTIVE_BATCH')
     this.#batchLocked = true
     this.#batchListener = onUpdate
     for (const file of files) {
       this.#emitDirect(file.sourcePath, 'queued', 0, 0)
     }
 
+    return Object.freeze({ completion: this.#runAcceptedBatch(files) })
+  }
+
+  async #runAcceptedBatch(files: readonly ValidatedMedia[]): Promise<void> {
     try {
       const snapshot = await this.#queue.run(files, { confirmed: true })
       if (
@@ -173,6 +196,14 @@ export class MediaUploadService {
     }
   }
 
+  async prepare(files: readonly ValidatedMedia[]): Promise<void> {
+    for (const file of files) {
+      if (!(await this.#isReadable(file.sourcePath))) {
+        throw new MediaUploadServiceError('SOURCE_INVALID')
+      }
+    }
+  }
+
   #serverSessionCapacityReached(): boolean {
     if (this.#unfinishedServerSessionCount === undefined) return false
     try {
@@ -183,28 +214,36 @@ export class MediaUploadService {
     }
   }
 
+  #batchUnavailable(): boolean {
+    return this.#batchLocked || this.#serverSessionCapacityReached()
+  }
+
   async pause(): Promise<void> {
-    const active = this.#active
-    if (!active?.active) return
+    const activeUploads = [...this.#active].filter((active) => active.active)
+    if (activeUploads.length === 0) return
     try {
-      await active.runner.pause()
-      if (this.#active === active) this.#emitStatus(active, 'paused')
+      await Promise.all(activeUploads.map((active) => active.runner.pause()))
+      for (const active of activeUploads) {
+        if (this.#active.has(active) && active.active) this.#emitStatus(active, 'paused')
+      }
     } catch {
       throw new MediaUploadServiceError('PAUSE_FAILED')
     }
   }
 
   async foreground(): Promise<void> {
-    const active = this.#active
-    if (!active?.active) return
-    let outcome: unknown
+    const activeUploads = [...this.#active].filter((active) => active.active)
+    if (activeUploads.length === 0) return
     try {
-      outcome = await active.runner.resume()
+      await Promise.all(activeUploads.map((active) => this.#foregroundActive(active)))
     } catch {
       throw new MediaUploadServiceError('FOREGROUND_FAILED')
     }
-    if (this.#active !== active) return
+  }
 
+  async #foregroundActive(active: ActiveUpload): Promise<void> {
+    const outcome: unknown = await active.runner.resume()
+    if (!this.#active.has(active) || !active.active) return
     if (!isRecord(outcome)) throw new MediaUploadServiceError('FOREGROUND_FAILED')
     switch (outcome['action']) {
       case 'continued':
@@ -231,6 +270,7 @@ export class MediaUploadService {
   #candidateFields(file: WechatSelectedMedia): Omit<MediaSelectionCandidate, 'readable'> {
     return {
       sourcePath: file.sourcePath,
+      previewPath: file.previewPath,
       sizeBytes: file.sizeBytes,
       kind: file.kind,
     }
@@ -249,25 +289,28 @@ export class MediaUploadService {
     let active: ActiveUpload | undefined
     this.#emitDirect(file.sourcePath, 'uploading', 0, 0)
     try {
-      runner = this.#runnerFactory({
-        onProgress: (event) => {
-          if (!active?.active) return
-          try {
-            this.#emitProgress(active, event)
-          } catch {
-            // Runtime callback data is untrusted and must not interrupt the queue.
-          }
+      runner = this.#runnerFactory(
+        {
+          onProgress: (event) => {
+            if (!active?.active) return
+            try {
+              this.#emitProgress(active, event)
+            } catch {
+              // Runtime callback data is untrusted and must not interrupt the queue.
+            }
+          },
+          onStatus: (event) => {
+            if (!active?.active) return
+            try {
+              const status = publicRunnerStatus(event.status)
+              if (status !== undefined) this.#emitStatus(active, status)
+            } catch {
+              // Runtime callback data is untrusted and must not interrupt the queue.
+            }
+          },
         },
-        onStatus: (event) => {
-          if (!active?.active) return
-          try {
-            const status = publicRunnerStatus(event.status)
-            if (status !== undefined) this.#emitStatus(active, status)
-          } catch {
-            // Runtime callback data is untrusted and must not interrupt the queue.
-          }
-        },
-      })
+        { maxParallelParts: 1 },
+      )
       active = {
         file,
         runner,
@@ -278,7 +321,7 @@ export class MediaUploadService {
         percent: 0,
         lastEventSignature: null,
       }
-      this.#active = active
+      this.#active.add(active)
       const result: unknown = await runner.run(file)
       if (result !== 'finalizing' && result !== 'uploaded') {
         throw new Error('invalid upload runner result')
@@ -295,7 +338,7 @@ export class MediaUploadService {
     } finally {
       if (active !== undefined) {
         active.active = false
-        if (this.#active === active) this.#active = undefined
+        this.#active.delete(active)
       }
     }
   }

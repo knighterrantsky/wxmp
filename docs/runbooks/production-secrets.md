@@ -112,7 +112,9 @@ R2 生命周期是应用 24 小时会话清理与后台对账之外的最终兜�
 
 ### 2.7 TLS 文件
 
-`TLS_CERTIFICATE_FILE` 和 `TLS_PRIVATE_KEY_FILE` 必须是宿主机绝对路径，Compose 将它们只读挂载到 Nginx。证书需要覆盖微信后台登记的完整 API 域名。续签由宿主机证书工具负责；续签后校验证书，再平滑重载 Nginx。
+`TLS_CERTIFICATE_FILE` 和 `TLS_PRIVATE_KEY_FILE` 必须是宿主机绝对路径，Compose 将它们只读挂载到 Nginx。当前使用 Let’s Encrypt 为 `api.rollinwave.store` 签发公信证书，Certbot standalone 通过 80 端口完成 HTTP-01 验证。
+
+`certbot.timer` 负责续期检查；成功续期后，`deploy/scripts/deploy-renewed-certificate.sh` 校验域名、公私钥与有效期，使用生产部署锁原子替换固定文件并重新创建 Nginx。不能只平滑 reload，因为 Docker 的单文件 bind mount 需要容器重建才能可靠加载原子替换后的文件。
 
 ## 3. 上线步骤
 
@@ -121,7 +123,7 @@ R2 生命周期是应用 24 小时会话清理与后台对账之外的最终兜�
 1. 将 API 域名 DNS 指向服务器。
 2. 在微信小程序后台把同一 HTTPS 域名加入 request 与 uploadFile 合法域名。
 3. 在微信公众平台《小程序用户隐私保护指引》中如实声明昵称收集及用途；未声明时 `<input type="nickname">` 的微信昵称候选能力不会生效。
-4. 防火墙仅开放所需管理来源、证书入口和 443；不要开放 PostgreSQL 5432。
+4. 防火墙开放所需管理来源、HTTP-01 使用的 80 和生产 HTTPS 443；不要开放 PostgreSQL 5432。
 5. 完成 R2 私有状态与 7 天未完成 multipart 生命周期检查。
 6. 建立 PostgreSQL 每日备份：7 个日备、4 个周备和 3 个长期恢复点；每月至少在隔离环境恢复一次。
 

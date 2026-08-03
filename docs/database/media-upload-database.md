@@ -388,6 +388,7 @@ CREATE TABLE upload_sessions (
   failed_at                timestamptz,
   failure_code             varchar(64),
   failure_detail           varchar(1000),
+  history_hidden_at        timestamptz,
   created_at               timestamptz NOT NULL DEFAULT clock_timestamp(),
   updated_at               timestamptz NOT NULL DEFAULT clock_timestamp(),
   row_version              bigint NOT NULL DEFAULT 0,
@@ -457,11 +458,18 @@ CREATE TABLE upload_sessions (
   CONSTRAINT ck_upload_failed CHECK (
     status <> 'failed' OR (failed_at IS NOT NULL AND failure_code IS NOT NULL)
   ),
+  CONSTRAINT ck_upload_history_hidden CHECK (
+    history_hidden_at IS NULL OR status = 'completed'
+  ),
   CONSTRAINT ck_upload_version CHECK (row_version >= 0)
 );
 
 CREATE INDEX ix_upload_user_history
   ON upload_sessions (user_id, created_at DESC, id DESC);
+
+CREATE INDEX ix_upload_visible_history
+  ON upload_sessions (user_id, created_at DESC, id DESC)
+  WHERE history_hidden_at IS NULL;
 
 CREATE INDEX ix_upload_expiry
   ON upload_sessions (expires_at)
@@ -481,6 +489,8 @@ CREATE INDEX ix_upload_reconcile_stuck
 ```
 
 每个媒体记录只对应一个上传会话。活跃会话内可重传分片；会话进入不可恢复的 `failed/aborted/expired` 后，用户重新上传会创建新的媒体记录和上传会话，旧记录保留在历史中。
+
+`history_hidden_at` 只表示用户已从上传记录页清除该成功记录。它不删除媒体对象、R2 对象或审计事件；列表查询必须过滤该字段。只有 `completed` 会话允许设置此字段。
 
 `last_activity_at` 在成功确认分片或进入 `completing/aborting` 时更新，用于判断状态持续时长；finalizer/aborter 的失败重试只更新各自的 `next_*_at` 和错误字段，不推进 `last_activity_at`，否则会掩盖长期卡住告警。
 

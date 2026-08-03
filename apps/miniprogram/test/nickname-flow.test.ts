@@ -139,6 +139,33 @@ describe('explicit WeChat nickname privacy authorization', () => {
     expect(updateNickname).not.toHaveBeenCalled()
   })
 
+  it('reuses an existing privacy grant for editing and collapses after a successful update', async () => {
+    const { controller, updateNickname } = fixture(confirmedUser)
+    authorize(controller)
+
+    controller.requestPrivacyAuthorization()
+    expect(controller.snapshot()).toMatchObject({
+      nicknamePrivacyAuthorized: true,
+      nicknameEditing: true,
+      nicknamePrivacyPromptVisible: false,
+    })
+
+    controller.onNicknameInput('新昵称')
+    controller.onNicknameReviewStart()
+    const submitting = controller.onNicknameSubmit({
+      detail: { value: { nickname: '新昵称' } },
+    })
+    await controller.onNicknameReview({ detail: { pass: true, timeout: false } })
+    await submitting
+
+    expect(updateNickname).toHaveBeenCalledWith({
+      nickname: '新昵称',
+      source: 'wechatNicknameInput',
+      confirmed: true,
+    })
+    expect(controller.snapshot().nicknameEditing).toBe(false)
+  })
+
   it('disables and guards media selection while the privacy panel is active', async () => {
     const { controller } = fixture()
     const chooseMedia = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
@@ -149,7 +176,8 @@ describe('explicit WeChat nickname privacy authorization', () => {
         selectedTotalBytes: 0,
         selectedTotalLabel: '0 B',
         selectionError: null,
-        uploadBatchRunning: false,
+        draftPicking: false,
+        draftSubmitting: false,
       } as UploadPageData,
       nicknameFlow: controller,
       setData(data: Partial<UploadPageData & NicknameFlowSnapshot>) {
@@ -177,7 +205,7 @@ describe('race-free WeChat nickname review and form submission', () => {
     const { controller, updateNickname } = fixture()
     authorize(controller)
 
-    controller.onNicknameInput()
+    controller.onNicknameInput(' 小晴 ')
     controller.onNicknameReviewStart()
     await controller.onNicknameSubmit({ detail: { value: { nickname: ' 小晴 ' } } })
 
@@ -209,7 +237,7 @@ describe('race-free WeChat nickname review and form submission', () => {
     const { controller, updateNickname } = fixture()
     authorize(controller)
 
-    controller.onNicknameInput()
+    controller.onNicknameInput('阿远')
     controller.onNicknameReviewStart()
     await controller.onNicknameReview({ detail: { pass: true, timeout: false } })
     expect(updateNickname).not.toHaveBeenCalled()
@@ -240,7 +268,7 @@ describe('race-free WeChat nickname review and form submission', () => {
   ])('never saves a $name', async ({ reviewFirst, review, message }) => {
     const { controller, updateNickname } = fixture()
     authorize(controller)
-    controller.onNicknameInput()
+    controller.onNicknameInput('不应保存')
     controller.onNicknameReviewStart()
 
     if (reviewFirst) {
@@ -264,7 +292,7 @@ describe('race-free WeChat nickname review and form submission', () => {
   it('does not reuse one review pass for a second form submission', async () => {
     const { controller, updateNickname } = fixture()
     authorize(controller)
-    controller.onNicknameInput()
+    controller.onNicknameInput('小晴')
     controller.onNicknameReviewStart()
     await controller.onNicknameReview({ detail: { pass: true, timeout: false } })
     await controller.onNicknameSubmit({ detail: { value: { nickname: '小晴' } } })
@@ -278,11 +306,11 @@ describe('race-free WeChat nickname review and form submission', () => {
     const { controller, updateNickname } = fixture()
     authorize(controller)
 
-    controller.onNicknameInput()
+    controller.onNicknameInput('第一个昵称')
     controller.onNicknameReviewStart()
     await controller.onNicknameSubmit({ detail: { value: { nickname: '第一个昵称' } } })
 
-    controller.onNicknameInput()
+    controller.onNicknameInput('第二个昵称')
     controller.onNicknameReviewStart()
     await controller.onNicknameSubmit({ detail: { value: { nickname: '第二个昵称' } } })
     await controller.onNicknameReview({ detail: { pass: true, timeout: false } })
@@ -296,7 +324,7 @@ describe('race-free WeChat nickname review and form submission', () => {
       canCreateUpload: false,
     })
 
-    controller.onNicknameInput()
+    controller.onNicknameInput('最终昵称')
     controller.onNicknameReviewStart()
     await controller.onNicknameSubmit({ detail: { value: { nickname: '最终昵称' } } })
     await controller.onNicknameReview({ detail: { pass: true, timeout: false } })
@@ -316,7 +344,7 @@ describe('race-free WeChat nickname review and form submission', () => {
     const controller = new NicknameFlowController({ updateNickname }, confirmedUser)
     authorize(controller)
 
-    controller.onNicknameInput()
+    controller.onNicknameInput('新昵称')
     controller.onNicknameReviewStart()
     await controller.onNicknameSubmit({ detail: { value: { nickname: '新昵称' } } })
     await controller.onNicknameReview({ detail: { pass: true, timeout: false } })
@@ -332,6 +360,30 @@ describe('race-free WeChat nickname review and form submission', () => {
 })
 
 describe('nickname page contract', () => {
+  it('keeps the nickname selected from the WeChat keyboard in page state', () => {
+    const { controller } = fixture()
+    const host = {
+      data: {
+        ...controller.snapshot(),
+        selectedFiles: [],
+        selectedTotalBytes: 0,
+        selectedTotalLabel: '0 B',
+        selectionError: null,
+        draftPicking: false,
+        draftSubmitting: false,
+      } as UploadPageData,
+      nicknameFlow: controller,
+      nicknameInteracted: false,
+      setData(data: Partial<UploadPageData & NicknameFlowSnapshot>) {
+        this.data = { ...this.data, ...data }
+      },
+    }
+
+    uploadPageDefinition.onNicknameInput.call(host, { detail: { value: '微信候选昵称' } })
+
+    expect(host.data.nicknameDraft).toBe('微信候选昵称')
+  })
+
   it('uses the official privacy button and gates every nickname input behind authorization', () => {
     const wxml = readFileSync(
       new URL('../miniprogram/pages/upload/index.wxml', import.meta.url),
@@ -349,9 +401,11 @@ describe('nickname page contract', () => {
     expect(wxml).toMatch(/bindtap=["']onOpenNicknamePrivacyContract["']/u)
     expect(wxml).toMatch(/bindtap=["']onRejectNicknamePrivacy["']/u)
     expect(wxml).not.toMatch(/上线前|开发者还必须/u)
-    expect(wxml).toMatch(/wx:if=["']\{\{nicknamePrivacyAuthorized\}\}["'][^>]*>\s*<form/su)
     expect(wxml).toMatch(
-      /<button[^>]+class=["']upload-button["'][^>]+disabled=["']\{\{nicknamePrivacyPromptVisible \|\| nicknamePrivacyRequesting(?: \|\| uploadBatchRunning)?\}\}["']/u,
+      /wx:if=["']\{\{nicknamePrivacyAuthorized && \(!nicknameConfirmed \|\| nicknameEditing\)\}\}["'][^>]*>\s*<form/su,
+    )
+    expect(wxml).toMatch(
+      /<button[^>]+class=["']upload-button["'][^>]+disabled=["']\{\{nicknamePrivacyPromptVisible \|\| nicknamePrivacyRequesting \|\| draftPicking \|\| draftSubmitting\}\}["']/u,
     )
     expect(pageSource).not.toMatch(/onNeedPrivacyAuthorization|NicknamePrivacyResolve/u)
   })
@@ -371,6 +425,10 @@ describe('nickname page contract', () => {
     expect(wxml).not.toMatch(/bindblur=["']onNicknameBlur["']|bindtap=["']onConfirmNickname["']/u)
     expect(wxml).toMatch(/<button[^>]+bindtap=["']onChooseMedia["']/u)
     expect(wxml).toMatch(/开始上传前.*确认昵称/su)
+    expect(wxml).toMatch(
+      /class=["']primary-button start-upload-button["'][^>]+disabled=["']\{\{draftPicking \|\| draftSubmitting \|\| nicknameSaving\}\}["']/u,
+    )
+    expect(wxml).not.toMatch(/disabled=["'][^"']*!nicknameConfirmed/u)
     expect(wxml).not.toMatch(/静默获取|实名认证成功|身份已验证/u)
   })
 })

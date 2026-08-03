@@ -5,3 +5,4 @@ docs/
 pnpm-lock.yaml
 apps/miniprogram/miniprogram/config.generated.ts
 apps/miniprogram/miniprogram/miniprogram_npm/
+apps/miniprogram/miniprogram/generated/contracts.js

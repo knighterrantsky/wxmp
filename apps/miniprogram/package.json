@@ -4,14 +4,19 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "node --experimental-strip-types scripts/bundle-contracts.ts",
+    "bundle:contracts": "node --experimental-strip-types scripts/bundle-contracts.ts",
     "generate:config": "node --experimental-strip-types scripts/generate-config.ts",
+    "pretest": "node --experimental-strip-types scripts/bundle-contracts.ts",
     "test": "vitest run",
+    "pretypecheck": "node --experimental-strip-types scripts/bundle-contracts.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.runtime.json --noEmit"
   },
   "dependencies": {
     "@wx-upload/contracts": "workspace:*"
   },
   "devDependencies": {
+    "esbuild": "0.27.0",
     "miniprogram-api-typings": "5.2.1"
   }
 }

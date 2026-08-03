@@ -4,6 +4,8 @@ import multipart from '@fastify/multipart'
 import {
   AbortUploadRequestSchema,
   AbortUploadResponseSchema,
+  ClearUploadedHistoryRequestSchema,
+  ClearUploadedHistoryResponseSchema,
   CompleteUploadRequestSchema,
   CompleteUploadResponseSchema,
   InitializeUploadResponseSchema,
@@ -16,6 +18,8 @@ import {
   UploadPathParamsSchema,
   type AbortUploadRequest,
   type AbortUploadResponse,
+  type ClearUploadedHistoryRequest,
+  type ClearUploadedHistoryResponse,
   type CompleteUploadRequest,
   type CompleteUploadResponse,
   type InitializeUploadResponse,
@@ -125,6 +129,11 @@ export interface UploadHistoryRouteService {
     data: UploadHistoryResponse['data']
     pagination: Pagination
   }>
+  clearUploaded(input: {
+    userId: string
+    sessionId: string
+    context: { requestId: string; sourceIp: string; userAgent?: string }
+  }): Promise<ClearUploadedHistoryResponse['data']>
 }
 
 interface UploadPartParams {
@@ -436,6 +445,26 @@ export function registerUploadRoutes(
           query: request.query,
         })
         return sendListData(reply, publicHistoryData(result.data), result.pagination)
+      },
+    )
+
+    app.post<{ Body: ClearUploadedHistoryRequest }>(
+      '/v1/uploads/history/clear-uploaded',
+      {
+        config: { rateLimit: rateLimitPolicy('history') },
+        preHandler: authenticate,
+        schema: {
+          body: ClearUploadedHistoryRequestSchema,
+          response: { 200: ClearUploadedHistoryResponseSchema },
+        },
+      },
+      async (request, reply) => {
+        const identity = authenticatedRequestIdentity(request)
+        const data = await history.clearUploaded({
+          ...identity,
+          context: requestAuthContext(request),
+        })
+        return sendData(reply, { clearedCount: data.clearedCount })
       },
     )
   }

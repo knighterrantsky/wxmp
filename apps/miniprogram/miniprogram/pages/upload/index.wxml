@@ -7,53 +7,61 @@
 
   <view class="card {{nicknameConfirmed ? 'confirmed-card' : ''}}">
     <block wx:if="{{nicknameConfirmed}}">
-      <text class="section-title">昵称已确认</text>
-      <text class="confirmed-name">{{nickname}}</text>
-      <text class="help-text">后续素材会记录此昵称，你也可以授权后重新选择并再次确认。</text>
+      <view class="confirmed-profile-row">
+        <view class="confirmed-profile-copy">
+          <text class="profile-label">当前上传用户</text>
+          <text class="confirmed-name">{{nickname}}</text>
+        </view>
+        <button
+          wx:if="{{!nicknameEditing && !nicknamePrivacyPromptVisible}}"
+          class="nickname-edit-button"
+          bindtap="onRequestNicknamePrivacy"
+        >
+          修改昵称
+        </button>
+      </view>
     </block>
     <block wx:else>
       <text class="section-title">先确认微信昵称</text>
-      <text class="help-text">昵称用于标识你上传的素材，仅作为显示名称，不代表实名认证。授权完成后，微信会在昵称输入框中展示候选昵称。</text>
+      <text class="help-text">昵称用于标识你上传的素材，仅作为显示名称，不代表实名认证。授权后，请点击昵称输入框，并在键盘上方选择微信昵称；微信不会自动填入。</text>
     </block>
 
-    <view wx:if="{{!nicknamePrivacyAuthorized}}">
-      <button
-        wx:if="{{!nicknamePrivacyPromptVisible}}"
-        class="primary-button"
-        bindtap="onRequestNicknamePrivacy"
-        loading="{{nicknamePrivacyRequesting}}"
-        disabled="{{nicknamePrivacyRequesting}}"
-      >
-        申请微信昵称授权
+    <button
+      wx:if="{{!nicknameConfirmed && !nicknamePrivacyAuthorized && !nicknamePrivacyPromptVisible}}"
+      class="primary-button"
+      bindtap="onRequestNicknamePrivacy"
+      loading="{{nicknamePrivacyRequesting}}"
+      disabled="{{nicknamePrivacyRequesting}}"
+    >
+      申请微信昵称授权
+    </button>
+    <view class="privacy-panel" wx:if="{{nicknamePrivacyPromptVisible}}">
+      <text class="privacy-title">微信昵称使用授权</text>
+      <text class="help-text">同意后才会启用微信昵称输入能力；暂不授权不会保存本次昵称。首次使用时，开始上传前仍需确认昵称。</text>
+      <button class="privacy-contract-button" bindtap="onOpenNicknamePrivacyContract">
+        查看隐私保护指引
       </button>
-      <view class="privacy-panel" wx:else>
-        <text class="privacy-title">微信昵称使用授权</text>
-        <text class="help-text">同意后才会启用微信昵称输入能力；暂不授权不会保存本次昵称。首次使用时，开始上传前仍需确认昵称。</text>
-        <button class="privacy-contract-button" bindtap="onOpenNicknamePrivacyContract">
-          查看隐私保护指引
-        </button>
-        <button
-          id="nickname-privacy-agree"
-          class="primary-button"
-          open-type="agreePrivacyAuthorization"
-          bindagreeprivacyauthorization="onAgreeNicknamePrivacy"
-        >
-          同意隐私指引并继续
-        </button>
-        <button class="privacy-cancel-button" bindtap="onRejectNicknamePrivacy">
-          暂不授权
-        </button>
-      </view>
+      <button
+        id="nickname-privacy-agree"
+        class="primary-button"
+        open-type="agreePrivacyAuthorization"
+        bindagreeprivacyauthorization="onAgreeNicknamePrivacy"
+      >
+        同意隐私指引并继续
+      </button>
+      <button class="privacy-cancel-button" bindtap="onRejectNicknamePrivacy">
+        暂不授权
+      </button>
     </view>
 
-    <view wx:if="{{nicknamePrivacyAuthorized}}">
+    <view wx:if="{{nicknamePrivacyAuthorized && (!nicknameConfirmed || nicknameEditing)}}">
       <form bindsubmit="onConfirmNickname">
         <input
           class="nickname-input {{nicknameConfirmed ? 'compact' : ''}}"
           name="nickname"
           type="nickname"
           value="{{nicknameDraft}}"
-          placeholder="{{nicknameConfirmed ? '重新选择微信昵称' : '选择微信昵称'}}"
+          placeholder="{{nicknameConfirmed ? '重新选择微信昵称' : '点击后在键盘上方选择昵称'}}"
           bindinput="onNicknameInput"
           bindblur="onNicknameReviewStart"
           bindnicknamereview="onNicknameReview"
@@ -84,45 +92,82 @@
 
   <view class="card upload-card">
     <text class="section-title">上传素材</text>
-    <text class="help-text">支持图片和视频，单个文件不超过 200MB。选择后还会展示清单并请你二次确认。</text>
+    <text class="help-text">支持图片和视频，单个文件不超过 200MB。选择后可预览和修改，点击上传即表示确认。</text>
     <button
+      wx:if="{{!selectedFiles.length}}"
       class="upload-button"
       bindtap="onChooseMedia"
-      disabled="{{nicknamePrivacyPromptVisible || nicknamePrivacyRequesting || uploadBatchRunning}}"
+      loading="{{draftPicking}}"
+      disabled="{{nicknamePrivacyPromptVisible || nicknamePrivacyRequesting || draftPicking || draftSubmitting}}"
     >
-      {{selectedFiles.length ? '重新选择图片或视频' : '选择图片或视频'}}
+      {{draftPicking ? '正在打开选择器' : '选择图片或视频'}}
     </button>
     <text class="notice-text" wx:if="{{!nicknameConfirmed}}">可以先选择素材；开始上传前仍需确认昵称。</text>
     <view class="selection-panel" wx:if="{{selectedFiles.length}}">
       <view class="selection-summary">
-        <text class="selection-title">已选择 {{selectedFiles.length}} 个文件</text>
-        <text class="selection-total">总计 {{selectedTotalLabel}}</text>
+        <view>
+          <text class="selection-title">上传预览</text>
+          <text class="selection-total">{{selectedFiles.length}} 个文件 · {{selectedTotalLabel}}</text>
+        </view>
+        <button
+          class="reselect-button"
+          aria-label="继续添加图片或视频"
+          bindtap="onChooseMedia"
+          loading="{{draftPicking}}"
+          disabled="{{draftPicking || draftSubmitting}}"
+        >
+          {{draftPicking ? '选择中' : '继续添加'}}
+        </button>
       </view>
       <view
         class="selected-file"
         wx:for="{{selectedFiles}}"
         wx:key="id"
         wx:for-item="item"
+        wx:for-index="index"
       >
-        <view class="selected-file-heading">
-          <text class="selected-file-name">{{item.fileName}}</text>
-          <text class="selected-file-status status-{{item.status}}">{{item.statusLabel}}</text>
+        <view class="preview-frame">
+          <image
+            wx:if="{{item.hasThumbnail}}"
+            class="preview-image"
+            src="{{item.previewPath}}"
+            mode="aspectFill"
+          />
+          <view class="video-placeholder" wx:else>视频</view>
+          <text class="video-badge" wx:if="{{item.isVideo}}">视频</text>
         </view>
-        <text class="selected-file-meta">{{item.kindLabel}} · {{item.sizeLabel}}</text>
-        <view class="progress-track" wx:if="{{item.status !== 'ready' || item.percent > 0}}">
-          <view class="progress-fill" style="width: {{item.percent}}%;"></view>
+        <view class="selected-file-copy">
+          <view class="file-name-editor">
+            <input
+              class="file-name-input"
+              value="{{item.fileNameStem}}"
+              maxlength="240"
+              aria-label="修改 {{item.fileName}} 的文件名"
+              data-index="{{index}}"
+              bindinput="onRenameSelectedMedia"
+              disabled="{{draftPicking || draftSubmitting}}"
+            />
+            <text class="file-extension">{{item.fileExtension}}</text>
+          </view>
+          <text class="selected-file-meta">{{item.kindLabel}} · {{item.sizeLabel}}</text>
         </view>
-        <text class="progress-copy" wx:if="{{item.status !== 'ready' || item.percent > 0}}">
-          {{item.percent}}%
-        </text>
+        <button
+          class="remove-file-button"
+          aria-label="移除 {{item.fileName}}"
+          data-index="{{index}}"
+          catchtap="onRemoveSelectedMedia"
+          disabled="{{draftPicking || draftSubmitting}}"
+        >
+          移除
+        </button>
       </view>
       <button
         class="primary-button start-upload-button"
         bindtap="onStartSelectedUpload"
-        loading="{{uploadBatchRunning}}"
-        disabled="{{uploadBatchRunning || !nicknameConfirmed}}"
+        loading="{{draftSubmitting}}"
+        disabled="{{draftPicking || draftSubmitting || nicknameSaving}}"
       >
-        {{uploadBatchRunning ? '正在上传' : '确认并开始上传'}}
+        {{draftSubmitting ? '正在创建上传任务' : (nicknameConfirmed ? '上传 ' + selectedFiles.length + ' 个素材' : '请先确认昵称后上传')}}
       </button>
     </view>
     <text class="error-text" wx:if="{{selectionError}}">{{selectionError}}</text>

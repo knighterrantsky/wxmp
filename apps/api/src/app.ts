@@ -199,6 +199,8 @@ export function buildApp(deps: AppDependencies): FastifyInstance {
   const history = new UploadHistoryService({
     repository: new PostgresUploadHistoryRepository({ pool: deps.pool }),
     cursor: new SignedHistoryCursorCodec({ secret: deps.cursorSigningSecret, clock: deps.clock }),
+    clock: deps.clock,
+    ids: deps.ids,
   })
   registerUploadRoutes(app, { uploads, history, tokens: deps.tokenService })
   return app

@@ -1,4 +1,4 @@
-import { MAX_PART_COUNT, PART_SIZE_BYTES, type UploadPartPlan } from '@wx-upload/contracts'
+import { MAX_PART_COUNT, PART_SIZE_BYTES, type UploadPartPlan } from '../generated/contracts.js'
 
 import { sha256Hex } from '../core/sha256.js'
 import type { WechatFileRuntime } from '../runtime/wx-files.js'

@@ -96,6 +96,22 @@ function fixture(): Fixture {
 }
 
 describe('ApiClient upload history', () => {
+  it('clears uploaded history with an authenticated same-origin request', async () => {
+    const { client, request, session } = fixture()
+    request.mockResolvedValueOnce(response(200, { data: { clearedCount: 2 }, meta: responseMeta }))
+
+    await expect(client.clearUploadedHistory(session)).resolves.toEqual({ clearedCount: 2 })
+    expect(request).toHaveBeenCalledWith({
+      method: 'POST',
+      url: 'https://api.example.com/v1/uploads/history/clear-uploaded',
+      headers: {
+        authorization: 'Bearer access-old',
+        'content-type': 'application/json',
+      },
+      data: {},
+    })
+  })
+
   it('loads the first page and preserves its pagination cursor', async () => {
     const { client, request, session } = fixture()
 

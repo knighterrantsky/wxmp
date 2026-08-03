@@ -4,6 +4,8 @@ import { describe, expect, it } from 'vitest'
 import {
   MediaValidationError,
   canSchedulePart,
+  renameValidatedMedia,
+  splitMediaFileName,
   validateMediaSelection,
   type MediaSelectionCandidate,
 } from '../miniprogram/core/media-validation.js'
@@ -95,10 +97,28 @@ describe('media selection validation', () => {
       ])[0],
     ).toEqual({
       sourcePath: 'wxfile://tmp/path/holiday.PNG',
+      previewPath: 'wxfile://tmp/path/holiday.PNG',
       fileName: 'holiday.PNG',
       sizeBytes: MIN_FILE_SIZE_BYTES,
       kind: 'image',
       mimeType: 'image/png',
+    })
+  })
+
+  it('keeps a validated local video thumbnail for preview without changing the upload source', () => {
+    expect(
+      validateMediaSelection([
+        candidate({
+          sourcePath: 'wxfile://tmp/movie.mp4',
+          previewPath: 'wxfile://tmp/movie-cover.jpg',
+          fileName: 'movie.mp4',
+          kind: 'video',
+          mimeType: 'video/mp4',
+        }),
+      ])[0],
+    ).toMatchObject({
+      sourcePath: 'wxfile://tmp/movie.mp4',
+      previewPath: 'wxfile://tmp/movie-cover.jpg',
     })
   })
 
@@ -143,6 +163,16 @@ describe('media selection validation', () => {
       () => validateMediaSelection([candidate(), candidate({ fileName: 'duplicate.jpg' })]),
       'DUPLICATE_SOURCE_PATH',
     )
+  })
+
+  it('renames only the stem while preserving the validated extension', () => {
+    const file = validateMediaSelection([candidate({ fileName: 'holiday.JPG' })])[0]
+    if (file === undefined) throw new Error('missing validated file')
+
+    expect(splitMediaFileName(file.fileName)).toEqual({ stem: 'holiday', extension: '.JPG' })
+    expect(renameValidatedMedia(file, '杭州 周末').fileName).toBe('杭州 周末.JPG')
+    expectValidationCode(() => renameValidatedMedia(file, '../private'), 'INVALID_FILE_NAME')
+    expectValidationCode(() => renameValidatedMedia(file, '图'.repeat(84)), 'INVALID_FILE_NAME')
   })
 
   it.each([

@@ -1,4 +1,4 @@
-import type { PublicUploadStatus } from '@wx-upload/contracts'
+import type { PublicUploadStatus } from '../generated/contracts.js'
 
 export type StatusTone = 'progress' | 'success' | 'warning' | 'error' | 'neutral'
 
@@ -13,7 +13,7 @@ export function statusCopy(status: PublicUploadStatus): PublicStatusCopy {
     case 'uploading':
       return { label: '上传中', tone: 'progress', terminal: false }
     case 'finalizing':
-      return { label: '正在完成', tone: 'progress', terminal: false }
+      return { label: '正在写入私有存储', tone: 'progress', terminal: false }
     case 'cancelling':
       return { label: '正在取消', tone: 'warning', terminal: false }
     case 'uploaded':

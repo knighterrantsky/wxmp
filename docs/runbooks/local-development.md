@@ -116,17 +116,17 @@ curl --fail \
 
 ## 7. 导入微信开发者工具
 
-先构建共享 contracts：
+先生成小程序可直接加载的共享协议模块：
 
 ```bash
-pnpm --filter @wx-upload/contracts build
+pnpm --filter @wx-upload/miniprogram bundle:contracts
 ```
 
 然后完成开发者工具导入：
 
 1. 将 `apps/miniprogram/project.private.config.json.example` 复制为被 Git 忽略的 `project.private.config.json`，填入自己的测试 AppID。
 2. 在微信开发者工具中导入 `apps/miniprogram` 目录。
-3. 点击“工具 → 构建 npm”。项目的手动打包关系会把 workspace contracts 输出到 `apps/miniprogram/miniprogram/miniprogram_npm`；该目录已被 Git 忽略，不能提交。
+3. 不要点击“工具 → 构建 npm”。共享协议及其校验依赖已经打包为 `miniprogram/generated/contracts.js`，避免微信开发者工具无法解析 pnpm workspace 软链接。
 4. 确认项目的 `miniprogramRoot` 为 `miniprogram/`，编译插件包含 TypeScript。
 5. 确认开发者工具使用项目固定的基础库 `2.32.3` 或更高稳定版本；更低版本不支持本项目要求的显式隐私授权 API。
 6. 使用 HTTPS 测试域名真机联调时，同时把该域名加入微信小程序的 request 与 uploadFile 合法域名。

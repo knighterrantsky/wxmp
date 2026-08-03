@@ -1,7 +1,9 @@
-import type { NicknameRequest, PublicUser } from '@wx-upload/contracts'
+import type { NicknameRequest, PublicUser } from '../../generated/contracts.js'
 
 import {
   MediaValidationError,
+  renameValidatedMedia,
+  splitMediaFileName,
   validateMediaSelection,
   type MediaSelectionCandidate,
   type ValidatedMedia,
@@ -15,6 +17,12 @@ export interface NicknameProfileApi {
 export interface NicknameSubmitEvent {
   readonly detail: {
     readonly value: { readonly nickname?: unknown }
+  }
+}
+
+export interface NicknameInputEvent {
+  readonly detail: {
+    readonly value?: unknown
   }
 }
 
@@ -41,31 +49,23 @@ export interface NicknameFlowSnapshot {
   readonly nicknamePrivacyAuthorized: boolean
   readonly nicknamePrivacyRequesting: boolean
   readonly nicknamePrivacyPromptVisible: boolean
+  readonly nicknameEditing: boolean
   readonly nicknameReviewPending: boolean
   readonly canChooseMedia: true
   readonly canCreateUpload: boolean
 }
 
-export type UploadUiStatus =
-  'ready' | 'queued' | 'uploading' | 'paused' | 'finalizing' | 'uploaded' | 'failed'
-
-export interface UploadUiEvent {
-  readonly sourcePath: string
-  readonly status: Exclude<UploadUiStatus, 'ready'>
-  readonly bytes: number
-  readonly percent: number
-}
-
 export interface SelectedFileView {
   readonly id: string
+  readonly previewPath: string
+  readonly isVideo: boolean
+  readonly hasThumbnail: boolean
   readonly fileName: string
+  readonly fileNameStem: string
+  readonly fileExtension: string
   readonly kindLabel: '图片' | '视频'
   readonly sizeLabel: string
   readonly sizeBytes: number
-  readonly status: UploadUiStatus
-  readonly statusLabel: string
-  readonly bytes: number
-  readonly percent: number
 }
 
 export interface UploadPageData extends NicknameFlowSnapshot {
@@ -73,12 +73,13 @@ export interface UploadPageData extends NicknameFlowSnapshot {
   readonly selectedTotalBytes: number
   readonly selectedTotalLabel: string
   readonly selectionError: string | null
-  readonly uploadBatchRunning: boolean
+  readonly draftPicking: boolean
+  readonly draftSubmitting: boolean
 }
 
 export interface MediaUploadPageService {
-  chooseMedia(): Promise<readonly MediaSelectionCandidate[]>
-  start(files: readonly ValidatedMedia[], onUpdate: (event: UploadUiEvent) => void): Promise<void>
+  chooseMedia(maxCount?: number): Promise<readonly MediaSelectionCandidate[]>
+  dispatch(files: readonly ValidatedMedia[]): Promise<void>
 }
 
 function normalizedNickname(value: string): string {
@@ -95,6 +96,7 @@ export class NicknameFlowController {
   #nicknamePrivacyAuthorized = false
   #nicknamePrivacyRequesting = false
   #nicknamePrivacyPromptVisible = false
+  #nicknameEditing = false
   #nicknamePrivacyRequestSequence = 0
   #nicknameReviewState: 'idle' | 'passed' | 'failed' | 'timeout' | 'consumed' = 'idle'
   #nicknameEditSequence = 0
@@ -121,20 +123,24 @@ export class NicknameFlowController {
       nicknamePrivacyAuthorized: this.#nicknamePrivacyAuthorized,
       nicknamePrivacyRequesting: this.#nicknamePrivacyRequesting,
       nicknamePrivacyPromptVisible: this.#nicknamePrivacyPromptVisible,
+      nicknameEditing: this.#nicknameEditing,
       nicknameReviewPending:
         this.#submittedNickname !== null &&
         (this.#nicknameReviewState === 'idle' || this.#nicknameReviewPendingCount > 0),
       canChooseMedia: true,
-      canCreateUpload: this.#nicknameConfirmed,
+      canCreateUpload: this.#nicknameConfirmed && !this.#nicknameSaving,
     }
   }
 
   requestPrivacyAuthorization(onChange: () => void = () => undefined): void {
-    if (
-      this.#nicknamePrivacyAuthorized ||
-      this.#nicknamePrivacyRequesting ||
-      this.#nicknamePrivacyPromptVisible
-    ) {
+    if (this.#nicknamePrivacyRequesting || this.#nicknamePrivacyPromptVisible) {
+      return
+    }
+
+    this.#nicknameEditing = true
+    if (this.#nicknamePrivacyAuthorized) {
+      this.#nicknameError = null
+      onChange()
       return
     }
 
@@ -189,6 +195,7 @@ export class NicknameFlowController {
     this.#nicknamePrivacyAuthorized = false
     this.#nicknamePrivacyRequesting = false
     this.#nicknamePrivacyPromptVisible = false
+    this.#nicknameEditing = !this.#nicknameConfirmed
     this.#nicknameError = '你已暂不授权昵称使用，可稍后重试；开始上传前仍需确认昵称'
   }
 
@@ -197,11 +204,13 @@ export class NicknameFlowController {
     this.#nicknamePrivacyAuthorized = false
     this.#nicknamePrivacyRequesting = false
     this.#nicknamePrivacyPromptVisible = false
+    this.#nicknameEditing = !this.#nicknameConfirmed
     this.#nicknameError = '当前微信版本无法完成昵称授权，请升级微信后重试'
   }
 
-  onNicknameInput(): void {
+  onNicknameInput(value: unknown): void {
     if (this.#nicknameSaving) return
+    this.#nicknameDraft = typeof value === 'string' ? value : ''
     if (this.#nicknameReviewPendingCount > 0) {
       this.#nicknameReviewAmbiguous = true
     } else {
@@ -346,6 +355,7 @@ export class NicknameFlowController {
       this.#nickname = user.nickname
       this.#nicknameDraft = user.nickname
       this.#nicknameConfirmed = true
+      this.#nicknameEditing = false
       return true
     } catch {
       this.#nicknameConfirmed = wasConfirmed
@@ -380,6 +390,7 @@ export class NicknameFlowController {
     this.#nicknamePrivacyAuthorized = authorized
     this.#nicknamePrivacyRequesting = false
     this.#nicknamePrivacyPromptVisible = false
+    if (!authorized && this.#nicknameConfirmed) this.#nicknameEditing = false
     this.#nicknameError = error
     onChange()
   }
@@ -406,18 +417,9 @@ const EMPTY_UPLOAD_PAGE_DATA = {
   selectedTotalBytes: 0,
   selectedTotalLabel: '0 B',
   selectionError: null,
-  uploadBatchRunning: false,
+  draftPicking: false,
+  draftSubmitting: false,
 } as const satisfies Omit<UploadPageData, keyof NicknameFlowSnapshot>
-
-const UPLOAD_STATUS_LABELS: Readonly<Record<UploadUiStatus, string>> = {
-  ready: '等待确认',
-  queued: '排队中',
-  uploading: '上传中',
-  paused: '已暂停',
-  finalizing: '正在写入私有存储',
-  uploaded: '已上传',
-  failed: '上传失败',
-}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1_024) return `${String(bytes)} B`
@@ -461,114 +463,86 @@ function selectionErrorMessage(error: unknown): string | null {
 }
 
 function selectedFileViews(files: readonly ValidatedMedia[]): SelectedFileView[] {
-  return files.map((file, index) => ({
-    id: `selected-${String(index + 1)}`,
-    fileName: file.fileName,
-    kindLabel: file.kind === 'image' ? '图片' : '视频',
-    sizeLabel: formatBytes(file.sizeBytes),
-    sizeBytes: file.sizeBytes,
-    status: 'ready',
-    statusLabel: UPLOAD_STATUS_LABELS.ready,
-    bytes: 0,
-    percent: 0,
-  }))
+  return files.map((file, index) => {
+    const previewPath = file.previewPath ?? file.sourcePath
+    const name = splitMediaFileName(file.fileName)
+    return {
+      id: `selected-${String(index + 1)}`,
+      previewPath,
+      isVideo: file.kind === 'video',
+      hasThumbnail: file.kind === 'image' || previewPath !== file.sourcePath,
+      fileName: file.fileName,
+      fileNameStem: name.stem,
+      fileExtension: name.extension,
+      kindLabel: file.kind === 'image' ? '图片' : '视频',
+      sizeLabel: formatBytes(file.sizeBytes),
+      sizeBytes: file.sizeBytes,
+    }
+  })
 }
 
-function queuedFileViews(files: readonly SelectedFileView[]): SelectedFileView[] {
-  return files.map((file) => ({
-    ...file,
-    status: 'queued',
-    statusLabel: UPLOAD_STATUS_LABELS.queued,
-    bytes: 0,
-    percent: 0,
-  }))
+function emptyDraft(page: UploadPageHost): void {
+  page.selectedMedia = []
+  page.setData({
+    selectedFiles: [],
+    selectedTotalBytes: 0,
+    selectedTotalLabel: '0 B',
+    selectionError: null,
+    draftPicking: false,
+    draftSubmitting: false,
+  })
 }
 
-function applyUploadEvent(page: UploadPageHost, event: UploadUiEvent): void {
-  const selectedMedia = page.selectedMedia ?? []
-  const index = selectedMedia.findIndex((file) => file.sourcePath === event.sourcePath)
-  if (index < 0) return
-  const current = page.data.selectedFiles[index]
-  const media = selectedMedia[index]
-  if (current === undefined || media === undefined) return
-
-  const bytes = Number.isFinite(event.bytes)
-    ? Math.max(current.bytes, Math.min(media.sizeBytes, Math.max(0, event.bytes)))
-    : current.bytes
-  const percent = Number.isFinite(event.percent)
-    ? Math.max(current.percent, Math.min(100, Math.max(0, event.percent)))
-    : current.percent
-  const updated = page.data.selectedFiles.map((file, itemIndex) =>
-    itemIndex === index
-      ? {
-          ...file,
-          status: event.status,
-          statusLabel: UPLOAD_STATUS_LABELS[event.status],
-          bytes,
-          percent,
-        }
-      : file,
-  )
-  page.setData({ selectedFiles: updated })
+function navigateToHistory(watchForNewUpload: boolean): void {
+  if (typeof wx !== 'object' || typeof wx.navigateTo !== 'function') return
+  wx.navigateTo({
+    url: watchForNewUpload ? '/pages/history/index?watch=1' : '/pages/history/index',
+    fail: () => {
+      if (typeof wx.showToast !== 'function') return
+      void wx.showToast({
+        title: watchForNewUpload ? '上传已开始，可从上传记录查看' : '上传记录打开失败，请重试',
+        icon: 'none',
+      })
+    },
+  })
 }
 
-async function confirmAndStartUpload(page: UploadPageHost): Promise<void> {
+async function startSelectedUpload(page: UploadPageHost): Promise<void> {
   const selected = page.selectedMedia ?? []
   const service = applicationData().mediaUpload
-  if (selected.length === 0 || service === undefined || page.data.uploadBatchRunning) return
+  if (
+    selected.length === 0 ||
+    service === undefined ||
+    page.data.draftPicking ||
+    page.data.draftSubmitting
+  ) {
+    return
+  }
 
-  if (!controller(page).snapshot().canCreateUpload) {
+  const nickname = controller(page).snapshot()
+  if (nickname.nicknameSaving) {
+    if (typeof wx === 'object') {
+      void wx.showToast({ title: '昵称正在更新，请稍候', icon: 'none' })
+    }
+    return
+  }
+  if (!nickname.canCreateUpload) {
     if (typeof wx === 'object') {
       void wx.showToast({ title: '请先确认昵称', icon: 'none' })
     }
     return
   }
-  if (typeof wx !== 'object' || typeof wx.showModal !== 'function') {
-    page.setData({ selectionError: '当前微信版本无法确认上传，请升级后重试' })
+
+  page.setData({ selectionError: null, draftSubmitting: true })
+  try {
+    await service.dispatch([...selected])
+  } catch {
+    page.setData({ selectionError: '上传任务创建失败，请稍后重试', draftSubmitting: false })
     return
   }
 
-  const totalBytes = selected.reduce((sum, file) => sum + file.sizeBytes, 0)
-  let confirmation: { confirm?: boolean }
-  try {
-    confirmation = await wx.showModal({
-      title: '确认上传素材',
-      content: `共 ${String(selected.length)} 个文件，总计 ${formatBytes(totalBytes)}。确认后将上传到私有存储。`,
-      confirmText: '开始上传',
-      cancelText: '取消',
-    })
-  } catch {
-    page.setData({ selectionError: '上传确认未完成，请重试' })
-    return
-  }
-  if (confirmation.confirm !== true) return
-
-  page.setData({
-    selectedFiles: queuedFileViews(page.data.selectedFiles),
-    selectionError: null,
-    uploadBatchRunning: true,
-  })
-  try {
-    await service.start([...selected], (event) => {
-      applyUploadEvent(page, event)
-    })
-  } catch {
-    const failed = page.data.selectedFiles.map((file) =>
-      file.status === 'uploaded' || file.status === 'finalizing'
-        ? file
-        : {
-            ...file,
-            status: 'failed' as const,
-            statusLabel: UPLOAD_STATUS_LABELS.failed,
-          },
-    )
-    page.setData({
-      selectedFiles: failed,
-      selectionError: '部分素材上传失败，可稍后重试',
-    })
-  } finally {
-    page.setData({ uploadBatchRunning: false })
-  }
+  emptyDraft(page)
+  navigateToHistory(true)
 }
 
 function unavailableProfileApi(): NicknameProfileApi {
@@ -678,9 +652,9 @@ export const uploadPageDefinition = {
     })
   },
 
-  onNicknameInput(this: UploadPageHost): void {
+  onNicknameInput(this: UploadPageHost, event: NicknameInputEvent): void {
     this.nicknameInteracted = true
-    controller(this).onNicknameInput()
+    controller(this).onNicknameInput(event.detail.value)
     synchronize(this)
   },
 
@@ -713,7 +687,7 @@ export const uploadPageDefinition = {
   },
 
   async onChooseMedia(this: UploadPageHost): Promise<void> {
-    if (this.data.uploadBatchRunning) return
+    if (this.data.draftPicking || this.data.draftSubmitting) return
     const privacy = controller(this).snapshot()
     if (privacy.nicknamePrivacyPromptVisible || privacy.nicknamePrivacyRequesting) {
       if (typeof wx === 'object') {
@@ -725,8 +699,19 @@ export const uploadPageDefinition = {
     const application = applicationData()
     const mediaUpload = application.mediaUpload
     if (mediaUpload !== undefined) {
+      const current = this.selectedMedia ?? []
+      const remainingCount = 9 - current.length
+      if (remainingCount < 1) {
+        this.setData({ selectionError: '一次最多选择 9 个文件' })
+        return
+      }
+      this.setData({ draftPicking: true, selectionError: null })
       try {
-        const selected = validateMediaSelection(await mediaUpload.chooseMedia())
+        const newlySelected = await mediaUpload.chooseMedia(remainingCount)
+        const selected = validateMediaSelection([
+          ...current.map((file) => ({ ...file, readable: true })),
+          ...newlySelected,
+        ])
         const totalBytes = selected.reduce((sum, file) => sum + file.sizeBytes, 0)
         this.selectedMedia = Object.freeze(selected.map((file) => Object.freeze({ ...file })))
         this.setData({
@@ -734,23 +719,20 @@ export const uploadPageDefinition = {
           selectedTotalBytes: totalBytes,
           selectedTotalLabel: formatBytes(totalBytes),
           selectionError: null,
-          uploadBatchRunning: false,
+          draftPicking: false,
         })
       } catch (error) {
         const message = selectionErrorMessage(error)
         if (message !== null) {
-          this.selectedMedia = []
           this.setData({
-            selectedFiles: [],
-            selectedTotalBytes: 0,
-            selectedTotalLabel: '0 B',
             selectionError: message,
-            uploadBatchRunning: false,
+            draftPicking: false,
           })
+        } else {
+          this.setData({ draftPicking: false })
         }
         return
       }
-      await confirmAndStartUpload(this)
       return
     }
     const chooseMedia = application.chooseMedia
@@ -763,14 +745,68 @@ export const uploadPageDefinition = {
     }
   },
 
+  onRemoveSelectedMedia(
+    this: UploadPageHost,
+    event: { readonly currentTarget: { readonly dataset: { readonly index?: unknown } } },
+  ): void {
+    if (this.data.draftPicking || this.data.draftSubmitting) return
+    const index = Number(event.currentTarget.dataset.index)
+    const selected = this.selectedMedia ?? []
+    if (!Number.isSafeInteger(index) || index < 0 || index >= selected.length) return
+
+    const remaining = selected.filter((_file, itemIndex) => itemIndex !== index)
+    if (remaining.length === 0) {
+      emptyDraft(this)
+      return
+    }
+    const totalBytes = remaining.reduce((sum, file) => sum + file.sizeBytes, 0)
+    this.selectedMedia = Object.freeze(remaining)
+    this.setData({
+      selectedFiles: selectedFileViews(remaining),
+      selectedTotalBytes: totalBytes,
+      selectedTotalLabel: formatBytes(totalBytes),
+      selectionError: null,
+    })
+  },
+
+  onRenameSelectedMedia(
+    this: UploadPageHost,
+    event: {
+      readonly detail: { readonly value?: unknown }
+      readonly currentTarget: { readonly dataset: { readonly index?: unknown } }
+    },
+  ): void {
+    if (this.data.draftPicking || this.data.draftSubmitting) return
+    const index = Number(event.currentTarget.dataset.index)
+    const nextStem = event.detail.value
+    const selected = this.selectedMedia ?? []
+    if (
+      !Number.isSafeInteger(index) ||
+      index < 0 ||
+      index >= selected.length ||
+      typeof nextStem !== 'string'
+    ) {
+      return
+    }
+
+    const current = selected[index]
+    if (current === undefined) return
+    try {
+      const renamed = renameValidatedMedia(current, nextStem)
+      const next = selected.map((file, itemIndex) => (itemIndex === index ? renamed : file))
+      this.selectedMedia = Object.freeze(next.map((file) => Object.freeze({ ...file })))
+      this.setData({ selectedFiles: selectedFileViews(next), selectionError: null })
+    } catch {
+      this.setData({ selectionError: '文件名不能为空，且不能包含斜杠或控制字符' })
+    }
+  },
+
   async onStartSelectedUpload(this: UploadPageHost): Promise<void> {
-    await confirmAndStartUpload(this)
+    await startSelectedUpload(this)
   },
 
   onOpenHistory(): void {
-    if (typeof wx === 'object' && typeof wx.navigateTo === 'function') {
-      void wx.navigateTo({ url: '/pages/history/index' })
-    }
+    navigateToHistory(false)
   },
 }
 

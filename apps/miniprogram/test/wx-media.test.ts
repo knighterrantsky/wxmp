@@ -81,11 +81,13 @@ describe('WeChat chooseMedia runtime adapter', () => {
     expect(selected).toEqual([
       {
         sourcePath: 'wxfile://tmp/photo.jpg',
+        previewPath: 'wxfile://tmp/photo.jpg',
         sizeBytes: 12,
         kind: 'image',
       },
       {
         sourcePath: 'wxfile://tmp/movie.mp4',
+        previewPath: 'wxfile://tmp/movie-cover.jpg',
         sizeBytes: 209_715_200,
         kind: 'video',
       },
@@ -94,6 +96,21 @@ describe('WeChat chooseMedia runtime adapter', () => {
     const rawFiles = raw['tempFiles'] as Record<string, unknown>[]
     rawFiles[0] = imageFile({ tempFilePath: 'wxfile://tmp/replaced.jpg' })
     expect(selected[0]?.sourcePath).toBe('wxfile://tmp/photo.jpg')
+  })
+
+  it('limits a subsequent picker to the remaining draft capacity', async () => {
+    let request: WxChooseMediaOptions | undefined
+    const source: WxChooseMediaSource = {
+      chooseMedia(options) {
+        request = options
+        options.success(successfulResult())
+      },
+    }
+
+    await chooseMediaWithWechatRuntime(source, 4)
+
+    expect(request?.count).toBe(4)
+    await expect(chooseMediaWithWechatRuntime(source, 0)).rejects.toBeInstanceOf(RangeError)
   })
 
   it.each([

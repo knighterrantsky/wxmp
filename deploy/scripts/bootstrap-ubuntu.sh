@@ -36,6 +36,7 @@ fi
 apt-get update
 apt-get install --yes \
   ca-certificates \
+  certbot \
   docker.io \
   docker-buildx \
   docker-compose-v2
@@ -65,6 +66,7 @@ install -d -o wxdeploy -g wxdeploy -m 0750 \
   /opt/wx-private-media-upload/releases \
   /opt/wx-private-media-upload/bin
 install -d -o root -g wxdeploy -m 0750 /etc/wx-private-media-upload
+install -d -o root -g root -m 0755 /etc/letsencrypt/renewal-hooks/deploy
 
 if [[ ! -e /etc/wx-private-media-upload/production.env ]]; then
   install -o root -g wxdeploy -m 0640 /dev/null \

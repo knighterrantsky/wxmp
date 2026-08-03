@@ -34,8 +34,27 @@ export interface HistoryRepositoryPageInput {
   readonly take: number
 }
 
+export interface ClearUploadedHistoryRepositoryInput {
+  readonly userId: string
+  readonly sessionId: string
+  readonly clearedAt: Date
+  readonly eventId: string
+  readonly context: {
+    readonly requestId: string
+    readonly sourceIp: string
+  }
+}
+
+export interface ClearUploadedHistoryRepositoryResult {
+  readonly userStatus: HistoryUserStatus | null
+  readonly clearedCount: number
+}
+
 export interface UploadHistoryRepository {
   listPage(input: HistoryRepositoryPageInput): Promise<HistoryRepositoryPage>
+  clearUploaded(
+    input: ClearUploadedHistoryRepositoryInput,
+  ): Promise<ClearUploadedHistoryRepositoryResult>
 }
 
 interface HistoryRow {
@@ -177,6 +196,7 @@ export class PostgresUploadHistoryRepository implements UploadHistoryRepository 
              from media_app.upload_sessions u
              join media_app.media_objects m on m.id = u.media_object_id
             where u.user_id = $1
+              and u.history_hidden_at is null
          )
          select upload_id, media_id, upload_status, media_status,
                 original_filename, kind, declared_content_type,
@@ -197,6 +217,64 @@ export class PostgresUploadHistoryRepository implements UploadHistoryRepository 
       )
       await client.query('commit')
       return { userStatus, rows: selected.rows.map(repositoryRecord) }
+    } catch (error) {
+      await rollback(client)
+      throw error
+    } finally {
+      client.release()
+    }
+  }
+
+  async clearUploaded(
+    input: ClearUploadedHistoryRepositoryInput,
+  ): Promise<ClearUploadedHistoryRepositoryResult> {
+    const client = await this.#pool.connect()
+    try {
+      await client.query('begin')
+      const selectedUser = await client.query<{ status: string }>(
+        `select status from media_app.users where id = $1 for update`,
+        [input.userId],
+      )
+      const userStatus = normalizedUserStatus(selectedUser.rows[0]?.status)
+      if (userStatus !== 'active') {
+        await client.query('commit')
+        return { userStatus, clearedCount: 0 }
+      }
+
+      const cleared = await client.query<{ id: string }>(
+        `update media_app.upload_sessions u
+            set history_hidden_at = $2
+           from media_app.media_objects m
+          where u.user_id = $1
+            and u.media_object_id = m.id
+            and m.user_id = $1
+            and u.status = 'completed'
+            and m.storage_status = 'ready'
+            and u.history_hidden_at is null
+        returning u.id`,
+        [input.userId, input.clearedAt],
+      )
+      const clearedCount = cleared.rowCount ?? cleared.rows.length
+      if (clearedCount > 0) {
+        await client.query(
+          `insert into media_app.audit_events(
+             event_id, occurred_at, actor_type, actor_user_id, actor_session_id,
+             request_id, event_type, entity_type, source_ip, metadata
+           ) values ($1, $2, 'user', $3, $4, $5,
+                     'upload.history.cleared', 'upload_history', $6, $7::jsonb)`,
+          [
+            input.eventId,
+            input.clearedAt,
+            input.userId,
+            input.sessionId,
+            input.context.requestId,
+            input.context.sourceIp,
+            JSON.stringify({ clearedCount }),
+          ],
+        )
+      }
+      await client.query('commit')
+      return { userStatus, clearedCount }
     } catch (error) {
       await rollback(client)
       throw error

@@ -51,7 +51,7 @@ describe('runMigrations', () => {
       'user_sessions',
       'users',
     ])
-    expect(bookkeeping.rows[0]?.count).toBe('2')
+    expect(bookkeeping.rows[0]?.count).toBe('3')
   })
 
   it('installs all documented enum types, version triggers, and explicit indexes', async () => {
@@ -115,6 +115,7 @@ describe('runMigrations', () => {
       'ix_upload_reconcile_stuck',
       'ix_upload_terminal_retention',
       'ix_upload_user_history',
+      'ix_upload_visible_history',
       'ix_user_identities_user',
       'ix_user_sessions_active',
       'ix_user_sessions_expired_retention',
@@ -150,6 +151,7 @@ describe('runMigrations', () => {
       'ck_upload_abort_schedule',
       'ck_upload_abort_reason_state',
       'ck_upload_completed',
+      'ck_upload_history_hidden',
       'ck_part_checksum',
       'ck_part_uploaded_fields',
       'uq_idempotency_scope',
@@ -172,7 +174,7 @@ describe('runMigrations', () => {
     const applied = await pool.query<{ count: string }>(
       'select count(*) from public.schema_migrations',
     )
-    expect(applied.rows[0]?.count).toBe('2')
+    expect(applied.rows[0]?.count).toBe('3')
   })
 
   it('checksums the original migration bytes and refuses any drift', async () => {
@@ -208,7 +210,7 @@ describe('runMigrations', () => {
       const applied = await contenderPool.query<{ count: string }>(
         'select count(*) from public.schema_migrations',
       )
-      expect(applied.rows[0]?.count).toBe('2')
+      expect(applied.rows[0]?.count).toBe('3')
     } finally {
       await Promise.all([brokenPool.end(), contenderPool.end()])
       await rm(brokenDirectory, { recursive: true, force: true })

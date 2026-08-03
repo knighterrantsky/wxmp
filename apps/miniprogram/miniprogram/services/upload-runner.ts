@@ -15,7 +15,7 @@ import {
   type UploadDetailResponse,
   type UploadPartPlan,
   type UploadPartResponse,
-} from '@wx-upload/contracts'
+} from '../generated/contracts.js'
 
 import { UploadProgressTracker, type UploadProgress } from '../core/progress.js'
 import {
@@ -158,6 +158,7 @@ export interface UploadRunnerOptions {
   readonly random?: (() => number) | undefined
   readonly onStatus?: ((event: UploadRunnerStatusEvent) => void) | undefined
   readonly onProgress?: ((event: UploadRunnerProgressEvent) => void) | undefined
+  readonly maxParallelParts?: number | undefined
 }
 
 interface UploadedCompletion {
@@ -545,6 +546,7 @@ export class UploadRunner {
   readonly #random: (() => number) | undefined
   readonly #onStatus: ((event: UploadRunnerStatusEvent) => void) | undefined
   readonly #onProgress: ((event: UploadRunnerProgressEvent) => void) | undefined
+  readonly #maxParallelParts: number
   #busy = false
   #pauseRequested = false
   #pauseGeneration = 0
@@ -557,6 +559,10 @@ export class UploadRunner {
   #pollAfterSeconds: number | null = null
 
   constructor(options: UploadRunnerOptions) {
+    const maxParallelParts = options.maxParallelParts ?? 2
+    if (!Number.isSafeInteger(maxParallelParts) || maxParallelParts < 1 || maxParallelParts > 2) {
+      throw new RangeError('maxParallelParts must be 1 or 2')
+    }
     this.#api = options.api
     this.#transport = options.transport
     this.#chunks = options.chunks
@@ -567,6 +573,7 @@ export class UploadRunner {
     this.#random = options.random
     this.#onStatus = options.onStatus
     this.#onProgress = options.onProgress
+    this.#maxParallelParts = maxParallelParts
   }
 
   get currentUploadId(): string | null {
@@ -759,7 +766,11 @@ export class UploadRunner {
       if (active.serverResult !== undefined) return
       if (active.pending.some((part) => part.partNumber === 1)) return
 
-      while (!active.paused && active.inFlight.size < 2 && active.pending.length > 0) {
+      while (
+        !active.paused &&
+        active.inFlight.size < this.#maxParallelParts &&
+        active.pending.length > 0
+      ) {
         const part = active.pending.shift()
         if (part !== undefined) void this.#startPart(active, part)
       }

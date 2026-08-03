@@ -5,7 +5,7 @@ import {
   UUID_V7_PATTERN,
   type ErrorCode,
   type UploadPartResponse,
-} from '@wx-upload/contracts'
+} from '../generated/contracts.js'
 
 import { ApiClientError, isApiClientError, type AuthorizedSession } from '../services/api-client.js'
 import { normalizeHttpOrigin } from './http-origin.js'

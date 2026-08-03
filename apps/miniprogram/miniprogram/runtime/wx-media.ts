@@ -18,16 +18,17 @@ export class WechatMediaSelectionError extends Error {
 
 export interface WechatSelectedMedia {
   readonly sourcePath: string
+  readonly previewPath: string
   readonly sizeBytes: number
   readonly kind: 'image' | 'video'
 }
 
 export interface WechatMediaRuntime {
-  chooseMedia(): Promise<WechatSelectedMedia[]>
+  chooseMedia(maxCount?: number): Promise<WechatSelectedMedia[]>
 }
 
 export interface WxChooseMediaOptions {
-  count: 9
+  count: number
   mediaType: ['image', 'video']
   success(result: unknown): void
   fail(reason: unknown): void
@@ -48,6 +49,15 @@ function isMediaKind(value: unknown): value is WechatSelectedMedia['kind'] {
   return value === 'image' || value === 'video'
 }
 
+function validLocalPath(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.trim() !== '' &&
+    value.length <= MAX_PATH_CHARACTERS &&
+    !value.includes('\u0000')
+  )
+}
+
 function normalizeFile(value: unknown): WechatSelectedMedia {
   if (!isRecord(value)) throw new WechatMediaSelectionError('INVALID_RESPONSE')
 
@@ -55,10 +65,7 @@ function normalizeFile(value: unknown): WechatSelectedMedia {
   const sizeBytes = value['size']
   const kind = value['fileType']
   if (
-    typeof sourcePath !== 'string' ||
-    sourcePath.trim() === '' ||
-    sourcePath.length > MAX_PATH_CHARACTERS ||
-    sourcePath.includes('\u0000') ||
+    !validLocalPath(sourcePath) ||
     typeof sizeBytes !== 'number' ||
     !Number.isSafeInteger(sizeBytes) ||
     sizeBytes < 0 ||
@@ -67,7 +74,9 @@ function normalizeFile(value: unknown): WechatSelectedMedia {
     throw new WechatMediaSelectionError('INVALID_RESPONSE')
   }
 
-  return { sourcePath, sizeBytes, kind }
+  const thumbnail = value['thumbTempFilePath']
+  const previewPath = kind === 'video' && validLocalPath(thumbnail) ? thumbnail : sourcePath
+  return { sourcePath, previewPath, sizeBytes, kind }
 }
 
 function normalizeSelection(value: unknown): WechatSelectedMedia[] {
@@ -99,11 +108,15 @@ function isCancellation(reason: unknown): boolean {
 
 export function chooseMediaWithWechatRuntime(
   source: WxChooseMediaSource,
+  maxCount = MAX_MEDIA_COUNT,
 ): Promise<WechatSelectedMedia[]> {
+  if (!Number.isSafeInteger(maxCount) || maxCount < 1 || maxCount > MAX_MEDIA_COUNT) {
+    return Promise.reject(new RangeError('maxCount must be an integer between 1 and 9'))
+  }
   return new Promise((resolve, reject) => {
     try {
       source.chooseMedia({
-        count: 9,
+        count: maxCount,
         mediaType: ['image', 'video'],
         success(result) {
           try {

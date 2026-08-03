@@ -71,9 +71,13 @@ function deferred<T>() {
 function harness(firstPage = page([historyItem('uploaded')])) {
   const list = vi.fn<HistoryApi['list']>().mockResolvedValue(firstPage)
   const getUpload = vi.fn<HistoryApi['getUpload']>()
+  const cancelUpload = vi.fn<HistoryApi['cancel']>().mockResolvedValue(undefined)
+  const clearUploaded = vi.fn<HistoryApi['clearUploaded']>().mockResolvedValue(1)
   const api: HistoryApi = {
     list,
     getUpload,
+    cancel: cancelUpload,
+    clearUploaded,
   }
   const scheduled: { callback: () => void; delayMs: number }[] = []
   const schedule: HistorySchedule = (callback, delayMs) => {
@@ -82,7 +86,7 @@ function harness(firstPage = page([historyItem('uploaded')])) {
   }
   const cancel = vi.fn()
   const controller = new HistoryController({ api, schedule, cancel })
-  return { api, list, getUpload, scheduled, cancel, controller }
+  return { api, list, getUpload, cancelUpload, clearUploaded, scheduled, cancel, controller }
 }
 
 describe('history controller', () => {
@@ -106,23 +110,33 @@ describe('history controller', () => {
     expect(scheduled).toEqual([])
   })
 
-  it('refreshes multiple nonterminal records with one five-second list request and stops at terminal states', async () => {
+  it('refreshes uploading, finalizing, and cancelling records with one list request', async () => {
     const cancellingId = '01981d0c-ec80-7000-8000-000000000106'
     const finalizing = historyItem('finalizing')
     const cancelling = historyItem('cancelling', {
       id: cancellingId,
       fileName: 'cancel.mov',
     })
-    const fixture = harness(page([finalizing, cancelling]))
-    fixture.list.mockResolvedValueOnce(page([finalizing, cancelling])).mockResolvedValueOnce(
-      page([
-        historyItem('uploaded'),
-        historyItem('aborted', {
-          id: cancellingId,
-          fileName: 'cancel.mov',
-        }),
-      ]),
-    )
+    const uploading = historyItem('uploading', {
+      id: '01981d0c-ec80-7000-8000-000000000107',
+      fileName: 'active.jpg',
+    })
+    const fixture = harness(page([uploading, finalizing, cancelling]))
+    fixture.list
+      .mockResolvedValueOnce(page([uploading, finalizing, cancelling]))
+      .mockResolvedValueOnce(
+        page([
+          historyItem('uploaded', {
+            id: '01981d0c-ec80-7000-8000-000000000107',
+            fileName: 'active.jpg',
+          }),
+          historyItem('uploaded'),
+          historyItem('aborted', {
+            id: cancellingId,
+            fileName: 'cancel.mov',
+          }),
+        ]),
+      )
 
     await fixture.controller.loadFirstPage()
 
@@ -135,6 +149,7 @@ describe('history controller', () => {
     fixture.scheduled[0]?.callback()
     await vi.waitFor(() => {
       expect(fixture.controller.snapshot().records.map((record) => record.status)).toEqual([
+        'uploaded',
         'uploaded',
         'aborted',
       ])
@@ -209,12 +224,12 @@ describe('history controller', () => {
     expect(fixture.scheduled).toHaveLength(1)
   })
 
-  it('uses fixed failure copy instead of server or storage details', async () => {
+  it('maps public failure codes to actionable copy without server or storage details', async () => {
     const { controller } = harness(page([historyItem('upload_failed')]))
 
     await controller.loadFirstPage()
 
-    expect(controller.snapshot().records[0]?.failureMessage).toBe('上传失败，请稍后重试')
+    expect(controller.snapshot().records[0]?.failureMessage).toBe('私有存储暂时不可用，请稍后重试')
     expect(JSON.stringify(controller.snapshot())).not.toMatch(/raw storage|upstream|mediaId/u)
   })
 
@@ -225,6 +240,115 @@ describe('history controller', () => {
     fixture.controller.dispose()
 
     expect(fixture.cancel).toHaveBeenCalledOnce()
+  })
+
+  it('optimistically marks an active upload as cancelling and prevents duplicate requests', async () => {
+    const fixture = harness(page([historyItem('uploading')]))
+    const request = deferred<undefined>()
+    fixture.cancelUpload.mockImplementation(() => request.promise)
+    await fixture.controller.loadFirstPage()
+
+    const first = fixture.controller.cancelUpload(uploadId)
+    const second = fixture.controller.cancelUpload(uploadId)
+
+    expect(fixture.cancelUpload).toHaveBeenCalledOnce()
+    expect(fixture.controller.snapshot().records[0]).toMatchObject({
+      status: 'cancelling',
+      statusLabel: '正在取消',
+      cancellable: false,
+      cancelPending: true,
+    })
+    await expect(second).resolves.toBe(false)
+
+    request.resolve(undefined)
+    await expect(first).resolves.toBe(true)
+    expect(fixture.controller.snapshot().records[0]).toMatchObject({
+      status: 'cancelling',
+      cancellable: false,
+      cancelPending: false,
+    })
+  })
+
+  it('restores a cancellable record and shows safe feedback when cancellation fails', async () => {
+    const fixture = harness(page([historyItem('finalizing')]))
+    fixture.cancelUpload.mockRejectedValue(new Error('r2 secret abort failure'))
+    await fixture.controller.loadFirstPage()
+
+    await expect(fixture.controller.cancelUpload(uploadId)).resolves.toBe(false)
+
+    expect(fixture.controller.snapshot().records[0]).toMatchObject({
+      status: 'finalizing',
+      cancellable: true,
+      cancelPending: false,
+    })
+    expect(fixture.controller.snapshot().error).toBe('取消上传失败，请稍后重试')
+    expect(JSON.stringify(fixture.controller.snapshot())).not.toMatch(/r2 secret|abort failure/u)
+  })
+
+  it('clears only uploaded history and keeps active records visible', async () => {
+    const uploaded = historyItem('uploaded')
+    const active = historyItem('uploading', {
+      id: '01981d0c-ec80-7000-8000-000000000108',
+      fileName: 'active.mov',
+    })
+    const fixture = harness(page([uploaded, active]))
+    fixture.list
+      .mockResolvedValueOnce(page([uploaded, active]))
+      .mockResolvedValueOnce(page([active]))
+    await fixture.controller.loadFirstPage()
+
+    await expect(fixture.controller.clearUploadedRecords()).resolves.toBe(1)
+
+    expect(fixture.clearUploaded).toHaveBeenCalledOnce()
+    expect(fixture.controller.snapshot()).toMatchObject({
+      clearingUploaded: false,
+    })
+    expect(fixture.controller.snapshot().records.map((record) => record.fileName)).toEqual([
+      'active.mov',
+    ])
+  })
+
+  it('temporarily watches for a newly created record after navigation from upload', async () => {
+    const list = vi.fn<HistoryApi['list']>().mockResolvedValue(page([]))
+    const scheduled: { callback: () => void; delayMs: number }[] = []
+    const controller = new HistoryController({
+      api: { list, getUpload: vi.fn(), cancel: vi.fn(), clearUploaded: vi.fn() },
+      watchForNewUpload: true,
+      schedule(callback, delayMs) {
+        scheduled.push({ callback, delayMs })
+        return scheduled.length
+      },
+    })
+
+    await controller.loadFirstPage()
+
+    expect(controller.snapshot().records).toEqual([])
+    expect(controller.snapshot().watchingForNewUpload).toBe(true)
+    expect(scheduled).toHaveLength(1)
+    expect(scheduled[0]?.delayMs).toBe(5_000)
+  })
+
+  it('keeps the short watch active when only older terminal records are initially visible', async () => {
+    const scheduled: { callback: () => void; delayMs: number }[] = []
+    const controller = new HistoryController({
+      api: {
+        list: vi.fn().mockResolvedValue(page([historyItem('uploaded')])),
+        getUpload: vi.fn(),
+        cancel: vi.fn(),
+        clearUploaded: vi.fn(),
+      },
+      watchForNewUpload: true,
+      schedule(callback, delayMs) {
+        scheduled.push({ callback, delayMs })
+        return scheduled.length
+      },
+    })
+
+    await controller.loadFirstPage()
+
+    expect(controller.snapshot().watchingForNewUpload).toBe(false)
+    expect(scheduled).toHaveLength(1)
+    expect(scheduled[0]?.delayMs).toBe(5_000)
   })
 
   it('ignores an old centralized refresh after a first-page refresh starts a new generation', async () => {
@@ -359,7 +483,34 @@ describe('history controller', () => {
 })
 
 describe('history page privacy contract', () => {
-  it('has no preview, download, share, delete, R2 path, ETag, or content action', () => {
+  it('requires destructive confirmation before forwarding a cancellation', async () => {
+    const fixture = harness(page([historyItem('uploading')]))
+    await fixture.controller.loadFirstPage()
+    const showModal = vi.fn().mockResolvedValue({ confirm: true, cancel: false })
+    vi.stubGlobal('wx', { showModal })
+    const host = {
+      data: fixture.controller.snapshot(),
+      historyController: fixture.controller,
+      setData(): void {
+        // The controller is asserted directly; rendering behavior has separate contract coverage.
+      },
+    }
+
+    await historyPageDefinition.onCancelUpload.call(host, {
+      currentTarget: { dataset: { uploadId } },
+    })
+
+    expect(showModal).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: '取消上传',
+        confirmText: '确认取消',
+        cancelText: '继续上传',
+      }),
+    )
+    expect(fixture.cancelUpload).toHaveBeenCalledWith(uploadId)
+  })
+
+  it('offers cancellation without preview, download, share, delete, R2 path, or ETag', () => {
     const wxml = readFileSync(
       new URL('../miniprogram/pages/history/index.wxml', import.meta.url),
       'utf8',
@@ -368,6 +519,9 @@ describe('history page privacy contract', () => {
     expect(wxml).toMatch(/\{\{item\.fileName\}\}/u)
     expect(wxml).toMatch(/\{\{item\.statusLabel\}\}/u)
     expect(wxml).toMatch(/\{\{item\.percent\}\}%/u)
-    expect(wxml).not.toMatch(/preview|download|share|delete|objectKey|r2|etag|bindtap/iu)
+    expect(wxml).toMatch(/bindtap=["']onCancelUpload["']/u)
+    expect(wxml).toMatch(/bindtap=["']onClearUploadedHistory["']/u)
+    expect(wxml).toMatch(/清空已上传记录/u)
+    expect(wxml).not.toMatch(/preview|download|share|delete|objectKey|r2|etag/iu)
   })
 })

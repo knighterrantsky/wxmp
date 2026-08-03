@@ -215,31 +215,43 @@ export class UploadQueue<T extends QueueableUpload> {
   async #drain(): Promise<readonly UploadQueueItemSnapshot[]> {
     if (this.#running) throw new UploadQueueBusyError()
     this.#running = true
+    const running = new Set<Promise<void>>()
     try {
       for (;;) {
-        if (this.#unfinishedServerSessionCount() >= MAX_UNFINISHED_UPLOADS) break
-        const item = this.#items.find((candidate) => candidate.status === 'queued')
-        if (item === undefined) break
+        while (this.#unfinishedServerSessionCount() < MAX_UNFINISHED_UPLOADS) {
+          const item = this.#items.find((candidate) => candidate.status === 'queued')
+          if (item === undefined) break
+          item.status = transitionUploadStatus(item.status, 'initializing')
+          item.status = transitionUploadStatus(item.status, 'uploading')
 
-        item.status = transitionUploadStatus(item.status, 'initializing')
-        item.status = transitionUploadStatus(item.status, 'uploading')
-        try {
-          const result: unknown = await this.#runner.run(item.file)
-          if (result !== 'finalizing' && result !== 'uploaded') {
-            throw new Error('upload runner returned an invalid result')
-          }
-          item.status = transitionUploadStatus(item.status, 'finalizing')
-          if (result === 'uploaded') {
-            item.status = transitionUploadStatus(item.status, 'uploaded')
-          }
-        } catch {
-          item.status = transitionUploadStatus(item.status, 'failed')
-          item.failureMessage = SAFE_UPLOAD_FAILURE_MESSAGE
+          const operation = this.#runItem(item)
+          running.add(operation)
+          void operation.finally(() => {
+            running.delete(operation)
+          })
         }
+
+        if (running.size === 0) break
+        await Promise.race(running)
       }
       return this.snapshot()
     } finally {
+      await Promise.allSettled(running)
       this.#running = false
+    }
+  }
+
+  async #runItem(item: UploadQueueItem<T>): Promise<void> {
+    try {
+      const result: unknown = await this.#runner.run(item.file)
+      if (result !== 'finalizing' && result !== 'uploaded') {
+        throw new Error('upload runner returned an invalid result')
+      }
+      item.status = transitionUploadStatus(item.status, 'finalizing')
+      if (result === 'uploaded') item.status = transitionUploadStatus(item.status, 'uploaded')
+    } catch {
+      item.status = transitionUploadStatus(item.status, 'failed')
+      item.failureMessage = SAFE_UPLOAD_FAILURE_MESSAGE
     }
   }
 }

@@ -76,7 +76,7 @@ describe('upload queue', () => {
     expect(run).toHaveBeenCalledTimes(9)
   })
 
-  it('runs exactly one file at a time and preserves selection order', async () => {
+  it('starts the selected files together so every server task becomes visible promptly', async () => {
     const gates = [deferred<'uploaded'>(), deferred<'uploaded'>(), deferred<'uploaded'>()]
     let concurrent = 0
     let maximumConcurrent = 0
@@ -95,23 +95,21 @@ describe('upload queue', () => {
 
     const pending = queue.run(files(3), { confirmed: true })
     await vi.waitFor(() => {
-      expect(run).toHaveBeenCalledTimes(1)
-    })
-    expect(queue.snapshot().map((item) => item.status)).toEqual(['uploading', 'queued', 'queued'])
-
-    gates[0]?.resolve('uploaded')
-    await vi.waitFor(() => {
-      expect(run).toHaveBeenCalledTimes(2)
-    })
-    gates[1]?.resolve('uploaded')
-    await vi.waitFor(() => {
       expect(run).toHaveBeenCalledTimes(3)
     })
+    expect(queue.snapshot().map((item) => item.status)).toEqual([
+      'uploading',
+      'uploading',
+      'uploading',
+    ])
+
+    gates[0]?.resolve('uploaded')
+    gates[1]?.resolve('uploaded')
     gates[2]?.resolve('uploaded')
     await pending
 
     expect(order).toEqual(['file-1.jpg', 'file-2.jpg', 'file-3.jpg'])
-    expect(maximumConcurrent).toBe(1)
+    expect(maximumConcurrent).toBe(3)
     expect(queue.snapshot().map((item) => item.status)).toEqual([
       'uploaded',
       'uploaded',

@@ -147,13 +147,56 @@ form {
 
 .confirmed-card {
   border-color: rgba(31, 107, 80, 0.22);
+  padding-top: 26rpx;
+  padding-bottom: 26rpx;
+}
+
+.confirmed-profile-row,
+.selection-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.confirmed-profile-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.profile-label {
+  color: #61746d;
+  font-size: 22rpx;
 }
 
 .confirmed-name {
-  margin-top: 16rpx;
+  margin-top: 6rpx;
   color: #1f6b50;
-  font-size: 38rpx;
+  font-size: 32rpx;
   font-weight: 700;
+}
+
+.nickname-edit-button,
+.reselect-button,
+.remove-file-button {
+  margin: 0;
+  border: 0;
+  background: transparent;
+  color: #1f6b50;
+}
+
+.nickname-edit-button::after,
+.reselect-button::after,
+.remove-file-button::after,
+.privacy-cancel-button::after,
+.history-button::after {
+  border: 0;
+}
+
+.nickname-edit-button {
+  width: auto;
+  padding: 12rpx 8rpx 12rpx 24rpx;
+  font-size: 24rpx;
 }
 
 .upload-card {
@@ -181,86 +224,132 @@ form {
   border-top: 1rpx solid #e4ebe7;
 }
 
-.selection-summary,
-.selected-file-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
 .selection-title {
+  display: block;
   color: #18332b;
   font-size: 27rpx;
   font-weight: 650;
 }
 
 .selection-total {
+  display: block;
+  margin-top: 6rpx;
   color: #61746d;
   font-size: 24rpx;
 }
 
+.reselect-button {
+  width: auto;
+  padding: 12rpx 0 12rpx 24rpx;
+  font-size: 24rpx;
+}
+
 .selected-file {
+  display: flex;
+  align-items: center;
   margin-top: 18rpx;
-  padding: 22rpx;
+  padding: 16rpx;
   border-radius: 16rpx;
   background: #f6f9f7;
 }
 
-.selected-file-name {
+.preview-frame {
+  position: relative;
+  width: 144rpx;
+  height: 144rpx;
+  flex: 0 0 144rpx;
+  overflow: hidden;
+  border-radius: 14rpx;
+  background: #dfe8e3;
+}
+
+.preview-image,
+.video-placeholder {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  border-radius: 14rpx;
+}
+
+.video-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #61746d;
+  font-size: 24rpx;
+}
+
+.video-badge {
+  position: absolute;
+  bottom: 8rpx;
+  left: 8rpx;
+  padding: 4rpx 10rpx;
+  border-radius: 999rpx;
+  background: rgba(16, 42, 34, 0.78);
+  color: #ffffff;
+  font-size: 18rpx;
+}
+
+.remove-file-button {
+  width: auto;
+  min-width: 88rpx;
+  margin-left: 12rpx;
+  padding: 18rpx 0 18rpx 16rpx;
+  color: #8b514b;
+  font-size: 23rpx;
+  line-height: 1.2;
+}
+
+.remove-file-button[disabled],
+.reselect-button[disabled] {
+  opacity: 0.45;
+}
+
+.selected-file-copy {
+  display: flex;
   min-width: 0;
   flex: 1;
-  overflow: hidden;
-  color: #18332b;
-  font-size: 26rpx;
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  flex-direction: column;
+  margin-left: 24rpx;
 }
 
-.selected-file-status {
-  margin-left: 20rpx;
+.file-name-editor {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.file-name-input {
+  min-width: 0;
+  flex: 1;
+  height: 58rpx;
+  padding: 0 14rpx;
+  border: 1rpx solid #cfdcd5;
+  border-radius: 10rpx 0 0 10rpx;
+  background: #ffffff;
+  color: #18332b;
+  font-size: 24rpx;
+  font-weight: 600;
+}
+
+.file-extension {
+  box-sizing: border-box;
+  height: 58rpx;
+  padding: 0 12rpx;
+  border: 1rpx solid #cfdcd5;
+  border-left: 0;
+  border-radius: 0 10rpx 10rpx 0;
+  background: #edf3ef;
   color: #61746d;
   font-size: 22rpx;
+  line-height: 56rpx;
 }
 
-.status-uploading,
-.status-finalizing {
-  color: #1f6b50;
-}
-
-.status-uploaded {
-  color: #14784f;
-}
-
-.status-failed {
-  color: #b3463c;
-}
-
-.selected-file-meta,
-.progress-copy {
+.selected-file-meta {
   display: block;
   margin-top: 10rpx;
   color: #71817b;
   font-size: 22rpx;
-}
-
-.progress-track {
-  height: 10rpx;
-  margin-top: 18rpx;
-  overflow: hidden;
-  border-radius: 999rpx;
-  background: #dfe8e3;
-}
-
-.progress-fill {
-  height: 100%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, #1f6b50 0%, #48a779 100%);
-  transition: width 160ms ease-out;
-}
-
-.progress-copy {
-  text-align: right;
 }
 
 .start-upload-button {

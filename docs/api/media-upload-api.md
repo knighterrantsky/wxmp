@@ -174,6 +174,7 @@ partCount = ceil(sizeBytes / 8388608)
 | PUT | `/v1/profile/nickname` | 用户 JWT | 确认或更新昵称 |
 | POST | `/v1/uploads` | 用户 JWT | 初始化分片上传 |
 | GET | `/v1/uploads` | 用户 JWT | 上传记录列表 |
+| POST | `/v1/uploads/history/clear-uploaded` | 用户 JWT | 软清空已上传记录，不删除对象 |
 | GET | `/v1/uploads/{uploadId}` | 用户 JWT | 获取上传与分片状态 |
 | POST | `/v1/uploads/{uploadId}/parts/{partNumber}` | 用户 JWT | 上传一个分片 |
 | POST | `/v1/uploads/{uploadId}/complete` | 用户 JWT | 提交完成 |
@@ -694,6 +695,36 @@ uploading | finalizing | cancelling | uploaded | upload_failed | aborted | expir
 历史列表由长期保留的媒体记录与上传会话摘要生成，不依赖 90 天后会删除的分片明细。
 
 用户响应会返回续传所需的业务 `upload.id`，但不包含 R2 bucket、object key、R2 multipart upload ID、ETag、签名 URL 或读取接口。
+
+### 6.7 清空已上传记录
+
+```http
+POST /v1/uploads/history/clear-uploaded
+Authorization: Bearer <access-token>
+Content-Type: application/json
+
+{}
+```
+
+响应 `200`：
+
+```json
+{
+  "data": { "clearedCount": 2 },
+  "meta": {
+    "requestId": "019bfae5-c06f-77dd-8cf2-b2e0513a6789",
+    "serverTime": "2026-07-14T09:30:00.000Z"
+  }
+}
+```
+
+语义：
+
+- 只处理当前认证用户的 `completed + ready` 成功记录。
+- 操作是幂等的；已经隐藏的记录不会重复计数。
+- 不处理上传中、失败、已取消或已过期记录。
+- 不删除 `media_objects`、R2 对象或分片审计数据，只设置上传会话的历史隐藏时间。
+- 后续 `GET /v1/uploads` 不再返回已隐藏记录，并写入一条仅含清空数量的聚合审计事件。
 
 ## 7. 状态机
 

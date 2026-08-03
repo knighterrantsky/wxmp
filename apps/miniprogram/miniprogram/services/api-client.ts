@@ -1,5 +1,6 @@
 import {
   AbortUploadResponseDataSchema,
+  ClearUploadedHistoryResponseDataSchema,
   CompleteUploadResponseDataSchema,
   ErrorEnvelopeSchema,
   InitializeUploadResponseDataSchema,
@@ -15,6 +16,7 @@ import {
   matchesSchema,
   type AbortUploadRequest,
   type AbortUploadResponse,
+  type ClearUploadedHistoryResponse,
   type ApiError,
   type CompleteUploadResponse,
   type ErrorCode,
@@ -28,7 +30,7 @@ import {
   type UploadHistoryQuery,
   type UploadHistoryResponse,
   type WechatLoginResponse,
-} from '@wx-upload/contracts'
+} from '../generated/contracts.js'
 
 import type { HttpRequest, WechatRuntime } from '../runtime/wechat-runtime.js'
 import { normalizeHttpOrigin } from '../runtime/http-origin.js'
@@ -215,6 +217,11 @@ function decodeAbortUploadData(value: unknown, uploadId: string): AbortUploadRes
   return value
 }
 
+function decodeClearUploadedHistoryData(value: unknown): ClearUploadedHistoryResponse['data'] {
+  if (!matchesSchema(ClearUploadedHistoryResponseDataSchema, value)) throw invalidResponseError()
+  return value
+}
+
 function decodeUploadHistoryEnvelope(value: unknown): UploadHistoryPage {
   if (
     !isRecord(value) ||
@@ -361,6 +368,18 @@ export class ApiClient implements AuthenticationApi {
         method: 'GET',
         path: uploadHistoryPath(query),
         decodeEnvelope: decodeUploadHistoryEnvelope,
+      },
+      session,
+    )
+  }
+
+  clearUploadedHistory(session: AuthorizedSession): Promise<ClearUploadedHistoryResponse['data']> {
+    return this.authorizedRequest<ClearUploadedHistoryResponse['data']>(
+      {
+        method: 'POST',
+        path: '/v1/uploads/history/clear-uploaded',
+        data: {},
+        decode: decodeClearUploadedHistoryData,
       },
       session,
     )

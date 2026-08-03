@@ -4,7 +4,23 @@
     <text class="history-subtitle">这里只展示你自己的私密素材写入状态，不提供内容访问入口。</text>
   </view>
 
-  <view class="history-empty" wx:if="{{!loading && !records.length && !error}}">
+  <view class="history-toolbar" wx:if="{{records.length}}">
+    <button
+      class="clear-history-button"
+      bindtap="onClearUploadedHistory"
+      loading="{{clearingUploaded}}"
+      disabled="{{clearingUploaded}}"
+    >
+      {{clearingUploaded ? '正在清空' : '清空已上传记录'}}
+    </button>
+  </view>
+
+  <view class="history-empty" wx:if="{{!loading && watchingForNewUpload && !records.length && !error}}">
+    <text class="empty-title">正在创建上传任务</text>
+    <text class="empty-copy">素材已交给上传服务，记录将在这里自动出现。</text>
+  </view>
+
+  <view class="history-empty" wx:if="{{!loading && !watchingForNewUpload && !records.length && !error}}">
     <text class="empty-title">还没有上传记录</text>
     <text class="empty-copy">完成一次素材上传后，记录会显示在这里。</text>
   </view>
@@ -13,13 +29,24 @@
     <view class="history-item" wx:for="{{records}}" wx:key="id" wx:for-item="item">
       <view class="item-heading">
         <text class="item-name">{{item.fileName}}</text>
-        <text class="status-pill tone-{{item.tone}}">{{item.statusLabel}}</text>
+        <view class="item-actions">
+          <text class="status-pill tone-{{item.tone}}">{{item.statusLabel}}</text>
+          <button
+            wx:if="{{item.cancellable}}"
+            class="cancel-upload-button"
+            aria-label="取消上传 {{item.fileName}}"
+            data-upload-id="{{item.id}}"
+            bindtap="onCancelUpload"
+          >
+            取消
+          </button>
+        </view>
       </view>
       <text class="item-meta">{{item.kindLabel}} · {{item.sizeLabel}}</text>
-      <view class="history-progress">
+      <view class="history-progress" wx:if="{{!item.terminal}}">
         <view class="history-progress-fill" style="width: {{item.percent}}%;"></view>
       </view>
-      <view class="progress-row">
+      <view class="progress-row" wx:if="{{!item.terminal}}">
         <text>上传进度</text>
         <text>{{item.percent}}%</text>
       </view>

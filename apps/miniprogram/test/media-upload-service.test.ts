@@ -16,6 +16,7 @@ function selected(
 ): WechatSelectedMedia {
   return {
     sourcePath,
+    previewPath: sourcePath,
     sizeBytes: 12,
     kind: 'image',
     ...overrides,
@@ -118,12 +119,14 @@ describe('MediaUploadService selection', () => {
     expect(candidates).toEqual([
       {
         sourcePath: 'wxfile://tmp/photo.jpg',
+        previewPath: 'wxfile://tmp/photo.jpg',
         sizeBytes: 12,
         kind: 'image',
         readable: true,
       },
       {
         sourcePath: 'wxfile://tmp/private.mov',
+        previewPath: 'wxfile://tmp/private.mov',
         sizeBytes: 24,
         kind: 'video',
         readable: false,
@@ -134,6 +137,7 @@ describe('MediaUploadService selection', () => {
     expect(maximumActive).toBe(1)
     expect(Object.keys(candidates[0] ?? {}).sort()).toEqual([
       'kind',
+      'previewPath',
       'readable',
       'sizeBytes',
       'sourcePath',
@@ -142,7 +146,20 @@ describe('MediaUploadService selection', () => {
 })
 
 describe('MediaUploadService batch coordination', () => {
-  it('uses UploadQueue to run files sequentially and associates runner events with each source path', async () => {
+  it('rejects an expired source before creating a runner or queue item', async () => {
+    const factory = vi.fn<MediaUploadRunnerFactory>((listeners) => uploadedRunner(listeners))
+    const service = serviceWith(factory, { isReadable: vi.fn().mockResolvedValue(false) })
+    const events: MediaUploadUiEvent[] = []
+
+    await expect(
+      service.start([validated('wxfile://tmp/expired.jpg')], (event) => events.push(event)),
+    ).rejects.toMatchObject({ code: 'SOURCE_INVALID' })
+
+    expect(factory).not.toHaveBeenCalled()
+    expect(events).toEqual([])
+  })
+
+  it('creates file tasks concurrently and associates runner events with each source path', async () => {
     const files = [validated('wxfile://tmp/one.jpg'), validated('wxfile://tmp/two.jpg')]
     const gates = [deferred<'uploaded'>(), deferred<'uploaded'>()]
     const order: string[] = []
@@ -168,18 +185,18 @@ describe('MediaUploadService batch coordination', () => {
 
     const running = service.start(files, (event) => events.push(event))
     await vi.waitFor(() => {
-      expect(factory).toHaveBeenCalledTimes(1)
-    })
-    expect(order).toEqual(['wxfile://tmp/one.jpg'])
-    gates[0]?.resolve('uploaded')
-    await vi.waitFor(() => {
       expect(factory).toHaveBeenCalledTimes(2)
     })
     expect(order).toEqual(['wxfile://tmp/one.jpg', 'wxfile://tmp/two.jpg'])
+    expect(factory.mock.calls.map((call) => call[1])).toEqual([
+      { maxParallelParts: 1 },
+      { maxParallelParts: 1 },
+    ])
+    gates[0]?.resolve('uploaded')
     gates[1]?.resolve('uploaded')
     await running
 
-    expect(maximumActive).toBe(1)
+    expect(maximumActive).toBe(2)
     expect(events).toContainEqual({
       sourcePath: 'wxfile://tmp/one.jpg',
       status: 'uploading',
@@ -319,7 +336,7 @@ describe('MediaUploadService batch coordination', () => {
     expect(JSON.stringify(events)).not.toMatch(/bearer-secret|object-key|upstream text/u)
   })
 
-  it('pauses only the current runner and resumes it on foreground', async () => {
+  it('pauses and resumes the active runner on foreground', async () => {
     const gate = deferred<'uploaded'>()
     let listeners: MediaUploadRunnerListeners | undefined
     const pause = vi.fn(() => {
@@ -361,6 +378,47 @@ describe('MediaUploadService batch coordination', () => {
     await expect(service.foreground()).resolves.toBeUndefined()
     expect(pause).toHaveBeenCalledOnce()
     expect(resume).toHaveBeenCalledOnce()
+  })
+
+  it('pauses and resumes every active file in a concurrent batch', async () => {
+    const gates = [deferred<'uploaded'>(), deferred<'uploaded'>()]
+    const pauseOperations = [
+      vi.fn().mockResolvedValue(undefined),
+      vi.fn().mockResolvedValue(undefined),
+    ]
+    const resumeOperations = [
+      vi.fn().mockResolvedValue({ action: 'continued' as const }),
+      vi.fn().mockResolvedValue({ action: 'continued' as const }),
+    ]
+    let runnerIndex = 0
+    const factory: MediaUploadRunnerFactory = () => {
+      const index = runnerIndex
+      runnerIndex += 1
+      const gate = gates[index]
+      const pause = pauseOperations[index]
+      const resume = resumeOperations[index]
+      if (gate === undefined || pause === undefined || resume === undefined) {
+        throw new Error('missing concurrent runner fixture')
+      }
+      return { run: vi.fn(() => gate.promise), pause, resume }
+    }
+    const service = serviceWith(factory)
+    const running = service.start(
+      [validated('wxfile://tmp/one.jpg'), validated('wxfile://tmp/two.jpg')],
+      () => undefined,
+    )
+    await vi.waitFor(() => {
+      expect(runnerIndex).toBe(2)
+    })
+
+    await service.pause()
+    await service.foreground()
+
+    expect(pauseOperations.every((operation) => operation.mock.calls.length === 1)).toBe(true)
+    expect(resumeOperations.every((operation) => operation.mock.calls.length === 1)).toBe(true)
+    gates[0]?.resolve('uploaded')
+    gates[1]?.resolve('uploaded')
+    await running
   })
 
   it('restores finalizing after foreground instead of regressing to uploading', async () => {

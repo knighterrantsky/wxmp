@@ -43,6 +43,7 @@ function historyRecord(
 
 class InMemoryHistoryRepository implements UploadHistoryRepository {
   readonly calls: Parameters<UploadHistoryRepository['listPage']>[0][] = []
+  readonly clearCalls: Parameters<UploadHistoryRepository['clearUploaded']>[0][] = []
 
   constructor(
     readonly records: readonly TestHistoryRecord[],
@@ -75,6 +76,19 @@ class InMemoryHistoryRepository implements UploadHistoryRepository {
       .slice(0, input.take)
     return Promise.resolve({ userStatus: this.userStatus, rows })
   }
+
+  clearUploaded(
+    input: Parameters<UploadHistoryRepository['clearUploaded']>[0],
+  ): ReturnType<UploadHistoryRepository['clearUploaded']> {
+    this.clearCalls.push(input)
+    const clearedCount = this.records.filter(
+      (record) =>
+        (record.ownerId === undefined || record.ownerId === input.userId) &&
+        record.uploadStatus === 'completed' &&
+        record.mediaStatus === 'ready',
+    ).length
+    return Promise.resolve({ userStatus: this.userStatus, clearedCount })
+  }
 }
 
 function service(repository: UploadHistoryRepository) {
@@ -82,7 +96,12 @@ function service(repository: UploadHistoryRepository) {
     secret: signingSecret,
     clock: { now: () => new Date(now) },
   })
-  return new UploadHistoryService({ repository, cursor })
+  return new UploadHistoryService({
+    repository,
+    cursor,
+    clock: { now: () => new Date(now) },
+    ids: { next: () => '01981c9e-6c80-7000-8000-000000000099' },
+  })
 }
 
 async function expectApiError(
@@ -303,6 +322,32 @@ describe('UploadHistoryService', () => {
       expect(failure).toMatchObject({ code: expectedCode, stage: expectedStage })
     }
   })
+
+  it('clears only completed ready history for the authenticated owner', async () => {
+    const repository = new InMemoryHistoryRepository([
+      historyRecord('01981c9e-6c80-7000-8000-000000000061', '2026-07-15T03:00:00.000Z', {
+        uploadStatus: 'completed',
+        mediaStatus: 'ready',
+      }),
+      historyRecord('01981c9e-6c80-7000-8000-000000000062', '2026-07-15T02:00:00.000Z'),
+    ])
+
+    await expect(
+      service(repository).clearUploaded({
+        userId,
+        sessionId: '01981c9e-6c80-7000-8000-000000000063',
+        context: {
+          requestId: '01981c9e-6c80-7000-8000-000000000064',
+          sourceIp: '127.0.0.1',
+        },
+      }),
+    ).resolves.toEqual({ clearedCount: 1 })
+    expect(repository.clearCalls[0]).toMatchObject({
+      userId,
+      clearedAt: now,
+      eventId: '01981c9e-6c80-7000-8000-000000000099',
+    })
+  })
 })
 
 describe('PostgresUploadHistoryRepository', () => {
@@ -331,6 +376,7 @@ describe('PostgresUploadHistoryRepository', () => {
     const pageQuery = queries.find(({ text }) => text.includes('from history'))
     expect(pageQuery).toBeDefined()
     expect(pageQuery?.text).toMatch(/where u\.user_id = \$1/u)
+    expect(pageQuery?.text).toMatch(/u\.history_hidden_at is null/u)
     expect(pageQuery?.text).toMatch(/\(created_at, upload_id\) < \(\$3, \$4::uuid\)/u)
     expect(pageQuery?.text).toMatch(/order by created_at desc, upload_id desc/u)
     expect(pageQuery?.text).not.toMatch(/object_key|r2_upload_id|object_etag|r2_bucket/u)
@@ -358,6 +404,47 @@ describe('PostgresUploadHistoryRepository', () => {
     expect(query.mock.calls.map(([text]) => text)).not.toEqual(
       expect.arrayContaining([expect.stringMatching(/from history/u)]),
     )
+    expect(client.release).toHaveBeenCalledOnce()
+  })
+
+  it('soft-hides only completed ready rows and writes one aggregate audit event', async () => {
+    const queries: { text: string; values?: readonly unknown[] }[] = []
+    const query = vi.fn((text: string, values?: readonly unknown[]) => {
+      queries.push(values === undefined ? { text } : { text, values })
+      if (text.includes('select status from media_app.users')) {
+        return Promise.resolve({ rowCount: 1, rows: [{ status: 'active' }] })
+      }
+      if (text.includes('update media_app.upload_sessions')) {
+        return Promise.resolve({ rowCount: 2, rows: [{ id: 'one' }, { id: 'two' }] })
+      }
+      return Promise.resolve({ rowCount: 0, rows: [] })
+    })
+    const client = { query, release: vi.fn() }
+    const repository = new PostgresUploadHistoryRepository({
+      pool: { connect: vi.fn(() => Promise.resolve(client)) } as never,
+    })
+    const clearedAt = new Date(now)
+
+    await expect(
+      repository.clearUploaded({
+        userId,
+        sessionId: '01981c9e-6c80-7000-8000-000000000071',
+        clearedAt,
+        eventId: '01981c9e-6c80-7000-8000-000000000072',
+        context: {
+          requestId: '01981c9e-6c80-7000-8000-000000000073',
+          sourceIp: '127.0.0.1',
+        },
+      }),
+    ).resolves.toEqual({ userStatus: 'active', clearedCount: 2 })
+
+    const update = queries.find(({ text }) => text.includes('update media_app.upload_sessions'))
+    expect(update?.text).toMatch(/u\.user_id = \$1/u)
+    expect(update?.text).toMatch(/u\.status = 'completed'/u)
+    expect(update?.text).toMatch(/m\.storage_status = 'ready'/u)
+    expect(update?.text).toMatch(/u\.history_hidden_at is null/u)
+    const audit = queries.find(({ text }) => text.includes('upload.history.cleared'))
+    expect(audit?.values?.at(-1)).toBe('{"clearedCount":2}')
     expect(client.release).toHaveBeenCalledOnce()
   })
 })

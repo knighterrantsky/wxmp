@@ -293,6 +293,20 @@ async function fixture(options: FixtureOptions = {}) {
       })
       return
     }
+    if (requestOptions.url.endsWith(`/v1/uploads/${uploadId}/abort`)) {
+      requestOptions.success({
+        statusCode: 202,
+        data: {
+          data: {
+            upload: { id: uploadId, status: 'cancelling' },
+            pollAfterSeconds: 2,
+          },
+          meta: meta(),
+        },
+        header: {},
+      })
+      return
+    }
     if (requestOptions.url.endsWith(`/v1/uploads/${uploadId}`)) {
       if (options.failFirstDetailNonRetryable && !detailFailed) {
         detailFailed = true
@@ -478,6 +492,47 @@ describe('application upload wiring', () => {
     expect(requests.some((request) => request.url.endsWith('/v1/uploads?limit=20'))).toBe(true)
   })
 
+  it('hands a batch to the application before completion and blocks a duplicate dispatch', async () => {
+    vi.useFakeTimers()
+    const { application, uploadCalls, resolveDeferredPartUpload, storage } = await fixture({
+      deferPartUpload: true,
+    })
+    const selected = validateMediaSelection(await application.globalData.mediaUpload.chooseMedia())
+
+    await expect(application.globalData.mediaUpload.dispatch(selected)).resolves.toBeUndefined()
+    await vi.waitFor(() => {
+      expect(uploadCalls).toHaveLength(1)
+    })
+    await expect(application.globalData.mediaUpload.dispatch(selected)).rejects.toMatchObject({
+      name: 'ApplicationUploadBusyError',
+    })
+
+    resolveDeferredPartUpload()
+    await vi.runAllTimersAsync()
+    await vi.waitFor(() => {
+      expect(storage.has('privateMediaUploadResumeV1')).toBe(false)
+    })
+  })
+
+  it('wires history cancellation to the userCancelled abort endpoint with a fresh key', async () => {
+    const { application, requests } = await fixture()
+
+    await expect(application.globalData.historyApi.cancel(uploadId)).resolves.toBeUndefined()
+
+    const cancellation = requests.find((request) =>
+      request.url.endsWith(`/v1/uploads/${uploadId}/abort`),
+    )
+    expect(cancellation).toMatchObject({
+      method: 'POST',
+      data: { reason: 'userCancelled' },
+      header: {
+        'Idempotency-Key': expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+        ),
+      },
+    })
+  })
+
   it('cold-restores finalizing metadata once across concurrent onShow calls', async () => {
     const resume: UploadRunnerResumeMetadata = {
       version: 1,
@@ -524,7 +579,7 @@ describe('application upload wiring', () => {
     })
   })
 
-  it('replays foreground recovery after another hide and show during an earlier refresh', async () => {
+  it('settles a terminal server result without issuing a redundant foreground refresh', async () => {
     const {
       application,
       requests,
@@ -557,12 +612,10 @@ describe('application upload wiring', () => {
     await flush()
     resolveDeferredDetail()
 
-    await vi.waitFor(() => {
-      expect(
-        requests.filter((request) => request.url.endsWith(`/v1/uploads/${uploadId}`)),
-      ).toHaveLength(2)
-    })
     await expect(starting).resolves.toBeUndefined()
+    expect(
+      requests.filter((request) => request.url.endsWith(`/v1/uploads/${uploadId}`)),
+    ).toHaveLength(1)
     expect(storage.has('privateMediaUploadResumeV1')).toBe(false)
   })
 

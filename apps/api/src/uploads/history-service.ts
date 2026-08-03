@@ -9,9 +9,12 @@ import {
   type PublicUploadStatus,
   type UploadHistoryQuery,
   type UploadHistoryResponse,
+  type ClearUploadedHistoryResponse,
 } from '@wx-upload/contracts'
 
 import { ApiError, PUBLIC_ERROR_MESSAGES } from '../http/errors.js'
+import type { Clock } from '../lib/clock.js'
+import type { IdGenerator } from '../lib/id.js'
 import type { SignedHistoryCursorCodec } from './cursor.js'
 import type {
   HistoryRepositoryRecord,
@@ -40,6 +43,15 @@ export interface UploadHistoryPage {
 export interface UploadHistoryListInput {
   readonly userId: string
   readonly query: UploadHistoryQuery
+}
+
+export interface ClearUploadedHistoryInput {
+  readonly userId: string
+  readonly sessionId: string
+  readonly context: {
+    readonly requestId: string
+    readonly sourceIp: string
+  }
 }
 
 function apiError(code: 'UNAUTHORIZED' | 'USER_DISABLED' | 'VALIDATION_ERROR', statusCode: number) {
@@ -151,10 +163,19 @@ function historyItem(row: HistoryRepositoryRecord): UploadHistoryResponse['data'
 export class UploadHistoryService {
   readonly #repository: UploadHistoryRepository
   readonly #cursor: SignedHistoryCursorCodec
+  readonly #clock: Clock
+  readonly #ids: IdGenerator
 
-  constructor(deps: { repository: UploadHistoryRepository; cursor: SignedHistoryCursorCodec }) {
+  constructor(deps: {
+    repository: UploadHistoryRepository
+    cursor: SignedHistoryCursorCodec
+    clock: Clock
+    ids: IdGenerator
+  }) {
     this.#repository = deps.repository
     this.#cursor = deps.cursor
+    this.#clock = deps.clock
+    this.#ids = deps.ids
   }
 
   async list(input: UploadHistoryListInput): Promise<UploadHistoryPage> {
@@ -189,5 +210,19 @@ export class UploadHistoryService {
       data: { items: visibleRows.map(historyItem) },
       pagination: { limit, hasMore, nextCursor },
     }
+  }
+
+  async clearUploaded(
+    input: ClearUploadedHistoryInput,
+  ): Promise<ClearUploadedHistoryResponse['data']> {
+    const result = await this.#repository.clearUploaded({
+      userId: input.userId,
+      sessionId: input.sessionId,
+      clearedAt: this.#clock.now(),
+      eventId: this.#ids.next(),
+      context: input.context,
+    })
+    assertActiveUser(result.userStatus)
+    return { clearedCount: result.clearedCount }
   }
 }

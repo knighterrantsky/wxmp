@@ -87,6 +87,9 @@ if [[ ! -d "$release_directory" ]]; then
   install -m 0750 \
     "$source_root/deploy/scripts/deploy-release.sh" \
     "$staging_directory/deploy/scripts/deploy-release.sh"
+  install -m 0750 \
+    "$source_root/deploy/scripts/deploy-renewed-certificate.sh" \
+    "$staging_directory/deploy/scripts/deploy-renewed-certificate.sh"
 
   API_IMAGE="$api_image" IMAGE_TAG="$image_tag" \
     POSTGRES_IMAGE="$postgres_image" NGINX_IMAGE="$nginx_image" \

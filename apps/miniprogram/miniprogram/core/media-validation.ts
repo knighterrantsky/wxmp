@@ -4,7 +4,7 @@ import {
   MIN_FILE_SIZE_BYTES,
   type AllowedMimeType,
   type MediaKind,
-} from '@wx-upload/contracts'
+} from '../generated/contracts.js'
 
 export type MediaValidationCode =
   | 'SELECTION_EMPTY'
@@ -17,9 +17,11 @@ export type MediaValidationCode =
   | 'UNSUPPORTED_MEDIA_TYPE'
   | 'MIME_EXTENSION_MISMATCH'
   | 'KIND_MISMATCH'
+  | 'INVALID_FILE_NAME'
 
 export interface MediaSelectionCandidate {
   readonly sourcePath: string
+  readonly previewPath?: string | undefined
   readonly fileName?: string | undefined
   readonly sizeBytes: number
   readonly kind: MediaKind
@@ -29,10 +31,16 @@ export interface MediaSelectionCandidate {
 
 export interface ValidatedMedia {
   readonly sourcePath: string
+  readonly previewPath?: string | undefined
   readonly fileName: string
   readonly sizeBytes: number
   readonly kind: MediaKind
   readonly mimeType: AllowedMimeType
+}
+
+export interface MediaFileNameParts {
+  readonly stem: string
+  readonly extension: string
 }
 
 export type FirstPartSignatureStatus = 'pending' | 'accepted' | 'rejected'
@@ -83,6 +91,59 @@ function extension(value: string): string {
   const name = basename(value)
   const dot = name.lastIndexOf('.')
   return dot <= 0 ? '' : name.slice(dot).toLowerCase()
+}
+
+export function splitMediaFileName(fileName: string): MediaFileNameParts {
+  const name = basename(fileName)
+  const dot = name.lastIndexOf('.')
+  if (dot <= 0 || dot === name.length - 1) {
+    throw new MediaValidationError('INVALID_FILE_NAME')
+  }
+  return { stem: name.slice(0, dot), extension: name.slice(dot) }
+}
+
+function utf8ByteLength(value: string): number {
+  let bytes = 0
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0
+    if (codePoint >= 0xd800 && codePoint <= 0xdfff) {
+      throw new MediaValidationError('INVALID_FILE_NAME')
+    }
+    bytes += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4
+  }
+  return bytes
+}
+
+function hasUnsafeFileNameCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0
+    if (
+      character === '/' ||
+      character === '\\' ||
+      codePoint <= 31 ||
+      (codePoint >= 127 && codePoint <= 159)
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+export function renameValidatedMedia(file: ValidatedMedia, nextStem: string): ValidatedMedia {
+  const normalizedStem = nextStem.normalize('NFC').trim()
+  const { extension: fixedExtension } = splitMediaFileName(file.fileName)
+  const nextFileName = `${normalizedStem}${fixedExtension}`
+  if (
+    normalizedStem === '' ||
+    normalizedStem === '.' ||
+    normalizedStem === '..' ||
+    nextFileName.length > 255 ||
+    utf8ByteLength(nextFileName) > 255 ||
+    hasUnsafeFileNameCharacter(normalizedStem)
+  ) {
+    throw new MediaValidationError('INVALID_FILE_NAME')
+  }
+  return { ...file, fileName: nextFileName }
 }
 
 function declarationForExtension(value: string): MediaDeclaration | undefined {
@@ -138,6 +199,10 @@ function validateCandidate(candidate: MediaSelectionCandidate, itemIndex: number
   if (!candidate.readable || candidate.sourcePath.trim() === '') {
     throw new MediaValidationError('FILE_UNREADABLE', itemIndex)
   }
+  const previewPath = candidate.previewPath ?? candidate.sourcePath
+  if (previewPath.trim() === '' || previewPath.length > 4096 || previewPath.includes('\u0000')) {
+    throw new MediaValidationError('FILE_UNREADABLE', itemIndex)
+  }
 
   let resolved: ReturnType<typeof supportedSource>
   try {
@@ -160,6 +225,7 @@ function validateCandidate(candidate: MediaSelectionCandidate, itemIndex: number
 
   return {
     sourcePath: candidate.sourcePath,
+    previewPath,
     fileName: validatedFileName(candidate, resolved.extension),
     sizeBytes: candidate.sizeBytes,
     kind: candidate.kind,

@@ -8,13 +8,6 @@
     "coverView": true,
     "es6": true,
     "minified": true,
-    "packNpmManually": true,
-    "packNpmRelationList": [
-      {
-        "packageJsonPath": "./package.json",
-        "miniprogramNpmDistDir": "./miniprogram/"
-      }
-    ],
     "postcss": true,
     "useCompilerPlugins": ["typescript"],
     "urlCheck": true

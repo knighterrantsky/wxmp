@@ -1,4 +1,4 @@
-import type { UploadDetailResponse } from '@wx-upload/contracts'
+import type { UploadDetailResponse } from '../generated/contracts.js'
 
 export type ResumeServerPart = UploadDetailResponse['data']['parts'][number]
 export type ResumeAction = 'resume' | 'replace'

@@ -106,9 +106,9 @@ cd /home/wxdeploy/actions-runner
 
 在以下条件都满足后再开启：
 
-- `api.rwseeding.com` 已指向服务器；
-- Cloudflare SSL/TLS 模式为 `Full (strict)`；
-- 服务器 TLS 证书覆盖 `api.rwseeding.com`；
+- `api.rollinwave.store` 已通过京东云 DNS 指向服务器；
+- 京东云轻量主机已绑定 `rollinwave.store`，80/443 已开放；
+- 服务器 Let’s Encrypt 证书覆盖 `api.rollinwave.store`，自动续期演练成功；
 - production.env 已填写且权限正确；
 - runner 在线；
 - 微信后台已登记同一个 HTTPS 合法域名。
@@ -124,7 +124,7 @@ ENABLE_PRODUCTION_DEPLOY=true
 部署完成后检查：
 
 ```bash
-curl --fail https://api.rwseeding.com/health/live
+curl --fail https://api.rollinwave.store/health/live
 set -a
 . /opt/wx-private-media-upload/release.env
 set +a

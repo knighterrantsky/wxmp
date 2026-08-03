@@ -1,4 +1,8 @@
-import type { PublicUser, RefreshTokenResponse, WechatLoginResponse } from '@wx-upload/contracts'
+import type {
+  PublicUser,
+  RefreshTokenResponse,
+  WechatLoginResponse,
+} from '../generated/contracts.js'
 
 import {
   ApiClientError,

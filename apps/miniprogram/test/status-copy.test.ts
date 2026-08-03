@@ -6,7 +6,7 @@ import { statusCopy } from '../miniprogram/core/status-copy.js'
 describe('statusCopy', () => {
   it.each([
     ['uploading', { label: '上传中', tone: 'progress', terminal: false }],
-    ['finalizing', { label: '正在完成', tone: 'progress', terminal: false }],
+    ['finalizing', { label: '正在写入私有存储', tone: 'progress', terminal: false }],
     ['cancelling', { label: '正在取消', tone: 'warning', terminal: false }],
     ['uploaded', { label: '已上传', tone: 'success', terminal: true }],
     ['upload_failed', { label: '上传失败', tone: 'error', terminal: true }],

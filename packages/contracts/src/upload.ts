@@ -275,6 +275,16 @@ export const UploadHistoryResponseSchema = listSuccessEnvelopeSchema(
   UploadHistoryResponseDataSchema,
 )
 
+export const ClearUploadedHistoryRequestSchema = strictObject({})
+
+export const ClearUploadedHistoryResponseDataSchema = strictObject({
+  clearedCount: Type.Integer({ minimum: 0 }),
+})
+
+export const ClearUploadedHistoryResponseSchema = successEnvelopeSchema(
+  ClearUploadedHistoryResponseDataSchema,
+)
+
 export type InitializeUploadRequest = Static<typeof InitializeUploadRequestSchema>
 export type InitializeUploadResponse = Static<typeof InitializeUploadResponseSchema>
 export type UploadPartResponse = Static<typeof UploadPartResponseSchema>
@@ -285,3 +295,5 @@ export type AbortUploadRequest = Static<typeof AbortUploadRequestSchema>
 export type AbortUploadResponse = Static<typeof AbortUploadResponseSchema>
 export type UploadHistoryQuery = Static<typeof UploadHistoryQuerySchema>
 export type UploadHistoryResponse = Static<typeof UploadHistoryResponseSchema>
+export type ClearUploadedHistoryRequest = Static<typeof ClearUploadedHistoryRequestSchema>
+export type ClearUploadedHistoryResponse = Static<typeof ClearUploadedHistoryResponseSchema>

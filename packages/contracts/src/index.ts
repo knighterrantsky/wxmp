@@ -17,6 +17,8 @@ import { NicknameRequestSchema, NicknameResponseSchema, ProfileResponseSchema } 
 import {
   AbortUploadRequestSchema,
   AbortUploadResponseSchema,
+  ClearUploadedHistoryRequestSchema,
+  ClearUploadedHistoryResponseSchema,
   CompleteUploadRequestSchema,
   CompleteUploadResponseSchema,
   InitializeUploadRequestSchema,
@@ -45,6 +47,8 @@ export const PUBLIC_SCHEMAS = [
   CompleteUploadResponseSchema,
   AbortUploadRequestSchema,
   AbortUploadResponseSchema,
+  ClearUploadedHistoryRequestSchema,
+  ClearUploadedHistoryResponseSchema,
   UploadHistoryQuerySchema,
   UploadHistoryResponseSchema,
 ] as const
