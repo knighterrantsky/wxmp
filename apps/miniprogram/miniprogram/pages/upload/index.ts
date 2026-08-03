@@ -75,6 +75,7 @@ export interface UploadPageData extends NicknameFlowSnapshot {
   readonly selectionError: string | null
   readonly draftPicking: boolean
   readonly draftSubmitting: boolean
+  readonly draftUploadFailed: boolean
 }
 
 export interface MediaUploadPageService {
@@ -419,6 +420,7 @@ const EMPTY_UPLOAD_PAGE_DATA = {
   selectionError: null,
   draftPicking: false,
   draftSubmitting: false,
+  draftUploadFailed: false,
 } as const satisfies Omit<UploadPageData, keyof NicknameFlowSnapshot>
 
 function formatBytes(bytes: number): string {
@@ -490,6 +492,7 @@ function emptyDraft(page: UploadPageHost): void {
     selectionError: null,
     draftPicking: false,
     draftSubmitting: false,
+    draftUploadFailed: false,
   })
 }
 
@@ -533,11 +536,15 @@ async function startSelectedUpload(page: UploadPageHost): Promise<void> {
     return
   }
 
-  page.setData({ selectionError: null, draftSubmitting: true })
+  page.setData({ selectionError: null, draftSubmitting: true, draftUploadFailed: false })
   try {
     await service.dispatch([...selected])
   } catch {
-    page.setData({ selectionError: '上传任务创建失败，请稍后重试', draftSubmitting: false })
+    page.setData({
+      selectionError: '上传任务创建失败，请点击重试上传',
+      draftSubmitting: false,
+      draftUploadFailed: true,
+    })
     return
   }
 
@@ -705,7 +712,7 @@ export const uploadPageDefinition = {
         this.setData({ selectionError: '一次最多选择 9 个文件' })
         return
       }
-      this.setData({ draftPicking: true, selectionError: null })
+      this.setData({ draftPicking: true, selectionError: null, draftUploadFailed: false })
       try {
         const newlySelected = await mediaUpload.chooseMedia(remainingCount)
         const selected = validateMediaSelection([
@@ -720,6 +727,7 @@ export const uploadPageDefinition = {
           selectedTotalLabel: formatBytes(totalBytes),
           selectionError: null,
           draftPicking: false,
+          draftUploadFailed: false,
         })
       } catch (error) {
         const message = selectionErrorMessage(error)
@@ -727,6 +735,7 @@ export const uploadPageDefinition = {
           this.setData({
             selectionError: message,
             draftPicking: false,
+            draftUploadFailed: false,
           })
         } else {
           this.setData({ draftPicking: false })
@@ -766,6 +775,7 @@ export const uploadPageDefinition = {
       selectedTotalBytes: totalBytes,
       selectedTotalLabel: formatBytes(totalBytes),
       selectionError: null,
+      draftUploadFailed: false,
     })
   },
 
@@ -795,7 +805,11 @@ export const uploadPageDefinition = {
       const renamed = renameValidatedMedia(current, nextStem)
       const next = selected.map((file, itemIndex) => (itemIndex === index ? renamed : file))
       this.selectedMedia = Object.freeze(next.map((file) => Object.freeze({ ...file })))
-      this.setData({ selectedFiles: selectedFileViews(next), selectionError: null })
+      this.setData({
+        selectedFiles: selectedFileViews(next),
+        selectionError: null,
+        draftUploadFailed: false,
+      })
     } catch {
       this.setData({ selectionError: '文件名不能为空，且不能包含斜杠或控制字符' })
     }

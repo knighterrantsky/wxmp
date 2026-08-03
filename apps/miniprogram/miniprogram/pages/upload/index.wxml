@@ -2,7 +2,7 @@
   <view class="hero-card">
     <text class="eyebrow">PRIVATE MEDIA</text>
     <text class="title">私密素材上传</text>
-    <text class="subtitle">图片与视频将通过你的专属账号上传到私有存储，不提供公开访问。</text>
+    <text class="subtitle">图片与视频将通过你的专属账号安全上传到服务器，不提供公开访问。</text>
   </view>
 
   <view class="card {{nicknameConfirmed ? 'confirmed-card' : ''}}">
@@ -167,7 +167,7 @@
         loading="{{draftSubmitting}}"
         disabled="{{draftPicking || draftSubmitting || nicknameSaving}}"
       >
-        {{draftSubmitting ? '正在创建上传任务' : (nicknameConfirmed ? '上传 ' + selectedFiles.length + ' 个素材' : '请先确认昵称后上传')}}
+        {{draftSubmitting ? '正在创建上传任务' : (nicknameConfirmed ? (draftUploadFailed ? '↻ 重试上传' : '上传 ' + selectedFiles.length + ' 个素材') : '请先确认昵称后上传')}}
       </button>
     </view>
     <text class="error-text" wx:if="{{selectionError}}">{{selectionError}}</text>

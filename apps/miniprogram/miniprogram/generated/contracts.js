@@ -3099,10 +3099,10 @@ var CompleteUploadRequestSchema = strictObject({});
 var CompleteUploadResponseDataSchema = strictObject({
   upload: strictObject({
     id: PublicIdSchema,
-    status: Type.Literal("finalizing"),
+    status: Type.Literal("uploaded"),
     progress: SummaryProgressSchema
   }),
-  pollAfterSeconds: Type.Integer({ minimum: 2, maximum: 30 })
+  pollAfterSeconds: Type.Null()
 });
 var CompleteUploadResponseSchema = successEnvelopeSchema(CompleteUploadResponseDataSchema);
 var AbortUploadRequestSchema = strictObject({
@@ -3144,6 +3144,13 @@ var ClearUploadedHistoryResponseDataSchema = strictObject({
 });
 var ClearUploadedHistoryResponseSchema = successEnvelopeSchema(
   ClearUploadedHistoryResponseDataSchema
+);
+var DeleteUploadHistoryRequestSchema = strictObject({});
+var DeleteUploadHistoryResponseDataSchema = strictObject({
+  deleted: Type.Literal(true)
+});
+var DeleteUploadHistoryResponseSchema = successEnvelopeSchema(
+  DeleteUploadHistoryResponseDataSchema
 );
 
 // node_modules/.pnpm/@sinclair+typebox@0.34.52/node_modules/@sinclair/typebox/build/esm/errors/function.mjs
@@ -6488,6 +6495,7 @@ export {
   AbortUploadResponseDataSchema,
   ClearUploadedHistoryResponseDataSchema,
   CompleteUploadResponseDataSchema,
+  DeleteUploadHistoryResponseDataSchema,
   ERROR_CODES,
   ErrorEnvelopeSchema,
   IMAGE_MIME_TYPES,

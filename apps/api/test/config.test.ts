@@ -146,6 +146,7 @@ describe('runtime production safety', () => {
     expect(config.wechat.connectTimeoutMs).toBe(2_000)
     expect(config.wechat.totalTimeoutMs).toBe(5_000)
     expect(config.r2.forcePathStyle).toBe(false)
+    expect(config.uploadSpoolDirectory).toBe('/var/lib/wx-upload/spool')
     expect(config.server).toEqual({
       host: '127.0.0.1',
       port: 3000,
@@ -170,6 +171,8 @@ describe('runtime production safety', () => {
     ['R2_ENDPOINT', 'https://account.r2.cloudflarestorage.com#bucket'],
     ['R2_ENDPOINT', 'https://account.r2.cloudflarestorage.com:8443'],
     ['R2_FORCE_PATH_STYLE', 'true'],
+    ['UPLOAD_SPOOL_DIR', 'relative/spool'],
+    ['UPLOAD_SPOOL_DIR', '/tmp/spool'],
     ['JWT_PRIVATE_KEY', 'temporary-development-key'],
     ['JWT_PUBLIC_KEY', 'temporary-development-key'],
     ['CURSOR_SIGNING_KEY', 'change-me'],

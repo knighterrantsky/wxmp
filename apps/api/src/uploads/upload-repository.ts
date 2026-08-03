@@ -397,26 +397,26 @@ function completeReplayData(value: unknown, uploadId: string): CompleteUploadRes
   const progress = upload['progress']
   if (
     upload['id'] !== uploadId ||
-    upload['status'] !== 'finalizing' ||
+    (upload['status'] !== 'finalizing' && upload['status'] !== 'uploaded') ||
     !isRecord(progress) ||
     !Number.isSafeInteger(progress['confirmedBytes']) ||
     !Number.isSafeInteger(progress['totalBytes']) ||
     typeof progress['percent'] !== 'number' ||
-    !Number.isSafeInteger(value['pollAfterSeconds'])
+    !(value['pollAfterSeconds'] === null || Number.isSafeInteger(value['pollAfterSeconds']))
   ) {
     throw new Error('complete idempotency response is invalid')
   }
   return {
     upload: {
       id: uploadId,
-      status: 'finalizing',
+      status: 'uploaded',
       progress: {
         confirmedBytes: Number(progress['confirmedBytes']),
         totalBytes: Number(progress['totalBytes']),
         percent: progress['percent'],
       },
     },
-    pollAfterSeconds: Number(value['pollAfterSeconds']),
+    pollAfterSeconds: null,
   }
 }
 
@@ -533,9 +533,9 @@ export class PostgresUploadRepository implements UploadRepository {
 
       const unfinished = await client.query<{ count: string }>(
         `select count(*)::text as count
-           from media_app.upload_sessions
+          from media_app.upload_sessions
           where user_id = $1
-            and status in ('initiating', 'uploading', 'completing', 'aborting')`,
+            and status in ('initiating', 'uploading', 'aborting')`,
         [draft.userId],
       )
       if (Number(unfinished.rows[0]?.count ?? 0) >= 5) {
@@ -917,10 +917,10 @@ export class PostgresUploadRepository implements UploadRepository {
       const data: CompleteUploadResponse['data'] = {
         upload: {
           id: input.uploadId,
-          status: 'finalizing',
+          status: 'uploaded',
           progress: { confirmedBytes: totalBytes, totalBytes, percent: 100 },
         },
-        pollAfterSeconds: 2,
+        pollAfterSeconds: null,
       }
       const completing = await client.query(
         `update media_app.upload_sessions
@@ -1403,6 +1403,8 @@ export class PostgresUploadRepository implements UploadRepository {
       const status = projectPublicStatus(
         row.upload_status as UploadSessionStatus,
         row.media_status as MediaStorageStatus,
+        confirmedBytes === totalBytes &&
+          ['completing', 'completed', 'failed'].includes(row.upload_status),
       )
       const terminal = terminalAt(row)
       const partsAvailableUntil =

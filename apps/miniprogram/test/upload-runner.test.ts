@@ -165,16 +165,15 @@ function chunkHarness() {
   }
 }
 
-function completeData(status: 'finalizing' | 'uploaded' = 'finalizing') {
-  if (status === 'uploaded') return { upload: { id: uploadId, status } } as const
+function completeData(): CompleteUploadResponse['data'] {
   return {
     upload: {
       id: uploadId,
-      status,
+      status: 'uploaded',
       progress: { confirmedBytes: 1, totalBytes: 1, percent: 100 },
     },
-    pollAfterSeconds: 2,
-  } satisfies CompleteUploadResponse['data']
+    pollAfterSeconds: null,
+  }
 }
 
 function abortData(): AbortUploadResponse['data'] {
@@ -262,17 +261,13 @@ describe('UploadRunner scheduling and retry', () => {
       ?.resolve(partResult(parts[2]!, selected.sizeBytes, selected.sizeBytes - parts[3]!.sizeBytes))
     waiting.get(4)?.resolve(partResult(parts[3]!, selected.sizeBytes, selected.sizeBytes))
 
-    await expect(running).resolves.toBe('finalizing')
-    expect(runner.pollAfterSeconds).toBe(2)
+    await expect(running).resolves.toBe('uploaded')
+    expect(runner.pollAfterSeconds).toBeNull()
     expect(maximumActive).toBe(2)
     expect(chunks.delete).toHaveBeenCalledTimes(4)
     expect(api.completeUpload).toHaveBeenCalledWith(uploadId, completeKey)
-    expect(store.store.clear).not.toHaveBeenCalled()
-    expect(store.current()).toMatchObject({
-      phase: 'finalizing',
-      uploadId,
-      completeIdempotencyKey: completeKey,
-    })
+    expect(store.store.clear).toHaveBeenCalledOnce()
+    expect(store.current()).toBeUndefined()
   })
 
   it('never schedules part 2 when first-part validation fails and still deletes its temp file', async () => {
@@ -302,7 +297,7 @@ describe('UploadRunner scheduling and retry', () => {
     expect(api.completeUpload).not.toHaveBeenCalled()
   })
 
-  it('makes one initial request plus at most five documented network retries', async () => {
+  it('does not automatically retry a failed part request', async () => {
     const selected = file(12)
     const api = apiHarness(selected)
     const chunks = chunkHarness()
@@ -323,13 +318,13 @@ describe('UploadRunner scheduling and retry', () => {
     })
 
     await expect(runner.run(selected)).rejects.toBe(failure)
-    expect(transport.uploadPart).toHaveBeenCalledTimes(6)
-    expect(sleep).toHaveBeenCalledTimes(5)
+    expect(transport.uploadPart).toHaveBeenCalledOnce()
+    expect(sleep).not.toHaveBeenCalled()
     expect(chunks.create).toHaveBeenCalledOnce()
     expect(chunks.delete).toHaveBeenCalledOnce()
   })
 
-  it('recreates a chunk after PART_CHECKSUM_MISMATCH but not for ordinary retries', async () => {
+  it('does not automatically retry a checksum mismatch', async () => {
     const selected = file(12)
     const part = planUploadParts(selected.sizeBytes)[0]!
     const api = apiHarness(selected)
@@ -340,25 +335,15 @@ describe('UploadRunner scheduling and retry', () => {
       sha256: 'a'.repeat(64),
       tempPath: 'wxfile://usr/private-checksum-first.part',
     }
-    const refreshedChunk = {
-      ...firstChunk,
-      sha256: 'b'.repeat(64),
-      tempPath: 'wxfile://usr/private-checksum-refreshed.part',
-    }
-    chunks.create.mockResolvedValueOnce(firstChunk).mockResolvedValueOnce(refreshedChunk)
+    chunks.create.mockResolvedValueOnce(firstChunk)
     const checksumMismatch = Object.assign(new Error('private checksum mismatch'), {
       code: 'PART_CHECKSUM_MISMATCH',
       statusCode: 422,
       retryable: true,
     })
-    const refreshedResult = partResult(part, selected.sizeBytes, selected.sizeBytes)
     const uploadPart = vi
       .fn<UploadPartTransport['uploadPart']>()
       .mockRejectedValueOnce(checksumMismatch)
-      .mockResolvedValueOnce({
-        ...refreshedResult,
-        part: { ...refreshedResult.part, sha256: refreshedChunk.sha256 },
-      })
     const sleep = vi.fn(async () => undefined)
     const runner = new UploadRunner({
       api,
@@ -371,8 +356,8 @@ describe('UploadRunner scheduling and retry', () => {
       random: () => 0,
     })
 
-    await expect(runner.run(selected)).resolves.toBe('finalizing')
-    expect(chunks.create).toHaveBeenCalledTimes(2)
+    await expect(runner.run(selected)).rejects.toBe(checksumMismatch)
+    expect(chunks.create).toHaveBeenCalledOnce()
     expect(uploadPart).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({
@@ -380,31 +365,16 @@ describe('UploadRunner scheduling and retry', () => {
         tempPath: firstChunk.tempPath,
       }),
     )
-    expect(uploadPart).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        sha256: refreshedChunk.sha256,
-        tempPath: refreshedChunk.tempPath,
-      }),
-    )
     expect(chunks.delete).toHaveBeenNthCalledWith(1, firstChunk)
-    expect(chunks.delete).toHaveBeenNthCalledWith(2, refreshedChunk)
-    expect(sleep).toHaveBeenCalledOnce()
+    expect(sleep).not.toHaveBeenCalled()
   })
 
-  it('retries initialization with the original request and idempotency key', async () => {
+  it('does not automatically retry initialization', async () => {
     const selected = file(12)
     const api = apiHarness(selected)
     const failure = Object.assign(new Error('network failed'), { networkError: true })
-    api.initializeUpload = vi
-      .fn<UploadRunnerApi['initializeUpload']>()
-      .mockRejectedValueOnce(failure)
-      .mockRejectedValueOnce(failure)
-      .mockResolvedValue(initializeData(selected))
-    const part = planUploadParts(selected.sizeBytes)[0]!
-    const transport: UploadPartTransport = {
-      uploadPart: vi.fn(async () => partResult(part, selected.sizeBytes, selected.sizeBytes)),
-    }
+    api.initializeUpload = vi.fn<UploadRunnerApi['initializeUpload']>().mockRejectedValue(failure)
+    const transport: UploadPartTransport = { uploadPart: vi.fn() }
     const sleep = vi.fn(async () => undefined)
     const runner = new UploadRunner({
       api,
@@ -417,8 +387,8 @@ describe('UploadRunner scheduling and retry', () => {
       random: () => 0,
     })
 
-    await expect(runner.run(selected)).resolves.toBe('finalizing')
-    expect(api.initializeUpload).toHaveBeenCalledTimes(3)
+    await expect(runner.run(selected)).rejects.toBe(failure)
+    expect(api.initializeUpload).toHaveBeenCalledOnce()
     for (const call of vi.mocked(api.initializeUpload).mock.calls) {
       expect(call).toEqual([
         {
@@ -430,10 +400,11 @@ describe('UploadRunner scheduling and retry', () => {
         initializeKey,
       ])
     }
-    expect(sleep).toHaveBeenCalledTimes(2)
+    expect(sleep).not.toHaveBeenCalled()
+    expect(transport.uploadPart).not.toHaveBeenCalled()
   })
 
-  it('bounds initialization retries and preserves resumable metadata after exhaustion', async () => {
+  it('preserves resumable metadata after one failed initialization request', async () => {
     const selected = file(12)
     const api = apiHarness(selected)
     const failure = Object.assign(new Error('network failed'), { networkError: true })
@@ -452,8 +423,8 @@ describe('UploadRunner scheduling and retry', () => {
     })
 
     await expect(runner.run(selected)).rejects.toBe(failure)
-    expect(api.initializeUpload).toHaveBeenCalledTimes(6)
-    expect(sleep).toHaveBeenCalledTimes(5)
+    expect(api.initializeUpload).toHaveBeenCalledOnce()
+    expect(sleep).not.toHaveBeenCalled()
     expect(store.store.clear).not.toHaveBeenCalled()
     expect(store.current()).toMatchObject({
       phase: 'initializing',
@@ -463,15 +434,11 @@ describe('UploadRunner scheduling and retry', () => {
     })
   })
 
-  it('retries completion with one key without re-uploading the confirmed part', async () => {
+  it('does not automatically retry completion or re-upload the confirmed part', async () => {
     const selected = file(12)
     const api = apiHarness(selected)
     const failure = Object.assign(new Error('network failed'), { networkError: true })
-    api.completeUpload = vi
-      .fn<UploadRunnerApi['completeUpload']>()
-      .mockRejectedValueOnce(failure)
-      .mockRejectedValueOnce(failure)
-      .mockResolvedValue(completeData())
+    api.completeUpload = vi.fn<UploadRunnerApi['completeUpload']>().mockRejectedValue(failure)
     const part = planUploadParts(selected.sizeBytes)[0]!
     const transport: UploadPartTransport = {
       uploadPart: vi.fn(async () => partResult(part, selected.sizeBytes, selected.sizeBytes)),
@@ -488,16 +455,14 @@ describe('UploadRunner scheduling and retry', () => {
       random: () => 0,
     })
 
-    await expect(runner.run(selected)).resolves.toBe('finalizing')
-    expect(api.completeUpload).toHaveBeenCalledTimes(3)
+    await expect(runner.run(selected)).rejects.toBe(failure)
+    expect(api.completeUpload).toHaveBeenCalledOnce()
     expect(api.completeUpload).toHaveBeenNthCalledWith(1, uploadId, completeKey)
-    expect(api.completeUpload).toHaveBeenNthCalledWith(2, uploadId, completeKey)
-    expect(api.completeUpload).toHaveBeenNthCalledWith(3, uploadId, completeKey)
     expect(transport.uploadPart).toHaveBeenCalledOnce()
-    expect(sleep).toHaveBeenCalledTimes(2)
+    expect(sleep).not.toHaveBeenCalled()
   })
 
-  it('bounds completion retries and keeps its key and confirmed progress after exhaustion', async () => {
+  it('keeps its key and confirmed progress after one failed completion request', async () => {
     const selected = file(12)
     const api = apiHarness(selected)
     const failure = Object.assign(new Error('network failed'), { networkError: true })
@@ -520,8 +485,8 @@ describe('UploadRunner scheduling and retry', () => {
     })
 
     await expect(runner.run(selected)).rejects.toBe(failure)
-    expect(api.completeUpload).toHaveBeenCalledTimes(6)
-    expect(sleep).toHaveBeenCalledTimes(5)
+    expect(api.completeUpload).toHaveBeenCalledOnce()
+    expect(sleep).not.toHaveBeenCalled()
     expect(transport.uploadPart).toHaveBeenCalledOnce()
     expect(store.store.clear).not.toHaveBeenCalled()
     expect(store.current()).toMatchObject({
@@ -555,7 +520,7 @@ describe('UploadRunner scheduling and retry', () => {
       sleep,
     })
 
-    await expect(runner.run(selected)).resolves.toBe('finalizing')
+    await expect(runner.run(selected)).resolves.toBe('uploaded')
     expect(internalRequests).toBe(2)
     expect(transport.uploadPart).toHaveBeenCalledOnce()
     expect(sleep).not.toHaveBeenCalled()
@@ -615,7 +580,7 @@ describe('UploadRunner scheduling and retry', () => {
         partResult(parts[2]!, selected.sizeBytes, parts[0]!.sizeBytes + parts[2]!.sizeBytes),
       )
 
-    await expect(running).resolves.toBe('finalizing')
+    await expect(running).resolves.toBe('uploaded')
     expect(progress.at(-1)).toBe(selected.sizeBytes)
     expect(progress.every((value, index) => index === 0 || value >= progress[index - 1]!)).toBe(
       true,
@@ -625,163 +590,6 @@ describe('UploadRunner scheduling and retry', () => {
 })
 
 describe('UploadRunner pause and resume', () => {
-  it('parks a part retry in the background and refreshes server truth before retrying', async () => {
-    const selected = file(12)
-    const part = planUploadParts(selected.sizeBytes)[0]!
-    const api = apiHarness(selected)
-    const refreshing = deferred<UploadDetailResponse['data']>()
-    api.getUpload = vi.fn(() => refreshing.promise)
-    const networkFailure = Object.assign(new Error('network failed'), { networkError: true })
-    const retryBackoff = deferred<undefined>()
-    const retriedUpload = deferred<UploadPartResponse['data']>()
-    const chunks = chunkHarness()
-    const uploadPart = vi
-      .fn<UploadPartTransport['uploadPart']>()
-      .mockRejectedValueOnce(networkFailure)
-      .mockImplementationOnce(() => retriedUpload.promise)
-    const runner = new UploadRunner({
-      api,
-      transport: { uploadPart },
-      chunks,
-      source: { isReadable: vi.fn(async () => true) },
-      store: memoryStore().store,
-      createIdempotencyKey: keys(),
-      sleep: vi.fn(() => retryBackoff.promise),
-      random: () => 0,
-    })
-
-    const running = runner.run(selected)
-    await vi.waitFor(() => {
-      expect(uploadPart).toHaveBeenCalledOnce()
-    })
-    await runner.pause()
-    retryBackoff.resolve(undefined)
-    await flush()
-
-    expect(uploadPart).toHaveBeenCalledOnce()
-    expect(api.getUpload).not.toHaveBeenCalled()
-
-    const foregrounding = runner.foreground()
-    await vi.waitFor(() => {
-      expect(api.getUpload).toHaveBeenCalledWith(uploadId)
-    })
-    expect(uploadPart).toHaveBeenCalledOnce()
-
-    refreshing.resolve(detailData(selected, { 1: 'pending' }, 0))
-    await foregrounding
-    await vi.waitFor(() => {
-      expect(uploadPart).toHaveBeenCalledTimes(2)
-    })
-    retriedUpload.resolve(partResult(part, selected.sizeBytes, selected.sizeBytes))
-
-    await expect(running).resolves.toBe('finalizing')
-    expect(chunks.create).toHaveBeenCalledOnce()
-    expect(chunks.delete).toHaveBeenCalledOnce()
-  })
-
-  it('does not let a stale foreground refresh override a newer pause', async () => {
-    const selected = file(12)
-    const part = planUploadParts(selected.sizeBytes)[0]!
-    const api = apiHarness(selected)
-    const firstRefresh = deferred<UploadDetailResponse['data']>()
-    api.getUpload = vi
-      .fn<UploadRunnerApi['getUpload']>()
-      .mockImplementationOnce(() => firstRefresh.promise)
-      .mockResolvedValueOnce(detailData(selected, { 1: 'pending' }, 0))
-    const networkFailure = Object.assign(new Error('network failed'), { networkError: true })
-    const retryBackoff = deferred<undefined>()
-    const retriedUpload = deferred<UploadPartResponse['data']>()
-    const uploadPart = vi
-      .fn<UploadPartTransport['uploadPart']>()
-      .mockRejectedValueOnce(networkFailure)
-      .mockImplementationOnce(() => retriedUpload.promise)
-    const store = memoryStore()
-    const runner = new UploadRunner({
-      api,
-      transport: { uploadPart },
-      chunks: chunkHarness(),
-      source: { isReadable: vi.fn(async () => true) },
-      store: store.store,
-      createIdempotencyKey: keys(),
-      sleep: vi.fn(() => retryBackoff.promise),
-      random: () => 0,
-    })
-
-    const running = runner.run(selected)
-    await vi.waitFor(() => {
-      expect(uploadPart).toHaveBeenCalledOnce()
-    })
-    await runner.pause()
-    retryBackoff.resolve(undefined)
-    await flush()
-
-    const staleForeground = runner.foreground()
-    await vi.waitFor(() => {
-      expect(api.getUpload).toHaveBeenCalledOnce()
-    })
-    await runner.pause()
-    firstRefresh.resolve(detailData(selected, { 1: 'pending' }, 0))
-    await staleForeground
-    await flush()
-
-    expect(uploadPart).toHaveBeenCalledOnce()
-    expect(store.current()).toMatchObject({ paused: true })
-
-    await runner.foreground()
-    await vi.waitFor(() => {
-      expect(api.getUpload).toHaveBeenCalledTimes(2)
-      expect(uploadPart).toHaveBeenCalledTimes(2)
-    })
-    retriedUpload.resolve(partResult(part, selected.sizeBytes, selected.sizeBytes))
-
-    await expect(running).resolves.toBe('finalizing')
-  })
-
-  it('does not send a completion retry in the background', async () => {
-    const selected = file(12)
-    const part = planUploadParts(selected.sizeBytes)[0]!
-    const api = apiHarness(selected)
-    const networkFailure = Object.assign(new Error('network failed'), { networkError: true })
-    const retryBackoff = deferred<undefined>()
-    const retriedCompletion = deferred<Awaited<ReturnType<UploadRunnerApi['completeUpload']>>>()
-    api.completeUpload = vi
-      .fn<UploadRunnerApi['completeUpload']>()
-      .mockRejectedValueOnce(networkFailure)
-      .mockImplementationOnce(() => retriedCompletion.promise)
-    api.getUpload = vi.fn(async () => detailData(selected, { 1: 'uploaded' }, selected.sizeBytes))
-    const runner = new UploadRunner({
-      api,
-      transport: {
-        uploadPart: vi.fn(async () => partResult(part, selected.sizeBytes, selected.sizeBytes)),
-      },
-      chunks: chunkHarness(),
-      source: { isReadable: vi.fn(async () => true) },
-      store: memoryStore().store,
-      createIdempotencyKey: keys(),
-      sleep: vi.fn(() => retryBackoff.promise),
-      random: () => 0,
-    })
-
-    const running = runner.run(selected)
-    await vi.waitFor(() => {
-      expect(api.completeUpload).toHaveBeenCalledOnce()
-    })
-    await runner.pause()
-    retryBackoff.resolve(undefined)
-    await flush()
-
-    expect(api.completeUpload).toHaveBeenCalledOnce()
-
-    await runner.foreground()
-    await vi.waitFor(() => {
-      expect(api.getUpload).toHaveBeenCalledWith(uploadId)
-      expect(api.completeUpload).toHaveBeenCalledTimes(2)
-    })
-    retriedCompletion.resolve(completeData())
-
-    await expect(running).resolves.toBe('finalizing')
-  })
-
   it('latches a fresh-run pause while the initialization key is pending', async () => {
     const selected = file(12)
     const part = planUploadParts(selected.sizeBytes)[0]!
@@ -832,7 +640,7 @@ describe('UploadRunner pause and resume', () => {
     })
     uploading.resolve(partResult(part, selected.sizeBytes, selected.sizeBytes))
 
-    await expect(running).resolves.toBe('finalizing')
+    await expect(running).resolves.toBe('uploaded')
   })
 
   it('pauses only new scheduling, lets requests finish, then refreshes server truth before resuming', async () => {
@@ -890,7 +698,7 @@ describe('UploadRunner pause and resume', () => {
     expect(starts).toEqual([1, 2, 3])
 
     await expect(runner.resume()).resolves.toEqual({ action: 'continued' })
-    await expect(running).resolves.toBe('finalizing')
+    await expect(running).resolves.toBe('uploaded')
     expect(starts).toEqual([1, 2, 3, 4])
     expect(api.getUpload).toHaveBeenCalledWith(uploadId)
     expect(statuses).toContain('paused')
@@ -992,7 +800,7 @@ describe('UploadRunner durable cold resume', () => {
       expect(uploadPart).toHaveBeenCalledOnce()
     })
     uploading.resolve(partResult(part, selected.sizeBytes, selected.sizeBytes))
-    await expect(restoring).resolves.toEqual({ action: 'completed', result: 'finalizing' })
+    await expect(restoring).resolves.toEqual({ action: 'completed', result: 'uploaded' })
   })
 
   it('latches pause while cold initialization awaits and schedules nothing in background', async () => {
@@ -1047,7 +855,7 @@ describe('UploadRunner durable cold resume', () => {
       expect(uploadPart).toHaveBeenCalledOnce()
     })
     uploading.resolve(partResult(part, selected.sizeBytes, selected.sizeBytes))
-    await expect(restoring).resolves.toEqual({ action: 'completed', result: 'finalizing' })
+    await expect(restoring).resolves.toEqual({ action: 'completed', result: 'uploaded' })
   })
 
   it('latches pause while cold detail refresh awaits and schedules nothing in background', async () => {
@@ -1108,7 +916,7 @@ describe('UploadRunner durable cold resume', () => {
       expect(uploadPart).toHaveBeenCalledOnce()
     })
     uploading.resolve(partResult(part, selected.sizeBytes, selected.sizeBytes))
-    await expect(restoring).resolves.toEqual({ action: 'completed', result: 'finalizing' })
+    await expect(restoring).resolves.toEqual({ action: 'completed', result: 'uploaded' })
   })
 
   it('rehashes every remotely confirmed part, cleans hash chunks, and uploads only pending parts', async () => {
@@ -1134,7 +942,7 @@ describe('UploadRunner durable cold resume', () => {
       createIdempotencyKey: vi.fn(() => completeKey),
     })
 
-    await expect(runner.resume()).resolves.toEqual({ action: 'completed', result: 'finalizing' })
+    await expect(runner.resume()).resolves.toEqual({ action: 'completed', result: 'uploaded' })
     expect(chunks.create.mock.calls.map((call) => call[1].partNumber)).toEqual([1, 2])
     expect(chunks.delete).toHaveBeenCalledTimes(2)
     expect(transport.uploadPart).toHaveBeenCalledOnce()
@@ -1212,12 +1020,12 @@ describe('UploadRunner durable cold resume', () => {
     })
 
     await expect(first.run(selected)).rejects.toBe(networkFailure)
-    expect(firstApi.initializeUpload).toHaveBeenCalledTimes(6)
+    expect(firstApi.initializeUpload).toHaveBeenCalledOnce()
     expect(firstApi.initializeUpload).toHaveBeenCalledWith(
       expect.objectContaining({ sizeBytes: 12 }),
       initializeKey,
     )
-    expect(sleep).toHaveBeenCalledTimes(5)
+    expect(sleep).not.toHaveBeenCalled()
     expect(store.saves[0]).toMatchObject({
       phase: 'initializing',
       initializeIdempotencyKey: initializeKey,
@@ -1235,14 +1043,14 @@ describe('UploadRunner durable cold resume', () => {
       createIdempotencyKey: vi.fn(() => completeKey),
     })
 
-    await expect(second.resume()).resolves.toEqual({ action: 'completed', result: 'finalizing' })
+    await expect(second.resume()).resolves.toEqual({ action: 'completed', result: 'uploaded' })
     expect(secondApi.initializeUpload).toHaveBeenCalledWith(
       expect.objectContaining({ sizeBytes: 12 }),
       initializeKey,
     )
   })
 
-  it('retains finalizing metadata without requiring the temporary source to remain readable', async () => {
+  it('treats server-received finalizing metadata as uploaded without reading the source again', async () => {
     const selected = file(PART_SIZE_BYTES + 12)
     const record: UploadRunnerResumeMetadata = {
       ...persisted(selected),
@@ -1267,16 +1075,13 @@ describe('UploadRunner durable cold resume', () => {
 
     await expect(runner.resume()).resolves.toEqual({
       action: 'completed',
-      result: 'finalizing',
+      result: 'uploaded',
     })
     expect(source.isReadable).not.toHaveBeenCalled()
-    expect(runner.pollAfterSeconds).toBe(2)
+    expect(runner.pollAfterSeconds).toBeNull()
     expect(api.abortUpload).not.toHaveBeenCalled()
-    expect(store.store.clear).not.toHaveBeenCalled()
-    expect(store.current()).toMatchObject({
-      phase: 'finalizing',
-      completeIdempotencyKey: completeKey,
-    })
+    expect(store.store.clear).toHaveBeenCalledOnce()
+    expect(store.current()).toBeUndefined()
   })
 
   it('uses a new complete key after a finalizer rolls a missing part back to pending', async () => {
@@ -1309,14 +1114,11 @@ describe('UploadRunner durable cold resume', () => {
 
     await expect(runner.resume()).resolves.toEqual({
       action: 'completed',
-      result: 'finalizing',
+      result: 'uploaded',
     })
     expect(transport.uploadPart).toHaveBeenCalledWith(expect.objectContaining({ partNumber: 2 }))
     expect(api.completeUpload).toHaveBeenCalledWith(uploadId, abortKey)
-    expect(store.current()).toMatchObject({
-      phase: 'finalizing',
-      completeIdempotencyKey: abortKey,
-    })
+    expect(store.current()).toBeUndefined()
   })
 
   it('foregrounds a paused cold-resume upload without waiting on its outer resume promise', async () => {
@@ -1355,7 +1157,7 @@ describe('UploadRunner durable cold resume', () => {
 
     upload.resolve(partResult(parts[1]!, selected.sizeBytes, selected.sizeBytes))
     await expect(foregrounding).resolves.toBeUndefined()
-    await expect(restoring).resolves.toEqual({ action: 'completed', result: 'finalizing' })
+    await expect(restoring).resolves.toEqual({ action: 'completed', result: 'uploaded' })
     expect(api.getUpload).toHaveBeenCalledTimes(2)
   })
 

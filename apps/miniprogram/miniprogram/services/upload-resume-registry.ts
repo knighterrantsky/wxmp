@@ -18,6 +18,7 @@ export interface UploadResumeRegistry {
   record(initializeIdempotencyKey: string): UploadRunnerResumeMetadata | undefined
   keys(): readonly string[]
   count(): number
+  remove(initializeIdempotencyKey: string): void
 }
 
 export class UploadResumeRegistryCapacityError extends Error {
@@ -148,5 +149,11 @@ export function createUploadResumeRegistry(
     },
     keys: () => Object.freeze([...read().keys()]),
     count: () => read().size,
+    remove: (initializeIdempotencyKey) => {
+      if (!UUID_V7.test(initializeIdempotencyKey)) return
+      const records = read()
+      records.delete(initializeIdempotencyKey)
+      write(records)
+    },
   }
 }

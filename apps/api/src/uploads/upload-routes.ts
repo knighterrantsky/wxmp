@@ -6,6 +6,8 @@ import {
   AbortUploadResponseSchema,
   ClearUploadedHistoryRequestSchema,
   ClearUploadedHistoryResponseSchema,
+  DeleteUploadHistoryRequestSchema,
+  DeleteUploadHistoryResponseSchema,
   CompleteUploadRequestSchema,
   CompleteUploadResponseSchema,
   InitializeUploadResponseSchema,
@@ -20,6 +22,8 @@ import {
   type AbortUploadResponse,
   type ClearUploadedHistoryRequest,
   type ClearUploadedHistoryResponse,
+  type DeleteUploadHistoryRequest,
+  type DeleteUploadHistoryResponse,
   type CompleteUploadRequest,
   type CompleteUploadResponse,
   type InitializeUploadResponse,
@@ -134,6 +138,12 @@ export interface UploadHistoryRouteService {
     sessionId: string
     context: { requestId: string; sourceIp: string; userAgent?: string }
   }): Promise<ClearUploadedHistoryResponse['data']>
+  deleteRecord(input: {
+    userId: string
+    sessionId: string
+    uploadId: string
+    context: { requestId: string; sourceIp: string; userAgent?: string }
+  }): Promise<DeleteUploadHistoryResponse['data']>
 }
 
 interface UploadPartParams {
@@ -322,14 +332,14 @@ function publicCompleteData(data: CompleteUploadResponse['data']): CompleteUploa
   return {
     upload: {
       id: data.upload.id,
-      status: 'finalizing',
+      status: 'uploaded',
       progress: {
         confirmedBytes: data.upload.progress.confirmedBytes,
         totalBytes: data.upload.progress.totalBytes,
         percent: data.upload.progress.percent,
       },
     },
-    pollAfterSeconds: data.pollAfterSeconds,
+    pollAfterSeconds: null,
   }
 }
 
@@ -465,6 +475,28 @@ export function registerUploadRoutes(
           context: requestAuthContext(request),
         })
         return sendData(reply, { clearedCount: data.clearedCount })
+      },
+    )
+
+    app.post<{ Body: DeleteUploadHistoryRequest; Params: UploadPathParams }>(
+      '/v1/uploads/:uploadId/history/delete',
+      {
+        config: { rateLimit: rateLimitPolicy('history') },
+        preHandler: authenticate,
+        schema: {
+          params: UploadPathParamsSchema,
+          body: DeleteUploadHistoryRequestSchema,
+          response: { 200: DeleteUploadHistoryResponseSchema },
+        },
+      },
+      async (request, reply) => {
+        const identity = authenticatedRequestIdentity(request)
+        const data = await history.deleteRecord({
+          ...identity,
+          uploadId: request.params.uploadId,
+          context: requestAuthContext(request),
+        })
+        return sendData(reply, { deleted: data.deleted })
       },
     )
   }

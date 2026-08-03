@@ -10,6 +10,7 @@ import {
   type UploadHistoryQuery,
   type UploadHistoryResponse,
   type ClearUploadedHistoryResponse,
+  type DeleteUploadHistoryResponse,
 } from '@wx-upload/contracts'
 
 import { ApiError, PUBLIC_ERROR_MESSAGES } from '../http/errors.js'
@@ -54,7 +55,14 @@ export interface ClearUploadedHistoryInput {
   }
 }
 
-function apiError(code: 'UNAUTHORIZED' | 'USER_DISABLED' | 'VALIDATION_ERROR', statusCode: number) {
+export interface DeleteUploadHistoryInput extends ClearUploadedHistoryInput {
+  readonly uploadId: string
+}
+
+function apiError(
+  code: 'UNAUTHORIZED' | 'USER_DISABLED' | 'VALIDATION_ERROR' | 'UPLOAD_NOT_FOUND' | 'UPLOAD_BUSY',
+  statusCode: number,
+) {
   return new ApiError({
     code,
     message: PUBLIC_ERROR_MESSAGES[code],
@@ -125,7 +133,12 @@ function failure(
 }
 
 function historyItem(row: HistoryRepositoryRecord): UploadHistoryResponse['data']['items'][number] {
-  const status = projectPublicStatus(row.uploadStatus, row.mediaStatus)
+  const status = projectPublicStatus(
+    row.uploadStatus,
+    row.mediaStatus,
+    row.confirmedBytes === row.sizeBytes &&
+      ['completing', 'completed', 'failed'].includes(row.uploadStatus),
+  )
   const common = {
     id: row.uploadId,
     mediaId: row.mediaId,
@@ -224,5 +237,22 @@ export class UploadHistoryService {
     })
     assertActiveUser(result.userStatus)
     return { clearedCount: result.clearedCount }
+  }
+
+  async deleteRecord(
+    input: DeleteUploadHistoryInput,
+  ): Promise<DeleteUploadHistoryResponse['data']> {
+    const result = await this.#repository.deleteRecord({
+      userId: input.userId,
+      uploadId: input.uploadId,
+      sessionId: input.sessionId,
+      deletedAt: this.#clock.now(),
+      eventId: this.#ids.next(),
+      context: input.context,
+    })
+    assertActiveUser(result.userStatus)
+    if (!result.found) throw apiError('UPLOAD_NOT_FOUND', 404)
+    if (!result.terminal) throw apiError('UPLOAD_BUSY', 409)
+    return { deleted: true }
   }
 }

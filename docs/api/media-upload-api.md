@@ -3,7 +3,7 @@
 > 文档状态：已确认
 > 版本：v1
 > 日期：2026-07-14
-> 关联文档：[架构设计](../superpowers/specs/2026-07-14-wechat-private-media-upload-design.md) · [数据库设计](../database/media-upload-database.md)
+> 关联文档：[当前上传状态与一致性设计](../design/upload-state-model.md) · [数据库设计](../database/media-upload-database.md)
 
 ## 1. 接口范围
 
@@ -12,7 +12,7 @@
 1. 微信小程序登录与个人资料接口。
 2. 私有素材初始化、分片、完成、取消和上传记录接口。
 
-小程序 API 不提供文件读取、预览、公开链接或删除接口。未来 QNAP NAS 与 R2 的自动同步不属于本 API 范围，不预留同步接口、凭据或状态。
+小程序 API 不提供文件读取、预览或公开链接。“删除上传记录”仅是软隐藏，不删除服务器文件、数据库元数据或 R2 对象。小程序只关心数据是否完整到达业务服务器；Cloudflare R2 交付是服务端内部持久化队列，不是客户端状态。未来 QNAP NAS 的自动同步不属于本 API 范围。
 
 ## 2. 通用约定
 
@@ -119,7 +119,7 @@ Idempotency-Key: 019bfae6-d170-76cc-9df3-c3f1624b789a
 - 同一 Key 和同一规范化请求返回首次稳定结果，并返回 `Idempotency-Replayed: true`。
 - 同一 Key 对应不同请求返回 `409 IDEMPOTENCY_KEY_REUSED`。
 - 首次请求仍执行时返回 `409 IDEMPOTENCY_IN_PROGRESS` 与 `Retry-After: 1`。
-- 对外部存储创建结果未知的初始化请求，账本保持 `in_progress` 并关联内部上传会话；后台对账只有在 R2 事实确定后，才把会话与账本一起收敛为稳定结果，避免同 Key 永久卡住。
+- 初始化只创建服务器本地上传会话和持久化目录，不同步请求 R2。结果不明时，幂等账本与 PostgreSQL 业务记录保持关联，不会因进程重启丢失。
 - 分片接口以 `uploadId + partNumber + chunkSha256` 自然幂等，不要求 Idempotency-Key。
 
 ## 3. 文件与上传限制
@@ -139,7 +139,7 @@ Idempotency-Key: 019bfae6-d170-76cc-9df3-c3f1624b789a
 | 每上传并行分片 | 最多 2 个 |
 | 每用户并行分片 | 最多 4 个 |
 | 每用户未完成上传 | 最多 5 个 |
-| 上传写入期限 | 创建后 24 小时；截止后不接受新分片或新的 complete，已进入 finalizing 的会话先对账而不直接过期 |
+| 上传写入期限 | 创建后 24 小时；截止后不接受新分片或新的 complete，已进入内部交付队列的会话不直接过期 |
 
 ```text
 partCount = ceil(sizeBytes / 8388608)
@@ -166,7 +166,7 @@ partCount = ceil(sizeBytes / 8388608)
 | 方法 | 路径 | 认证 | 说明 |
 |---|---|---|---|
 | GET | `/health/live` | 无 | 进程存活检查 |
-| GET | `/health/ready` | 内网或监控 | PostgreSQL 与 R2 就绪检查 |
+| GET | `/health/ready` | 内网或监控 | PostgreSQL 与服务器持久化上传目录就绪检查 |
 | POST | `/v1/auth/wechat-login` | 无 | 微信 code2Session 登录 |
 | POST | `/v1/auth/refresh` | Refresh Token | 轮换登录令牌 |
 | POST | `/v1/auth/logout` | 用户 JWT | 撤销登录会话 |
@@ -175,6 +175,7 @@ partCount = ceil(sizeBytes / 8388608)
 | POST | `/v1/uploads` | 用户 JWT | 初始化分片上传 |
 | GET | `/v1/uploads` | 用户 JWT | 上传记录列表 |
 | POST | `/v1/uploads/history/clear-uploaded` | 用户 JWT | 软清空已上传记录，不删除对象 |
+| POST | `/v1/uploads/{uploadId}/history/delete` | 用户 JWT | 软隐藏一条终态记录，不删除元数据或文件 |
 | GET | `/v1/uploads/{uploadId}` | 用户 JWT | 获取上传与分片状态 |
 | POST | `/v1/uploads/{uploadId}/parts/{partNumber}` | 用户 JWT | 上传一个分片 |
 | POST | `/v1/uploads/{uploadId}/complete` | 用户 JWT | 提交完成 |
@@ -185,7 +186,7 @@ partCount = ceil(sizeBytes / 8388608)
 ### 4.1 健康检查语义
 
 - `GET /health/live` 只检查进程和事件循环，正常返回 `200 {"status":"ok"}`；不得因 PostgreSQL、微信或 R2 故障而失败。
-- `GET /health/ready` 在 2 秒预算内检查 PostgreSQL 简单查询和 R2 `HeadBucket`，全部正常返回 `200 {"status":"ready"}`，否则返回 `503` 并只列依赖名称与状态，不返回地址或凭据。
+- `GET /health/ready` 在 2 秒预算内检查 PostgreSQL 简单查询，并确认 `UPLOAD_SPOOL_DIR` 可读写。全部正常返回 `200 {"status":"ready"}`，否则返回 `503` 并只列依赖名称与状态。R2 不可用不影响接收能力的 readiness，由队列积压与 finalizer 指标独立告警。
 - `ready` 仅允许内网、负载均衡器或带独立监控认证的来源访问；两个健康接口都不写业务审计事件。
 
 ## 5. 登录与资料接口
@@ -375,9 +376,10 @@ Idempotency-Key: 019bfae6-d170-76cc-9df3-c3f1624b789a
 初始化流程：
 
 1. 检查昵称、文件名、MIME、大小和活跃会话数量。
-2. 先在 PostgreSQL 中创建 `initiating` 媒体/会话并把会话 ID 关联到 `in_progress` 幂等记录，再在事务外创建 R2 multipart。
-3. R2 明确拒绝且确认未创建时，业务记录与幂等记录一起收敛为稳定失败；超时、网络中断或 5xx 导致结果未知时保持 `initiating + in_progress`，由 object key 对账并在事实确定后一起收口。
-4. 成功后返回固定分片计划；R2 multipart upload ID 和 object key 不返回客户端。
+2. 先在 PostgreSQL 中创建 `initiating` 媒体/会话并把会话 ID 关联到 `in_progress` 幂等记录。
+3. 在服务器 `UPLOAD_SPOOL_DIR` 下创建权限为 `0700/0600` 的持久化 multipart 目录和原子 manifest；该过程不访问 R2。
+4. 本地持久化创建成功后，在 PostgreSQL 中把会话改为 `uploading`并稳定结算幂等响应。
+5. 成功后返回固定分片计划；服务器目录、R2 multipart upload ID 和 object key 都不返回客户端。
 
 响应 `201`：
 
@@ -463,7 +465,7 @@ wx.uploadFile({
 - 同 part number 正在处理时返回 `409 PART_UPLOAD_IN_PROGRESS`。
 - 状态进入 `completing` 后不再接受分片。
 - `serverTime >= expiresAt` 时不再接受新分片，返回 `410 UPLOAD_EXPIRED` 并触发安全终止。
-- 服务端将文件字段流式写入 R2 `UploadPart`，不把整个分片转成进程级 Buffer。
+- 服务端将文件字段流式写入持久化本地分片临时文件，不把整个分片转成进程级 Buffer。长度与 SHA-256 校验通过后执行文件 `fsync` + 原子更名 + 目录 `fsync`，之后才在 PostgreSQL 中确认该分片。
 - 首片不足以完成格式签名校验时返回 `422 FILE_TOO_SMALL`；magic bytes 与声明 MIME/扩展名不兼容时返回 `415 MIME_MISMATCH`。两者都持久化 `aborting + abort_reason=validationFailed` 及对应安全 `failure_code`，后台安全终止 multipart 后记录变为 `upload_failed`。SHA-256 或长度不匹配只拒绝并重传当前 part，不终止整个会话。
 
 响应 `200`：
@@ -564,11 +566,11 @@ Authorization: Bearer <access-token>
 }
 ```
 
-活跃会话中，此接口是断点续传的事实来源；客户端只在上传聚合状态为 `uploading` 时重传 `status=pending` 的分片。`uploaded` 和 `verified` 都表示无需重传，`verified` 表示完成前已与 R2 ListParts 复核。
+活跃会话中，此接口是服务器接收进度的事实来源。`status=pending` 表示服务器还没有在 PostgreSQL 中确认该分片；`uploaded` 和 `verified` 都表示服务器已完整接收。小程序不根据 R2 状态决定是否重传。
 
 终态上传摘要和 `uploadId` 长期保留。活跃会话的 `partsAvailableUntil=null`；进入终态时设置为 `terminalAt + 90 days`。截止后 `partDetailsRetained=false`、`partsAvailableUntil` 保持原截止时间且 `parts=[]`，详情与历史记录仍返回 `200`。
 
-客户端按会话独立保存最多 5 条断点元数据，任何文件失败都不得覆盖其他会话的 `uploadId` 或幂等键；冷启动时依次恢复。只有原微信临时路径仍可读取，并且所有已上传分片的本地 SHA-256 与这里返回的哈希逐片匹配，才能继续旧会话。路径失效或任一不匹配时，客户端必须以 `reason=replaced` 中止旧上传，让用户重新选择、二次确认并调用 `POST /v1/uploads` 创建新记录；重新选择的文件不能拼接到旧会话。
+客户端可按会话保存本地临时路径与幂等键，以支持用户明确点击“↻ 重新上传”。小程序冷启动、页面 `onShow`、超时、`429` 或网络错误都不得自动重试上传。原临时路径失效时，手动重试返回固定提示，由用户返回上传页重新选择。
 
 ### 6.4 完成上传
 
@@ -585,7 +587,9 @@ Idempotency-Key: 019bfae7-e281-75bb-aef4-d402735c89ab
 {}
 ```
 
-请求处理器只接受 `serverTime < expiresAt` 的 `uploading` 会话，校验数据库分片连续并把会话持久化为 `completing`。若会话已到期，则在同一短事务中持久化 `aborting + abort_reason=expired + next_abort_at=now` 后返回 `410 UPLOAD_EXPIRED`。持久化后台 finalizer 每秒只扫描 `nextFinalizeAt` 已到期的候选，对 `uploadId` 取得 PostgreSQL session-level advisory lock 后，先 `HEAD` 固定对象键：对象已存在且大小正确时直接补齐数据库，否则依据数据库分片记录执行 `ListParts`、`CompleteMultipartUpload` 与最终 `HEAD`；客户端不提交 ETag 清单。失败次数、错误和下一次执行时间持久化，并以最大 5 分钟 full-jitter 退避。即使 API 进程在返回后退出，其他实例或重启后的扫描也会继续处理。
+请求处理器只接受 `serverTime < expiresAt` 的 `uploading` 会话。它在一个 PostgreSQL 事务中确认：分片编号连续、所有分片都已落盘并写入数据库、`confirmed_size_bytes = expected_size_bytes`；随后把会话持久化为内部 `completing` 队列任务并写入 `next_finalize_at`。该事务提交后，对小程序而言上传已经完成。
+
+后台 finalizer 按 `next_finalize_at` 扫描并取得 PostgreSQL advisory lock，从服务器持久化分片创建/恢复 R2 multipart，逐片交付并执行最终 `HEAD` 验证。队列尝试次数、上次错误和下次执行时间持久化在 PostgreSQL，以最大 5 分钟 full-jitter 退避。这是服务端内部恢复机制，不得转化为小程序自动重试。
 
 正常响应 `202`：
 
@@ -594,14 +598,14 @@ Idempotency-Key: 019bfae7-e281-75bb-aef4-d402735c89ab
   "data": {
     "upload": {
       "id": "019bfae2-9d3c-7a10-89df-8fbd2e073456",
-      "status": "finalizing",
+      "status": "uploaded",
       "progress": {
         "confirmedBytes": 12582913,
         "totalBytes": 12582913,
         "percent": 100
       }
     },
-    "pollAfterSeconds": 2
+    "pollAfterSeconds": null
   },
   "meta": {
     "requestId": "019bfae5-c06f-77dd-8cf2-b2e0513a6789",
@@ -610,9 +614,9 @@ Idempotency-Key: 019bfae7-e281-75bb-aef4-d402735c89ab
 }
 ```
 
-完成后查询状态返回成功终态 `uploaded`。finalizing 时，GET 状态中的 `pollAfterSeconds` 根据下一次 finalizer 时间计算并限制在 2–30 秒；进入任一终态后返回 `pollAfterSeconds=null`，客户端停止轮询。分片不齐返回 `409 PARTS_INCOMPLETE`，`details.missingPartNumbers` 列出缺失片。
+HTTP `202` 表示“服务器已完整接收，后台交付已排队”，不表示客户端还有上传工作。响应直接返回 `status=uploaded` 与 `pollAfterSeconds=null`，小程序清理本地续传状态并停止轮询。分片不齐返回 `409 PARTS_INCOMPLETE`，`details.missingPartNumbers` 列出缺失片。
 
-若 `HEAD` 明确对象不存在、`ListParts` 明确 Complete 尚未成功并发现缺片/不匹配，且仍在写入期限内，finalizer 将受影响分片恢复为 `pending`，清空其已确认字段、重新汇总权威进度，并把会话恢复为 `uploading`。客户端重新上传这些分片；再次满足完成条件时必须生成新的 complete `Idempotency-Key`，因为上一完成周期的 Key 仍稳定重放其首次 `202`。若 `HEAD` 找到对象但大小与预期不符，则标记 `upload_failed` 和 `STORAGE_OBJECT_SIZE_MISMATCH`、写高优先级审计/告警并停止自动处理；系统不得删除该私有对象，也不得在同一 object key 创建第二个 multipart。
+R2 交付失败不将用户已完成的“服务器上传”改回失败。运维侧通过内部 `completing`、`finalize_attempt_count`、`last_finalize_error_code`、`next_finalize_at` 和持久化目录积压监控它；不对小程序公开 R2 失败细节。
 
 ### 6.5 中止上传
 
@@ -631,7 +635,7 @@ Idempotency-Key: 019bfae8-f392-74aa-bf05-e513846d9abc
 }
 ```
 
-`reason` 允许 `userCancelled` 或 `replaced`。仅 `initiating/uploading` 可以中止；该接口只持久化 `aborting` 调度，不在 HTTP 请求内等待 R2。后台 aborter 使用持久化 full-jitter 重试，最大间隔 5 分钟；进程重启后继续。该流程不删除已完成对象。
+`reason` 允许 `userCancelled` 或 `replaced`。仅 `initiating/uploading` 可以中止；该接口只持久化 `aborting` 调度。后台 aborter 删除对应的服务器本地持久化目录；如果内部队列已创建 R2 multipart，再同步终止该 multipart。后台清理可重试，小程序不自动重发上传。
 
 响应 `202` 返回用户聚合状态 `status=cancelling`，最终查询为 `aborted`。已中止记录重复调用返回原结果。
 
@@ -720,11 +724,40 @@ Content-Type: application/json
 
 语义：
 
-- 只处理当前认证用户的 `completed + ready` 成功记录。
+- 只处理当前认证用户已完整到达服务器的记录；内部 R2 交付是否完成不影响可清空性。
 - 操作是幂等的；已经隐藏的记录不会重复计数。
 - 不处理上传中、失败、已取消或已过期记录。
-- 不删除 `media_objects`、R2 对象或分片审计数据，只设置上传会话的历史隐藏时间。
+- 不删除 `media_objects`、`upload_sessions`、`upload_parts`、服务器持久化文件、R2 对象或审计数据，只设置上传会话的历史隐藏时间。
 - 后续 `GET /v1/uploads` 不再返回已隐藏记录，并写入一条仅含清空数量的聚合审计事件。
+
+### 6.8 删除单条上传记录
+
+```http
+POST /v1/uploads/{uploadId}/history/delete
+Authorization: Bearer <access-token>
+Content-Type: application/json
+
+{}
+```
+
+响应 `200`：
+
+```json
+{
+  "data": { "deleted": true },
+  "meta": {
+    "requestId": "019bfae5-c06f-77dd-8cf2-b2e0513a6789",
+    "serverTime": "2026-07-14T09:30:00.000Z"
+  }
+}
+```
+
+语义：
+
+- 只能软隐藏当前用户的终态或已完整到达服务器的记录。
+- 仍在传到服务器的记录返回 `409 UPLOAD_BUSY`；不存在或不属于当前用户返回 `404 UPLOAD_NOT_FOUND`。
+- 重复删除是幂等的，返回 `{ "deleted": true }`。
+- 不删除任何后台元数据或文件；操作写入 `upload.history.deleted` 审计事件。
 
 ## 7. 状态机
 
@@ -732,19 +765,15 @@ Content-Type: application/json
 
 | 当前状态 | 可进入状态 | 触发条件 |
 |---|---|---|
-| `uploading` | `finalizing` | 所有分片已确认并请求 complete |
+| `uploading` | `uploaded` | 所有分片已在服务器落盘、PostgreSQL 已确认并请求 complete |
 | `uploading` | `cancelling` | 用户中止或会话过期并开始清理 |
 | `uploading` | `cancelling` | 首片类型验证不可恢复失败，先安全终止 multipart |
 | `cancelling` | `aborted` | 用户中止清理完成 |
 | `cancelling` | `expired` | 超时会话清理完成 |
 | `cancelling` | `upload_failed` | 类型验证失败的 multipart 清理完成 |
-| `uploading` | `upload_failed` | 文件校验或 R2 分片不可恢复失败 |
-| `finalizing` | `uploaded` | R2 完成并 HEAD 验证成功 |
-| `finalizing` | `uploading` | HEAD 明确对象不存在、ListParts 明确 Complete 未成功、期限内发现缺片；GET 返回需补传的 `pending` 分片 |
-| `finalizing` | `upload_failed` | 对账确认不可恢复失败 |
-| `finalizing` | `cancelling` | HEAD 明确对象不存在、multipart 未完成且写入期限已过 |
+| `uploading` | `upload_failed` | 文件校验或服务器接收不可恢复失败 |
 
-终态：`uploaded`、`upload_failed`、`aborted`、`expired`。其中 `uploaded` 是当前产品范围内的成功终态，对外不再投影任何后续处理状态。
+终态：`uploaded`、`upload_failed`、`aborted`、`expired`。`uploaded` 只表示服务器完整接收，对外不再投影 R2 队列处理状态。`finalizing` 保留在 v1 枚举中用于历史客户端兼容和不一致数据的保守投影，新流程不使用它表达 R2。
 
 ### 7.2 失败对象
 
@@ -771,28 +800,17 @@ Content-Type: application/json
 | complete/abort 获取上传独占门 | 最多 8 秒；超时返回可重试 `409 UPLOAD_BUSY` |
 | 微信 code2Session | 连接 2 秒，总时限 5 秒 |
 | 分片 POST | 请求空闲 30 秒，总时限 180 秒 |
-| R2 UploadPart | 150 秒 |
-| 后台 R2 Complete/HEAD | 单次 30 秒；超时继续对账 |
-| 上传写入期限 | 24 小时；finalizing 不按年龄直接终止 |
+| 本地分片写入 | 跟随分片 POST 的 180 秒总时限 |
+| 后台 R2 UploadPart/Complete/HEAD | 单次 30 秒；超时由服务端队列继续对账 |
+| 上传写入期限 | 24 小时；已进入服务端交付队列的任务不按年龄直接终止 |
 
 普通接口的 10 秒为从收到请求头开始计算的绝对时限。只有精确匹配分片路径且使用 `multipart/form-data` 的请求采用 180 秒总时限；同一路径上的其他 Content-Type 仍按普通时限处理。分片请求若在鉴权、限流、路径参数或表单校验阶段失败，服务端会排空请求体并关闭该 HTTP 连接。
 
-可自动重试：网络错误、`408`、`429`、`502`、`503`、`504`，以及错误体明确标记 `retryable=true` 的响应；`409` 或 `500` 只有在该标志为 true 时重试。使用 full-jitter 指数退避：
+小程序上传请求不自动重试。初始化、分片或 complete 的任意一次请求失败后，当次前台流程终止，保留必要的本地元数据，由用户点击“↻ 重试上传”才创建新尝试。这避免在故障或 `429` 期间由多个文件、分片和前后台恢复共同放大请求量。
 
-```text
-delay = random(0, min(2^retryIndex, 30)) seconds
-```
+例外只有认证传输：`401 TOKEN_EXPIRED` 可由通用会话层刷新 Token；这不等于重新初始化或重传文件分片。`429` 和 `503` 仍返回整数秒 `Retry-After`，用于界面提示和人工操作决策。
 
-`retryIndex` 从 0 开始，只统计首次请求之后的自动重试。
-
-规则：
-
-- 分片最多自动重试 5 次；继续失败时保留 uploadId，稍后恢复。
-- `401 TOKEN_EXPIRED`：先刷新 Token；刷新失败则重新 `wx.login`。
-- 幂等接口重试必须复用原 Idempotency-Key。
-- `complete` 返回 202 后按 `pollAfterSeconds` 查询状态，不能不断使用新 Key 重提。
-- 仅当 finalizer 明确把会话从 `finalizing` 恢复为 `uploading` 并返回新的 `pending` 分片时，补传完成后的提交属于新的完成周期，客户端必须生成新的 complete Key。
-- `429` 和 `503` 返回整数秒 `Retry-After`。
+服务端 R2 交付队列与客户端不同：它使用 PostgreSQL 持久化的尝试次数、错误与下次执行时间做 full-jitter 退避，进程重启后可继续。这些重试不会产生小程序请求。
 
 ## 9. 错误码
 

@@ -46,6 +46,7 @@ function host(user: PublicUser = confirmedUser) {
       selectionError: null,
       draftPicking: false,
       draftSubmitting: false,
+      draftUploadFailed: false,
     } as UploadPageData,
     nicknameFlow,
     setData(data: Partial<UploadPageData & NicknameFlowSnapshot>) {
@@ -319,7 +320,8 @@ describe('upload draft selection and explicit submission', () => {
 
     expect(page.data.selectedFiles).toHaveLength(1)
     expect(page.data.draftSubmitting).toBe(false)
-    expect(page.data.selectionError).toBe('上传任务创建失败，请稍后重试')
+    expect(page.data.selectionError).toBe('上传任务创建失败，请点击重试上传')
+    expect(page.data.draftUploadFailed).toBe(true)
     expect(navigateTo).not.toHaveBeenCalled()
     expect(JSON.stringify(page.data)).not.toMatch(/private expired|source path/u)
   })

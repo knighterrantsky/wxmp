@@ -1,6 +1,7 @@
 export {
   AbortUploadResponseDataSchema,
   ClearUploadedHistoryResponseDataSchema,
+  DeleteUploadHistoryResponseDataSchema,
   CompleteUploadResponseDataSchema,
   ERROR_CODES,
   ErrorEnvelopeSchema,

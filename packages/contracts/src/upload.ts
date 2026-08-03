@@ -227,10 +227,10 @@ export const CompleteUploadRequestSchema = strictObject({})
 export const CompleteUploadResponseDataSchema = strictObject({
   upload: strictObject({
     id: PublicIdSchema,
-    status: Type.Literal('finalizing'),
+    status: Type.Literal('uploaded'),
     progress: SummaryProgressSchema,
   }),
-  pollAfterSeconds: Type.Integer({ minimum: 2, maximum: 30 }),
+  pollAfterSeconds: Type.Null(),
 })
 
 export const CompleteUploadResponseSchema = successEnvelopeSchema(CompleteUploadResponseDataSchema)
@@ -285,6 +285,16 @@ export const ClearUploadedHistoryResponseSchema = successEnvelopeSchema(
   ClearUploadedHistoryResponseDataSchema,
 )
 
+export const DeleteUploadHistoryRequestSchema = strictObject({})
+
+export const DeleteUploadHistoryResponseDataSchema = strictObject({
+  deleted: Type.Literal(true),
+})
+
+export const DeleteUploadHistoryResponseSchema = successEnvelopeSchema(
+  DeleteUploadHistoryResponseDataSchema,
+)
+
 export type InitializeUploadRequest = Static<typeof InitializeUploadRequestSchema>
 export type InitializeUploadResponse = Static<typeof InitializeUploadResponseSchema>
 export type UploadPartResponse = Static<typeof UploadPartResponseSchema>
@@ -297,3 +307,5 @@ export type UploadHistoryQuery = Static<typeof UploadHistoryQuerySchema>
 export type UploadHistoryResponse = Static<typeof UploadHistoryResponseSchema>
 export type ClearUploadedHistoryRequest = Static<typeof ClearUploadedHistoryRequestSchema>
 export type ClearUploadedHistoryResponse = Static<typeof ClearUploadedHistoryResponseSchema>
+export type DeleteUploadHistoryRequest = Static<typeof DeleteUploadHistoryRequestSchema>
+export type DeleteUploadHistoryResponse = Static<typeof DeleteUploadHistoryResponseSchema>

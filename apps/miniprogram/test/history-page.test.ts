@@ -73,11 +73,15 @@ function harness(firstPage = page([historyItem('uploaded')])) {
   const getUpload = vi.fn<HistoryApi['getUpload']>()
   const cancelUpload = vi.fn<HistoryApi['cancel']>().mockResolvedValue(undefined)
   const clearUploaded = vi.fn<HistoryApi['clearUploaded']>().mockResolvedValue(1)
+  const retry = vi.fn<HistoryApi['retry']>().mockResolvedValue(true)
+  const deleteRecord = vi.fn<HistoryApi['deleteRecord']>().mockResolvedValue(undefined)
   const api: HistoryApi = {
     list,
     getUpload,
     cancel: cancelUpload,
     clearUploaded,
+    retry,
+    deleteRecord,
   }
   const scheduled: { callback: () => void; delayMs: number }[] = []
   const schedule: HistorySchedule = (callback, delayMs) => {
@@ -86,7 +90,18 @@ function harness(firstPage = page([historyItem('uploaded')])) {
   }
   const cancel = vi.fn()
   const controller = new HistoryController({ api, schedule, cancel })
-  return { api, list, getUpload, cancelUpload, clearUploaded, scheduled, cancel, controller }
+  return {
+    api,
+    list,
+    getUpload,
+    cancelUpload,
+    clearUploaded,
+    retry,
+    deleteRecord,
+    scheduled,
+    cancel,
+    controller,
+  }
 }
 
 describe('history controller', () => {
@@ -229,7 +244,9 @@ describe('history controller', () => {
 
     await controller.loadFirstPage()
 
-    expect(controller.snapshot().records[0]?.failureMessage).toBe('私有存储暂时不可用，请稍后重试')
+    expect(controller.snapshot().records[0]?.failureMessage).toBe(
+      '服务器暂时无法接收，请稍后手动重试',
+    )
     expect(JSON.stringify(controller.snapshot())).not.toMatch(/raw storage|upstream|mediaId/u)
   })
 
@@ -308,11 +325,40 @@ describe('history controller', () => {
     ])
   })
 
+  it('starts a retry only after an explicit user action', async () => {
+    const fixture = harness(page([historyItem('upload_failed')]))
+    await fixture.controller.loadFirstPage()
+
+    expect(fixture.retry).not.toHaveBeenCalled()
+    await expect(fixture.controller.retryUpload(uploadId)).resolves.toBe(true)
+
+    expect(fixture.retry).toHaveBeenCalledOnce()
+    expect(fixture.retry).toHaveBeenCalledWith(uploadId, 'summer.jpg', 12)
+    expect(fixture.controller.snapshot().records[0]?.retryPending).toBe(false)
+  })
+
+  it('soft-deletes one terminal record from the visible list', async () => {
+    const fixture = harness(page([historyItem('uploaded')]))
+    await fixture.controller.loadFirstPage()
+
+    await expect(fixture.controller.deleteRecord(uploadId)).resolves.toBe(true)
+
+    expect(fixture.deleteRecord).toHaveBeenCalledWith(uploadId, 'summer.jpg', 12)
+    expect(fixture.controller.snapshot().records).toEqual([])
+  })
+
   it('temporarily watches for a newly created record after navigation from upload', async () => {
     const list = vi.fn<HistoryApi['list']>().mockResolvedValue(page([]))
     const scheduled: { callback: () => void; delayMs: number }[] = []
     const controller = new HistoryController({
-      api: { list, getUpload: vi.fn(), cancel: vi.fn(), clearUploaded: vi.fn() },
+      api: {
+        list,
+        getUpload: vi.fn(),
+        cancel: vi.fn(),
+        clearUploaded: vi.fn(),
+        retry: vi.fn(),
+        deleteRecord: vi.fn(),
+      },
       watchForNewUpload: true,
       schedule(callback, delayMs) {
         scheduled.push({ callback, delayMs })
@@ -336,6 +382,8 @@ describe('history controller', () => {
         getUpload: vi.fn(),
         cancel: vi.fn(),
         clearUploaded: vi.fn(),
+        retry: vi.fn(),
+        deleteRecord: vi.fn(),
       },
       watchForNewUpload: true,
       schedule(callback, delayMs) {
@@ -510,7 +558,7 @@ describe('history page privacy contract', () => {
     expect(fixture.cancelUpload).toHaveBeenCalledWith(uploadId)
   })
 
-  it('offers cancellation without preview, download, share, delete, R2 path, or ETag', () => {
+  it('offers cancellation, manual retry, and history deletion without content access or storage internals', () => {
     const wxml = readFileSync(
       new URL('../miniprogram/pages/history/index.wxml', import.meta.url),
       'utf8',
@@ -521,7 +569,9 @@ describe('history page privacy contract', () => {
     expect(wxml).toMatch(/\{\{item\.percent\}\}%/u)
     expect(wxml).toMatch(/bindtap=["']onCancelUpload["']/u)
     expect(wxml).toMatch(/bindtap=["']onClearUploadedHistory["']/u)
+    expect(wxml).toMatch(/bindtap=["']onRetryUpload["']/u)
+    expect(wxml).toMatch(/bindtap=["']onDeleteRecord["']/u)
     expect(wxml).toMatch(/清空已上传记录/u)
-    expect(wxml).not.toMatch(/preview|download|share|delete|objectKey|r2|etag/iu)
+    expect(wxml).not.toMatch(/preview|download|share|objectKey|r2|etag/iu)
   })
 })

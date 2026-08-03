@@ -44,6 +44,7 @@ function historyRecord(
 class InMemoryHistoryRepository implements UploadHistoryRepository {
   readonly calls: Parameters<UploadHistoryRepository['listPage']>[0][] = []
   readonly clearCalls: Parameters<UploadHistoryRepository['clearUploaded']>[0][] = []
+  readonly deleteCalls: Parameters<UploadHistoryRepository['deleteRecord']>[0][] = []
 
   constructor(
     readonly records: readonly TestHistoryRecord[],
@@ -88,6 +89,18 @@ class InMemoryHistoryRepository implements UploadHistoryRepository {
         record.mediaStatus === 'ready',
     ).length
     return Promise.resolve({ userStatus: this.userStatus, clearedCount })
+  }
+
+  deleteRecord(
+    input: Parameters<UploadHistoryRepository['deleteRecord']>[0],
+  ): ReturnType<UploadHistoryRepository['deleteRecord']> {
+    this.deleteCalls.push(input)
+    const found = this.records.some(
+      (record) =>
+        record.uploadId === input.uploadId &&
+        (record.ownerId === undefined || record.ownerId === input.userId),
+    )
+    return Promise.resolve({ userStatus: this.userStatus, found, terminal: found })
   }
 }
 
@@ -348,6 +361,57 @@ describe('UploadHistoryService', () => {
       eventId: '01981c9e-6c80-7000-8000-000000000099',
     })
   })
+
+  it('soft-deletes one terminal record and preserves owner-scoped audit context', async () => {
+    const repository = new InMemoryHistoryRepository([
+      historyRecord('01981c9e-6c80-7000-8000-000000000081', '2026-07-15T03:00:00.000Z', {
+        uploadStatus: 'completed',
+        mediaStatus: 'ready',
+        confirmedBytes: 12_582_913,
+      }),
+    ])
+
+    await expect(
+      service(repository).deleteRecord({
+        userId,
+        uploadId: '01981c9e-6c80-7000-8000-000000000081',
+        sessionId: '01981c9e-6c80-7000-8000-000000000082',
+        context: {
+          requestId: '01981c9e-6c80-7000-8000-000000000083',
+          sourceIp: '127.0.0.1',
+        },
+      }),
+    ).resolves.toEqual({ deleted: true })
+
+    expect(repository.deleteCalls[0]).toMatchObject({
+      userId,
+      uploadId: '01981c9e-6c80-7000-8000-000000000081',
+      deletedAt: now,
+      eventId: '01981c9e-6c80-7000-8000-000000000099',
+    })
+  })
+
+  it('rejects deletion of a nonterminal server upload', async () => {
+    class BusyRepository extends InMemoryHistoryRepository {
+      override deleteRecord(): ReturnType<UploadHistoryRepository['deleteRecord']> {
+        return Promise.resolve({ userStatus: 'active', found: true, terminal: false })
+      }
+    }
+    const repository = new BusyRepository([])
+
+    await expectApiError(
+      service(repository).deleteRecord({
+        userId,
+        uploadId: '01981c9e-6c80-7000-8000-000000000084',
+        sessionId: '01981c9e-6c80-7000-8000-000000000085',
+        context: {
+          requestId: '01981c9e-6c80-7000-8000-000000000086',
+          sourceIp: '127.0.0.1',
+        },
+      }),
+      { code: 'UPLOAD_BUSY', statusCode: 409 },
+    )
+  })
 })
 
 describe('PostgresUploadHistoryRepository', () => {
@@ -440,11 +504,60 @@ describe('PostgresUploadHistoryRepository', () => {
 
     const update = queries.find(({ text }) => text.includes('update media_app.upload_sessions'))
     expect(update?.text).toMatch(/u\.user_id = \$1/u)
-    expect(update?.text).toMatch(/u\.status = 'completed'/u)
-    expect(update?.text).toMatch(/m\.storage_status = 'ready'/u)
+    expect(update?.text).toMatch(/confirmed_size_bytes = u\.expected_size_bytes/u)
+    expect(update?.text).toMatch(/'completing', 'completed', 'failed'/u)
     expect(update?.text).toMatch(/u\.history_hidden_at is null/u)
     const audit = queries.find(({ text }) => text.includes('upload.history.cleared'))
     expect(audit?.values?.at(-1)).toBe('{"clearedCount":2}')
     expect(client.release).toHaveBeenCalledOnce()
+  })
+
+  it('soft-hides one terminal owner-scoped record without deleting metadata', async () => {
+    const queries: { text: string; values?: readonly unknown[] }[] = []
+    const query = vi.fn((text: string, values?: readonly unknown[]) => {
+      queries.push(values === undefined ? { text } : { text, values })
+      if (text.includes('select status from media_app.users')) {
+        return Promise.resolve({ rowCount: 1, rows: [{ status: 'active' }] })
+      }
+      if (text.includes('select status, expected_size_bytes')) {
+        return Promise.resolve({
+          rowCount: 1,
+          rows: [
+            {
+              status: 'completing',
+              expected_size_bytes: '12',
+              confirmed_size_bytes: '12',
+              history_hidden_at: null,
+            },
+          ],
+        })
+      }
+      return Promise.resolve({ rowCount: 1, rows: [] })
+    })
+    const client = { query, release: vi.fn() }
+    const repository = new PostgresUploadHistoryRepository({
+      pool: { connect: vi.fn(() => Promise.resolve(client)) } as never,
+    })
+
+    await expect(
+      repository.deleteRecord({
+        userId,
+        uploadId: '01981c9e-6c80-7000-8000-000000000094',
+        sessionId: '01981c9e-6c80-7000-8000-000000000091',
+        deletedAt: now,
+        eventId: '01981c9e-6c80-7000-8000-000000000092',
+        context: {
+          requestId: '01981c9e-6c80-7000-8000-000000000093',
+          sourceIp: '127.0.0.1',
+        },
+      }),
+    ).resolves.toEqual({ userStatus: 'active', found: true, terminal: true })
+
+    const update = queries.find(({ text }) => text.includes('set history_hidden_at'))
+    expect(update?.text).toMatch(/where id = \$1 and user_id = \$2/u)
+    expect(queries.map(({ text }) => text)).not.toEqual(
+      expect.arrayContaining([expect.stringMatching(/delete from media_app/u)]),
+    )
+    expect(queries.some(({ text }) => text.includes('upload.history.deleted'))).toBe(true)
   })
 })

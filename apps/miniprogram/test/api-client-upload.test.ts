@@ -94,10 +94,10 @@ const detailData: UploadDetailResponse['data'] = {
 const completeData: CompleteUploadResponse['data'] = {
   upload: {
     id: uploadId,
-    status: 'finalizing',
+    status: 'uploaded',
     progress: { confirmedBytes: 12, totalBytes: 12, percent: 100 },
   },
-  pollAfterSeconds: 2,
+  pollAfterSeconds: null,
 }
 
 const abortData: AbortUploadResponse['data'] = {

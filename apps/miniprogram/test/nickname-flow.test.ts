@@ -178,6 +178,7 @@ describe('explicit WeChat nickname privacy authorization', () => {
         selectionError: null,
         draftPicking: false,
         draftSubmitting: false,
+        draftUploadFailed: false,
       } as UploadPageData,
       nicknameFlow: controller,
       setData(data: Partial<UploadPageData & NicknameFlowSnapshot>) {
@@ -371,6 +372,7 @@ describe('nickname page contract', () => {
         selectionError: null,
         draftPicking: false,
         draftSubmitting: false,
+        draftUploadFailed: false,
       } as UploadPageData,
       nicknameFlow: controller,
       nicknameInteracted: false,

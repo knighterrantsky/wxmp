@@ -1,6 +1,7 @@
 import {
   AbortUploadResponseDataSchema,
   ClearUploadedHistoryResponseDataSchema,
+  DeleteUploadHistoryResponseDataSchema,
   CompleteUploadResponseDataSchema,
   ErrorEnvelopeSchema,
   InitializeUploadResponseDataSchema,
@@ -17,6 +18,7 @@ import {
   type AbortUploadRequest,
   type AbortUploadResponse,
   type ClearUploadedHistoryResponse,
+  type DeleteUploadHistoryResponse,
   type ApiError,
   type CompleteUploadResponse,
   type ErrorCode,
@@ -222,6 +224,11 @@ function decodeClearUploadedHistoryData(value: unknown): ClearUploadedHistoryRes
   return value
 }
 
+function decodeDeleteUploadHistoryData(value: unknown): DeleteUploadHistoryResponse['data'] {
+  if (!matchesSchema(DeleteUploadHistoryResponseDataSchema, value)) throw invalidResponseError()
+  return value
+}
+
 function decodeUploadHistoryEnvelope(value: unknown): UploadHistoryPage {
   if (
     !isRecord(value) ||
@@ -380,6 +387,22 @@ export class ApiClient implements AuthenticationApi {
         path: '/v1/uploads/history/clear-uploaded',
         data: {},
         decode: decodeClearUploadedHistoryData,
+      },
+      session,
+    )
+  }
+
+  deleteUploadHistory(
+    uploadId: string,
+    session: AuthorizedSession,
+  ): Promise<DeleteUploadHistoryResponse['data']> {
+    assertUuidV7(uploadId, 'uploadId')
+    return this.authorizedRequest<DeleteUploadHistoryResponse['data']>(
+      {
+        method: 'POST',
+        path: `/v1/uploads/${uploadId}/history/delete`,
+        data: {},
+        decode: decodeDeleteUploadHistoryData,
       },
       session,
     )

@@ -1,5 +1,3 @@
-import { MAX_UPLOAD_RETRIES, retryWithFullJitter, shouldRetryUploadFailure } from '../core/retry.js'
-
 export type CompletionRunnerResult = 'finalizing' | 'uploaded'
 
 export type CompletionRunnerResumeOutcome =
@@ -53,8 +51,6 @@ type DecodedResumeOutcome =
   | { readonly action: 'replace' }
   | { readonly action: 'completed'; readonly result: CompletionRunnerResult }
 
-const RESTORE_RETRY_DELAY_MS = 5_000
-
 type PollResumeResult =
   { readonly exhausted: true } | { readonly exhausted: false; readonly value: unknown }
 
@@ -88,9 +84,6 @@ function defaultSleep(delayMs: number): Promise<void> {
 export class CompletionController<TFile extends { readonly fileName: string }> {
   readonly #runner: CompletionRunner<TFile>
   readonly #sleep: (delayMs: number) => Promise<void>
-  readonly #backoff: ((delayMs: number) => Promise<void>) | undefined
-  readonly #random: (() => number) | undefined
-  readonly #shouldRetry: (error: unknown) => boolean
   #busy = false
   #backgrounded = false
   #pauseGeneration = 0
@@ -100,9 +93,6 @@ export class CompletionController<TFile extends { readonly fileName: string }> {
   constructor(options: CompletionControllerOptions<TFile>) {
     this.#runner = options.runner
     this.#sleep = options.sleep ?? defaultSleep
-    this.#backoff = options.backoff
-    this.#random = options.random
-    this.#shouldRetry = options.shouldRetry ?? shouldRetryUploadFailure
   }
 
   async run(file: Readonly<TFile>): Promise<'uploaded'> {
@@ -251,24 +241,10 @@ export class CompletionController<TFile extends { readonly fileName: string }> {
   }
 
   async #resumeWithRetries(): Promise<unknown> {
-    let attempts = 0
     try {
-      return await retryWithFullJitter(
-        async () => {
-          await this.#waitUntilForeground()
-          attempts += 1
-          return await this.#runner.resume()
-        },
-        {
-          sleep: this.#backoff,
-          random: this.#random,
-          shouldRetry: (error) => this.#safelyShouldRetry(error),
-        },
-      )
-    } catch (error) {
-      if (attempts === MAX_UPLOAD_RETRIES + 1 && this.#safelyShouldRetry(error)) {
-        throw new CompletionControllerError('POLL_RETRY_EXHAUSTED')
-      }
+      await this.#waitUntilForeground()
+      return await this.#runner.resume()
+    } catch {
       throw new CompletionControllerError('RUNNER_FAILED')
     }
   }
@@ -287,35 +263,9 @@ export class CompletionController<TFile extends { readonly fileName: string }> {
   }
 
   async #resumeInitialRestore(): Promise<unknown> {
-    for (;;) {
-      try {
-        const value = await this.#resumeWithRetries()
-        await this.#waitUntilForeground()
-        return value
-      } catch (error) {
-        if (
-          !(error instanceof CompletionControllerError) ||
-          error.code !== 'POLL_RETRY_EXHAUSTED'
-        ) {
-          throw error
-        }
-      }
-      await this.#waitUntilForeground()
-      try {
-        await this.#sleep(RESTORE_RETRY_DELAY_MS)
-      } catch {
-        throw new CompletionControllerError('POLL_DELAY_FAILED')
-      }
-      await this.#waitUntilForeground()
-    }
-  }
-
-  #safelyShouldRetry(error: unknown): boolean {
-    try {
-      return this.#shouldRetry(error)
-    } catch {
-      return false
-    }
+    const value = await this.#resumeWithRetries()
+    await this.#waitUntilForeground()
+    return value
   }
 
   async #waitUntilForeground(): Promise<void> {

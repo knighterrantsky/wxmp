@@ -1,4 +1,7 @@
 import { generateKeyPairSync } from 'node:crypto'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { DeleteObjectCommand } from '@aws-sdk/client-s3'
 import type { FastifyInstance } from 'fastify'
@@ -19,6 +22,7 @@ import {
   R2ObjectStorage,
   type R2ObjectStorageConfig,
 } from '../../src/uploads/r2-object-storage.js'
+import { LocalUploadSpool, QueuedR2ObjectStorage } from '../../src/uploads/queued-object-storage.js'
 import { PostgresUploadConcurrency } from '../../src/uploads/upload-concurrency.js'
 import { loadDestructiveDatabaseTestConfig } from './destructive-database.js'
 
@@ -110,6 +114,7 @@ export async function startLocalPrivateUploadHarness(
   let runtimePool: Pool | undefined
   let lockClient: PoolClient | undefined
   let app: FastifyInstance | undefined
+  let spoolDirectory: string | undefined
   const cleanupClient = createR2S3Client(r2Config)
 
   try {
@@ -130,8 +135,14 @@ export async function startLocalPrivateUploadHarness(
       max: 12,
       applicationName: `wx-${label}-runtime`.slice(0, 63),
     })
-    const storage = new R2ObjectStorage(r2Config)
-    if (!(await storage.ready())) throw new Error('Local MinIO test bucket is not ready')
+    const remoteStorage = new R2ObjectStorage(r2Config)
+    if (!(await remoteStorage.ready())) throw new Error('Local MinIO test bucket is not ready')
+    spoolDirectory = await mkdtemp(join(tmpdir(), 'wx-upload-e2e-spool-'))
+    const uploadSpool = new LocalUploadSpool({ rootDirectory: spoolDirectory })
+    const queuedStorage = new QueuedR2ObjectStorage({
+      spool: uploadSpool,
+      remote: remoteStorage,
+    })
 
     const ids = createSecureIdGenerator(systemClock)
     const pair = generateKeyPairSync('ed25519')
@@ -151,7 +162,7 @@ export async function startLocalPrivateUploadHarness(
           await runtimePool?.query('select 1')
           return !signal.aborted
         },
-        objectStorage: (signal) => storage.ready(signal),
+        objectStorage: (signal) => uploadSpool.ready(signal),
       },
       clock: systemClock,
       ids,
@@ -162,14 +173,14 @@ export async function startLocalPrivateUploadHarness(
       wechatAppId: 'wx-local-e2e-app',
       wechatGateway: new WechatStubGateway(),
       tokenService,
-      objectStorage: storage,
+      objectStorage: uploadSpool,
       objectStorageBucket: r2Config.bucket,
       cursorSigningSecret: Buffer.alloc(32, 0x5a),
       uploadConcurrency: concurrency,
     })
     const finalizer = new Finalizer({
       pool: runtimePool,
-      storage,
+      storage: queuedStorage,
       concurrency,
       clock: systemClock,
       ids,
@@ -180,6 +191,7 @@ export async function startLocalPrivateUploadHarness(
     const runningMigrationPool = migrationPool
     const runningRuntimePool = runtimePool
     const runningLockClient = lockClient
+    const runningSpoolDirectory = spoolDirectory
     let closed = false
 
     return {
@@ -211,13 +223,16 @@ export async function startLocalPrivateUploadHarness(
           cleanupFailed = true
         }
         for (const row of storedRows) {
-          await storage
-            .abortMultipart({
-              bucket: row.r2_bucket,
-              key: row.object_key,
-              uploadId: row.r2_upload_id,
-            })
-            .catch(() => undefined)
+          const remoteState = await uploadSpool.remoteState(row.r2_upload_id).catch(() => undefined)
+          if (remoteState !== undefined) {
+            await remoteStorage
+              .abortMultipart({
+                bucket: row.r2_bucket,
+                key: row.object_key,
+                uploadId: remoteState.uploadId,
+              })
+              .catch(() => undefined)
+          }
           try {
             await cleanupClient.send(
               new DeleteObjectCommand({ Bucket: row.r2_bucket, Key: row.object_key }),
@@ -226,6 +241,9 @@ export async function startLocalPrivateUploadHarness(
             cleanupFailed = true
           }
         }
+        await rm(runningSpoolDirectory, { recursive: true, force: true }).catch(() => {
+          cleanupFailed = true
+        })
         try {
           await runningMigrationPool.query(TRUNCATE_TEST_DATA)
         } catch {
@@ -240,6 +258,9 @@ export async function startLocalPrivateUploadHarness(
   } catch (error) {
     await app?.close().catch(() => undefined)
     cleanupClient.destroy()
+    if (spoolDirectory !== undefined) {
+      await rm(spoolDirectory, { recursive: true, force: true }).catch(() => undefined)
+    }
     await releaseLock(lockClient)
     await closePools([runtimePool, migrationPool])
     throw error

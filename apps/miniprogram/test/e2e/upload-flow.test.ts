@@ -277,9 +277,8 @@ describe('mini-program upload flow against the listening local API', () => {
         failureMessage: null,
       }),
     ])
-    expect(statuses).toEqual(
-      expect.arrayContaining(['initializing', 'uploading', 'finalizing', 'uploaded']),
-    )
+    expect(statuses).toEqual(expect.arrayContaining(['initializing', 'uploading', 'uploaded']))
+    expect(statuses).not.toContain('finalizing')
     expect(progress).toContain(100)
     expect([...memory.files.keys()]).toEqual([SOURCE_PATH])
 

@@ -13,7 +13,7 @@ export function statusCopy(status: PublicUploadStatus): PublicStatusCopy {
     case 'uploading':
       return { label: '上传中', tone: 'progress', terminal: false }
     case 'finalizing':
-      return { label: '正在写入私有存储', tone: 'progress', terminal: false }
+      return { label: '服务器处理中', tone: 'progress', terminal: false }
     case 'cancelling':
       return { label: '正在取消', tone: 'warning', terminal: false }
     case 'uploaded':

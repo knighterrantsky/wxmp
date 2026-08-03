@@ -112,6 +112,24 @@ describe('ApiClient upload history', () => {
     })
   })
 
+  it('soft-deletes one upload history record with an authenticated request', async () => {
+    const { client, request, session } = fixture()
+    request.mockResolvedValueOnce(response(200, { data: { deleted: true }, meta: responseMeta }))
+
+    await expect(
+      client.deleteUploadHistory('01981d0c-ec80-7000-8000-000000000103', session),
+    ).resolves.toEqual({ deleted: true })
+    expect(request).toHaveBeenCalledWith({
+      method: 'POST',
+      url: 'https://api.example.com/v1/uploads/01981d0c-ec80-7000-8000-000000000103/history/delete',
+      headers: {
+        authorization: 'Bearer access-old',
+        'content-type': 'application/json',
+      },
+      data: {},
+    })
+  })
+
   it('loads the first page and preserves its pagination cursor', async () => {
     const { client, request, session } = fixture()
 

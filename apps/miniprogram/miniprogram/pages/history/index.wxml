@@ -1,7 +1,7 @@
 <view class="history-shell">
   <view class="history-header">
     <text class="history-title">上传记录</text>
-    <text class="history-subtitle">这里只展示你自己的私密素材写入状态，不提供内容访问入口。</text>
+    <text class="history-subtitle">这里只展示素材传到服务器的状态。</text>
   </view>
 
   <view class="history-toolbar" wx:if="{{records.length}}">
@@ -47,10 +47,34 @@
         <view class="history-progress-fill" style="width: {{item.percent}}%;"></view>
       </view>
       <view class="progress-row" wx:if="{{!item.terminal}}">
-        <text>上传进度</text>
+        <text>传到服务器</text>
         <text>{{item.percent}}%</text>
       </view>
       <text class="failure-copy" wx:if="{{item.failureMessage}}">{{item.failureMessage}}</text>
+      <view class="record-actions" wx:if="{{item.terminal}}">
+        <button
+          wx:if="{{item.retryable || item.retryPending}}"
+          class="retry-upload-button"
+          aria-label="重新上传 {{item.fileName}}"
+          data-upload-id="{{item.id}}"
+          bindtap="onRetryUpload"
+          loading="{{item.retryPending}}"
+          disabled="{{item.retryPending}}"
+        >
+          {{item.retryPending ? '重试中' : '↻ 重新上传'}}
+        </button>
+        <button
+          wx:if="{{item.deletable || item.deletePending}}"
+          class="delete-record-button"
+          aria-label="删除记录 {{item.fileName}}"
+          data-upload-id="{{item.id}}"
+          bindtap="onDeleteRecord"
+          loading="{{item.deletePending}}"
+          disabled="{{item.deletePending}}"
+        >
+          删除记录
+        </button>
+      </view>
       <text class="time-copy">创建于 {{item.createdAtLabel}} · 更新于 {{item.updatedAtLabel}}</text>
     </view>
   </view>

@@ -23,11 +23,9 @@ import {
   MediaUploadService,
   type MediaUploadRunnerListeners,
   type MediaUploadUiEvent,
-  type MediaUploadUiStatus,
 } from './services/media-upload-service.js'
 import { SessionStore } from './services/session-store.js'
 import { createUploadResumeRegistry } from './services/upload-resume-registry.js'
-import { UploadRestoreCoordinator } from './services/upload-restore-coordinator.js'
 import { UploadRunner, type UploadRunnerResumeMetadata } from './services/upload-runner.js'
 
 const INSTALLATION_ID_STORAGE_KEY = 'installationId'
@@ -42,15 +40,9 @@ interface ApplicationServices {
 
 interface ApplicationUploadServices {
   readonly mediaUpload: MediaUploadService
-  readonly restoreCoordinator: UploadRestoreCoordinator
-  readonly retainedSessionCount: () => number
   readonly retainedKeys: () => readonly string[]
-  readonly hasRetainedKeys: (keys: ReadonlySet<string>) => boolean
-}
-
-interface PendingRecoveryUpdates {
-  readonly retainedKeys: Set<string>
-  readonly listener: (event: MediaUploadUiEvent) => void
+  readonly retainedRecord: (key: string) => UploadRunnerResumeMetadata | undefined
+  readonly removeRetained: (key: string) => void
 }
 
 export interface ApplicationProfileApi {
@@ -71,6 +63,8 @@ export interface ApplicationHistoryApi {
   getUpload(uploadId: string): Promise<UploadDetailResponse['data']>
   cancel(uploadId: string): Promise<void>
   clearUploaded(): Promise<number>
+  retry(uploadId: string, fileName: string, sizeBytes: number): Promise<boolean>
+  deleteRecord(uploadId: string, fileName: string, sizeBytes: number): Promise<void>
 }
 
 export interface ApplicationGlobalData {
@@ -105,12 +99,10 @@ interface WechatUploadCapabilities {
 
 let servicesPromise: Promise<ApplicationServices> | undefined
 let uploadServicesPromise: Promise<ApplicationUploadServices> | undefined
-let coldRestorePromise: Promise<void> | undefined
 let foregroundPromise: Promise<void> | undefined
 let uploadBatchActive = false
 let applicationHidden = false
 let applicationPauseGeneration = 0
-let pendingRecoveryUpdates: PendingRecoveryUpdates | undefined
 
 interface UploadBatchHandle {
   readonly completion: Promise<void>
@@ -232,70 +224,6 @@ async function sourceIsReadable(
   }
 }
 
-function publicRecoveryStatus(value: string): MediaUploadUiStatus | undefined {
-  switch (value) {
-    case 'initializing':
-    case 'uploading':
-      return 'uploading'
-    case 'resuming':
-      return undefined
-    case 'paused':
-    case 'finalizing':
-    case 'uploaded':
-    case 'failed':
-      return value
-    case 'replace-required':
-      return 'failed'
-    default:
-      return undefined
-  }
-}
-
-function recoveryListeners(
-  retainedKey: string,
-  metadata: UploadRunnerResumeMetadata | undefined,
-): MediaUploadRunnerListeners | undefined {
-  const recovery = pendingRecoveryUpdates
-  if (metadata === undefined || !recovery?.retainedKeys.has(retainedKey)) {
-    return undefined
-  }
-
-  const sourcePath = metadata.file.sourcePath
-  const sizeBytes = metadata.file.sizeBytes
-  let bytes = Math.min(sizeBytes, Math.max(0, metadata.confirmedBytes))
-  let percent = sizeBytes === 0 ? 0 : Math.min(100, Math.max(0, (bytes / sizeBytes) * 100))
-  let status: MediaUploadUiStatus = metadata.phase === 'finalizing' ? 'finalizing' : 'uploading'
-
-  const publish = (): void => {
-    try {
-      recovery.listener(Object.freeze({ sourcePath, status, bytes, percent }))
-    } catch {
-      // A stale page callback must not interrupt retained-session recovery.
-    }
-  }
-
-  return {
-    onProgress(event) {
-      if (Number.isFinite(event.bytes)) {
-        bytes = Math.max(bytes, Math.min(sizeBytes, Math.max(0, event.bytes)))
-      }
-      if (Number.isFinite(event.percent)) {
-        percent = Math.max(percent, Math.min(100, Math.max(0, event.percent)))
-      }
-      publish()
-    },
-    onStatus(event) {
-      const next = publicRecoveryStatus(event.status)
-      if (next !== undefined) status = next
-      if (status === 'finalizing' || status === 'uploaded') {
-        bytes = sizeBytes
-        percent = 100
-      }
-      publish()
-    },
-  }
-}
-
 function applicationUploadServices(): Promise<ApplicationUploadServices> {
   if (uploadServicesPromise === undefined) {
     const pending = (async () => {
@@ -369,33 +297,15 @@ function applicationUploadServices(): Promise<ApplicationUploadServices> {
         source,
         runnerFactory: (listeners, options) =>
           controller(listeners, undefined, options?.maxParallelParts),
-        unfinishedServerSessionCount: () => resumeRegistry.count(),
-      })
-
-      const restoreCoordinator = new UploadRestoreCoordinator({
-        retainedKeys: () => resumeRegistry.keys(),
-        controllerFor: (retainedKey) => {
-          const listeners = recoveryListeners(retainedKey, resumeRegistry.record(retainedKey))
-          const retainedController = controller(listeners, retainedKey)
-          return {
-            async restore() {
-              const outcome = await retainedController.restore()
-              if (outcome !== 'uploaded') listeners?.onStatus({ status: 'failed' })
-              return outcome
-            },
-            pause: () => retainedController.pause(),
-            foreground: () => retainedController.foreground(),
-          }
-        },
       })
 
       return {
         mediaUpload,
-        restoreCoordinator,
-        retainedSessionCount: () => resumeRegistry.count(),
         retainedKeys: () => resumeRegistry.keys(),
-        hasRetainedKeys: (keys: ReadonlySet<string>) =>
-          resumeRegistry.keys().some((key) => keys.has(key)),
+        retainedRecord: (key: string) => resumeRegistry.record(key),
+        removeRetained: (key: string) => {
+          resumeRegistry.remove(key)
+        },
       }
     })()
     uploadServicesPromise = pending
@@ -408,48 +318,9 @@ function applicationUploadServices(): Promise<ApplicationUploadServices> {
   return uploadServicesPromise
 }
 
-function beginColdRestore(): void {
-  if (coldRestorePromise !== undefined || uploadBatchActive) return
-  const recoveryUpdates = pendingRecoveryUpdates
-  let keepRecoveryUpdates = false
-  const pending = (async () => {
-    const selectedServicesPromise = applicationUploadServices()
-    const services = await selectedServicesPromise
-    try {
-      const retainedBeforeRestore = services.retainedSessionCount()
-      if (applicationHidden) await services.restoreCoordinator.pause()
-      const restored = await services.restoreCoordinator.restoreAll()
-      if (
-        retainedBeforeRestore > 0 &&
-        restored === retainedBeforeRestore &&
-        services.retainedSessionCount() === 0 &&
-        uploadServicesPromise === selectedServicesPromise
-      ) {
-        uploadServicesPromise = undefined
-      }
-    } finally {
-      keepRecoveryUpdates =
-        recoveryUpdates !== undefined && services.hasRetainedKeys(recoveryUpdates.retainedKeys)
-    }
-  })()
-  coldRestorePromise = pending
-  void pending
-    .finally(() => {
-      if (coldRestorePromise === pending) coldRestorePromise = undefined
-      if (!keepRecoveryUpdates && pendingRecoveryUpdates === recoveryUpdates) {
-        pendingRecoveryUpdates = undefined
-      }
-    })
-    .catch(() => undefined)
-}
-
 function pauseUploads(): Promise<void> {
   return applicationUploadServices().then(async (services) => {
-    if (uploadBatchActive) {
-      await services.mediaUpload.pause()
-    } else if (coldRestorePromise !== undefined) {
-      await services.restoreCoordinator.pause()
-    }
+    if (uploadBatchActive) await services.mediaUpload.pause()
   })
 }
 
@@ -461,11 +332,7 @@ function foregroundUploads(): Promise<void> {
       await services.mediaUpload.foreground()
       return
     }
-    if (coldRestorePromise !== undefined) {
-      await services.restoreCoordinator.foreground()
-      return
-    }
-    beginColdRestore()
+    return
   })
   foregroundPromise = pending
   void pending
@@ -483,44 +350,45 @@ async function dispatchUploadBatch(
   files: readonly ValidatedMedia[],
   onUpdate: (event: MediaUploadUiEvent) => void,
 ): Promise<UploadBatchHandle> {
-  const retainedRecoveryPending = (pendingRecoveryUpdates?.retainedKeys.size ?? 0) > 0
-  if (uploadBatchActive || coldRestorePromise !== undefined || retainedRecoveryPending) {
-    if (!uploadBatchActive && coldRestorePromise === undefined && retainedRecoveryPending) {
-      beginColdRestore()
-    }
-    throw new ApplicationUploadBusyError()
-  }
-
-  const recoveryUpdates: PendingRecoveryUpdates = {
-    retainedKeys: new Set(),
-    listener: onUpdate,
-  }
-  pendingRecoveryUpdates = recoveryUpdates
+  if (uploadBatchActive) throw new ApplicationUploadBusyError()
   uploadBatchActive = true
   let services: ApplicationUploadServices
-  let retainedBefore: Set<string>
   let mediaBatch: Awaited<ReturnType<ApplicationUploadServices['mediaUpload']['begin']>>
   try {
     services = await applicationUploadServices()
-    retainedBefore = new Set(services.retainedKeys())
     mediaBatch = await services.mediaUpload.begin(files, onUpdate)
   } catch (error) {
     uploadBatchActive = false
-    if (pendingRecoveryUpdates === recoveryUpdates) pendingRecoveryUpdates = undefined
-    beginColdRestore()
     throw error
   }
 
   const completion = mediaBatch.completion.finally(() => {
-    if (pendingRecoveryUpdates === recoveryUpdates) {
-      for (const retainedKey of services.retainedKeys()) {
-        if (!retainedBefore.has(retainedKey)) recoveryUpdates.retainedKeys.add(retainedKey)
-      }
-    }
     uploadBatchActive = false
-    beginColdRestore()
   })
   return Object.freeze({ completion })
+}
+
+function retainedUploadFor(
+  services: ApplicationUploadServices,
+  uploadId: string,
+  fileName: string,
+  sizeBytes: number,
+): { key: string; metadata: UploadRunnerResumeMetadata } | undefined {
+  const records = services.retainedKeys().map((key) => ({
+    key,
+    metadata: services.retainedRecord(key),
+  }))
+  const exact = records.find((entry) => entry.metadata?.uploadId === uploadId)
+  const fallback = [...records]
+    .reverse()
+    .find(
+      (entry) =>
+        entry.metadata?.file.fileName === fileName && entry.metadata.file.sizeBytes === sizeBytes,
+    )
+  const selected = exact ?? fallback
+  return selected?.metadata === undefined
+    ? undefined
+    : { key: selected.key, metadata: selected.metadata }
 }
 
 const globalData: ApplicationGlobalData = {
@@ -571,6 +439,32 @@ const globalData: ApplicationGlobalData = {
       const { api, session } = await applicationServices()
       const result = await api.clearUploadedHistory(session)
       return result.clearedCount
+    },
+
+    async retry(uploadId, fileName, sizeBytes) {
+      const services = await applicationUploadServices()
+      const retained = retainedUploadFor(services, uploadId, fileName, sizeBytes)
+      if (retained === undefined) return false
+      const file: ValidatedMedia = {
+        ...retained.metadata.file,
+        previewPath: retained.metadata.file.sourcePath,
+      }
+      try {
+        const handle = await dispatchUploadBatch([file], () => undefined)
+        services.removeRetained(retained.key)
+        void handle.completion.catch(() => undefined)
+        return true
+      } catch {
+        return false
+      }
+    },
+
+    async deleteRecord(uploadId, fileName, sizeBytes) {
+      const { api, session } = await applicationServices()
+      await api.deleteUploadHistory(uploadId, session)
+      const services = await applicationUploadServices()
+      const retained = retainedUploadFor(services, uploadId, fileName, sizeBytes)
+      if (retained !== undefined) services.removeRetained(retained.key)
     },
   },
 

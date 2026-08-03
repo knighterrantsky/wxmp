@@ -171,7 +171,7 @@ function postComplete(app: ReturnType<typeof buildAppShell>, key = completeKey) 
 }
 
 describe('POST /v1/uploads/:uploadId/complete', () => {
-  it('persists finalizing before returning 202 and never completes R2 in the request', async () => {
+  it('persists the internal delivery job before returning uploaded and never completes R2 in the request', async () => {
     await seedReadyForComplete()
     const fixture = fixtureApp()
 
@@ -182,14 +182,14 @@ describe('POST /v1/uploads/:uploadId/complete', () => {
       data: {
         upload: {
           id: uploadFixtureId,
-          status: 'finalizing',
+          status: 'uploaded',
           progress: {
             confirmedBytes: PART_SIZE_BYTES + 16,
             totalBytes: PART_SIZE_BYTES + 16,
             percent: 100,
           },
         },
-        pollAfterSeconds: 2,
+        pollAfterSeconds: null,
       },
     })
     const state = await migrationPool.query<{
@@ -451,7 +451,7 @@ describe('Finalizer.runOnce', () => {
     expect(await lifecycleState()).toMatchObject({ status: 'completed', media_status: 'ready' })
   })
 
-  it('returns a pre-expiry mismatch to uploading and resets only affected confirmations', async () => {
+  it('keeps server-confirmed metadata and retries an internal manifest mismatch', async () => {
     await seedCompleting()
     const storage = storageFixture()
     vi.mocked(storage.headObject).mockResolvedValue(null)
@@ -461,10 +461,10 @@ describe('Finalizer.runOnce', () => {
     await fixture.finalizer.runOnce(10)
 
     expect(await lifecycleState()).toMatchObject({
-      status: 'uploading',
-      confirmed_size_bytes: String(PART_SIZE_BYTES),
-      confirmed_part_count: 1,
-      next_finalize_at: null,
+      status: 'completing',
+      confirmed_size_bytes: String(PART_SIZE_BYTES + 16),
+      confirmed_part_count: 2,
+      next_finalize_at: new Date(uploadFixtureNow.getTime() + 500),
     })
     const parts = await migrationPool.query<{
       actual_size_bytes: number | null
@@ -482,11 +482,12 @@ describe('Finalizer.runOnce', () => {
         actual_size_bytes: PART_SIZE_BYTES,
         r2_etag: 'private-part-etag-1',
       },
-      { status: 'pending', actual_size_bytes: null, r2_etag: null },
+      { status: 'uploaded', actual_size_bytes: 16, r2_etag: 'private-part-etag-2' },
     ])
+    expect(fixture.criticalReconciliation).toHaveBeenCalledWith('STORAGE_UNAVAILABLE')
   })
 
-  it('schedules abort when the multipart manifest mismatch is known at expiry', async () => {
+  it('does not expire or erase a server-confirmed upload during delivery mismatch', async () => {
     await seedCompleting({ expiresAt: uploadFixtureNow })
     const storage = storageFixture()
     vi.mocked(storage.headObject).mockResolvedValue(null)
@@ -496,11 +497,14 @@ describe('Finalizer.runOnce', () => {
     await fixture.finalizer.runOnce(10)
 
     expect(await lifecycleState()).toMatchObject({
-      status: 'aborting',
-      abort_reason: 'expired',
-      next_abort_at: uploadFixtureNow,
-      next_finalize_at: null,
+      status: 'completing',
+      abort_reason: null,
+      confirmed_size_bytes: String(PART_SIZE_BYTES + 16),
+      confirmed_part_count: 2,
+      next_abort_at: null,
+      next_finalize_at: new Date(uploadFixtureNow.getTime() + 500),
     })
+    expect(fixture.criticalReconciliation).toHaveBeenCalledWith('STORAGE_UNAVAILABLE')
   })
 
   it('fails and alerts without deleting an object whose HEAD size is wrong', async () => {

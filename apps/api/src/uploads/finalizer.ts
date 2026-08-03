@@ -27,7 +27,6 @@ interface FinalizerRow {
   r2_upload_id: string
   expected_size_bytes: string
   expected_part_count: number
-  expires_at: Date | string
   finalize_attempt_count: number
   media_status: string
   r2_bucket: string
@@ -58,10 +57,6 @@ export interface FinalizerRunResult {
   repaired: number
   retried: number
   succeeded: number
-}
-
-function asDate(value: Date | string): Date {
-  return value instanceof Date ? value : new Date(value)
 }
 
 function rollback(client: PoolClient): Promise<void> {
@@ -257,11 +252,11 @@ export class Finalizer {
 
     const mismatched = this.#mismatchedParts(work, r2Parts)
     if (mismatched.length > 0) {
-      const changed =
-        this.#clock.now().getTime() >= asDate(work.row.expires_at).getTime()
-          ? await this.#scheduleExpiredAbort(work)
-          : await this.#repairParts(work, mismatched)
-      return changed ? 'repaired' : 'ignored'
+      // Crossing the complete boundary means the business server has durably
+      // accepted every byte. An internal delivery mismatch must not erase that
+      // fact or send the session back to the client for another upload.
+      this.#alerts.criticalReconciliation('STORAGE_UNAVAILABLE')
+      return (await this.#scheduleRetry(work, 'PROTOCOL_ERROR')) ? 'retried' : 'ignored'
     }
 
     let completionEtag: string | undefined
@@ -314,7 +309,7 @@ export class Finalizer {
     const selected = await this.#pool.query<FinalizerRow>(
       `select u.id as upload_id, u.media_object_id as media_id, u.user_id, u.status,
               u.row_version::text, u.r2_upload_id, u.expected_size_bytes::text,
-              u.expected_part_count, u.expires_at, u.finalize_attempt_count,
+              u.expected_part_count, u.finalize_attempt_count,
               m.storage_status as media_status, m.r2_bucket, m.object_key,
               m.declared_content_type
          from media_app.upload_sessions u
@@ -442,75 +437,6 @@ export class Finalizer {
         [work.row.media_id, now, code],
       )
       await this.#audit(client, work.row.upload_id, 'upload.finalization_failed', { code })
-      return true
-    })
-  }
-
-  async #repairParts(work: FinalizerWork, mismatched: number[]): Promise<boolean> {
-    return this.#transaction(async (client) => {
-      if (!(await this.#lockCurrent(client, work, true))) return false
-      const now = this.#clock.now()
-      await client.query(
-        `update media_app.upload_parts
-            set status = 'pending', actual_size_bytes = null,
-                checksum_sha256 = null, r2_etag = null,
-                uploaded_at = null, verified_at = null
-          where upload_session_id = $1 and part_number = any($2::smallint[])`,
-        [work.row.upload_id, mismatched],
-      )
-      const aggregate = await client.query<{
-        confirmed_bytes: string
-        confirmed_parts: number
-      }>(
-        `select coalesce(sum(actual_size_bytes), 0)::text as confirmed_bytes,
-                count(*)::integer as confirmed_parts
-           from media_app.upload_parts
-          where upload_session_id = $1 and status in ('uploaded', 'verified')`,
-        [work.row.upload_id],
-      )
-      const progress = aggregate.rows[0]
-      if (progress === undefined) throw new Error('upload aggregate is missing')
-      const repaired = await client.query(
-        `update media_app.upload_sessions
-            set status = 'uploading', confirmed_size_bytes = $3,
-                confirmed_part_count = $4, finalize_attempt_count = 0,
-                next_finalize_at = null, last_finalize_error_code = null,
-                last_finalize_error_at = null, last_activity_at = $5
-          where id = $1 and status = 'completing' and row_version = $2`,
-        [
-          work.row.upload_id,
-          work.row.row_version,
-          progress.confirmed_bytes,
-          progress.confirmed_parts,
-          now,
-        ],
-      )
-      if (repaired.rowCount !== 1) throw new Error('finalizer repair CAS failed while locked')
-      await this.#audit(client, work.row.upload_id, 'upload.finalization_repaired', {
-        resetPartNumbers: mismatched,
-      })
-      return true
-    })
-  }
-
-  async #scheduleExpiredAbort(work: FinalizerWork): Promise<boolean> {
-    return this.#transaction(async (client) => {
-      if (!(await this.#lockCurrent(client, work))) return false
-      const now = this.#clock.now()
-      const scheduled = await client.query(
-        `update media_app.upload_sessions
-            set status = 'aborting', abort_reason = 'expired',
-                abort_attempt_count = 0, next_abort_at = $3,
-                last_abort_error_code = null, last_abort_error_at = null,
-                next_finalize_at = null, last_finalize_error_code = null,
-                last_finalize_error_at = null
-          where id = $1 and status = 'completing' and row_version = $2`,
-        [work.row.upload_id, work.row.row_version, now],
-      )
-      if (scheduled.rowCount !== 1) throw new Error('finalizer expiry CAS failed while locked')
-      await this.#audit(client, work.row.upload_id, 'upload.expiry_scheduled', {
-        source: 'finalizer',
-      })
       return true
     })
   }

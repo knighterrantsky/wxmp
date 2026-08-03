@@ -1,5 +1,7 @@
 # WeChat Private Media Upload V1 Implementation Plan
 
+> **Historical implementation plan; do not execute it as the current upload design.** The current boundary is mini program → durable server spool → PostgreSQL-backed internal R2 delivery queue, with no client automatic retry and no OSS/R2 UI state. See [`docs/design/upload-state-model.md`](../../design/upload-state-model.md), [`docs/api/media-upload-api.md`](../../api/media-upload-api.md), and [`docs/database/media-upload-database.md`](../../database/media-upload-database.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a locally runnable WeChat mini program and Fastify backend that authenticates WeChat users, records the confirmed nickname mapping, uploads private image/video files to Cloudflare R2 in fixed multipart chunks, shows real progress, and lists upload records through the terminal `uploaded` state.

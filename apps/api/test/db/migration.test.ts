@@ -51,7 +51,7 @@ describe('runMigrations', () => {
       'user_sessions',
       'users',
     ])
-    expect(bookkeeping.rows[0]?.count).toBe('3')
+    expect(bookkeeping.rows[0]?.count).toBe('4')
   })
 
   it('installs all documented enum types, version triggers, and explicit indexes', async () => {
@@ -174,7 +174,7 @@ describe('runMigrations', () => {
     const applied = await pool.query<{ count: string }>(
       'select count(*) from public.schema_migrations',
     )
-    expect(applied.rows[0]?.count).toBe('3')
+    expect(applied.rows[0]?.count).toBe('4')
   })
 
   it('checksums the original migration bytes and refuses any drift', async () => {
@@ -210,7 +210,7 @@ describe('runMigrations', () => {
       const applied = await contenderPool.query<{ count: string }>(
         'select count(*) from public.schema_migrations',
       )
-      expect(applied.rows[0]?.count).toBe('3')
+      expect(applied.rows[0]?.count).toBe('4')
     } finally {
       await Promise.all([brokenPool.end(), contenderPool.end()])
       await rm(brokenDirectory, { recursive: true, force: true })

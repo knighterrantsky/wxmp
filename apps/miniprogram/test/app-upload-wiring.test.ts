@@ -282,10 +282,10 @@ async function fixture(options: FixtureOptions = {}) {
           data: {
             upload: {
               id: uploadId,
-              status: 'finalizing',
+              status: 'uploaded',
               progress: { confirmedBytes: 12, totalBytes: 12, percent: 100 },
             },
-            pollAfterSeconds: 2,
+            pollAfterSeconds: null,
           },
           meta: meta(),
         },
@@ -533,7 +533,7 @@ describe('application upload wiring', () => {
     })
   })
 
-  it('cold-restores finalizing metadata once across concurrent onShow calls', async () => {
+  it('does not automatically restore retained uploads on launch or foreground', async () => {
     const resume: UploadRunnerResumeMetadata = {
       version: 1,
       phase: 'finalizing',
@@ -553,7 +553,7 @@ describe('application upload wiring', () => {
       abortIdempotencyKey: null,
       paused: false,
     }
-    const { application, requests, storage, resolveDeferredDetail } = await fixture({
+    const { application, requests, storage } = await fixture({
       initialStorage: {
         apiSession: {
           accessToken: 'access-restored',
@@ -563,7 +563,6 @@ describe('application upload wiring', () => {
         installationId: 'installation-000102030405060708090a0b0c0d0e0f',
         privateMediaUploadResumeV1: resume,
       },
-      deferDetail: true,
     })
 
     application.onShow?.call(application)
@@ -571,10 +570,18 @@ describe('application upload wiring', () => {
     await flush()
     expect(
       requests.filter((request) => request.url.endsWith(`/v1/uploads/${uploadId}`)),
-    ).toHaveLength(1)
+    ).toHaveLength(0)
+    expect(storage.has('privateMediaUploadResumeV1')).toBe(true)
 
-    resolveDeferredDetail()
+    await expect(
+      application.globalData.historyApi.retry(uploadId, 'private-photo.jpg', 12),
+    ).resolves.toBe(true)
     await vi.waitFor(() => {
+      expect(
+        requests.filter(
+          (request) => request.url.endsWith('/v1/uploads') && request.method === 'POST',
+        ),
+      ).toHaveLength(1)
       expect(storage.has('privateMediaUploadResumeV1')).toBe(false)
     })
   })
@@ -619,8 +626,7 @@ describe('application upload wiring', () => {
     expect(storage.has('privateMediaUploadResumeV1')).toBe(false)
   })
 
-  it('starts retained-session recovery after a live batch fails without requiring onHide/onShow', async () => {
-    vi.useFakeTimers()
+  it('keeps retry metadata and makes only one part request when a live upload fails', async () => {
     const { application, requests, uploadCalls, storage } = await fixture({
       failPartUpload: true,
     })
@@ -635,141 +641,16 @@ describe('application upload wiring', () => {
     const starting = application.globalData.mediaUpload.start(selected, (event) => {
       updates.push(event)
     })
-    await vi.runAllTimersAsync()
     await expect(starting).resolves.toBeUndefined()
-    await vi.waitFor(() => {
-      expect(storage.has('privateMediaUploadResumeV1')).toBe(false)
-    })
-
-    expect(uploadCalls).toHaveLength(6)
+    expect(storage.has('privateMediaUploadResumeV1')).toBe(true)
+    expect(uploadCalls).toHaveLength(1)
     expect(
       requests.filter((request) => request.url.endsWith(`/v1/uploads/${uploadId}`)),
-    ).toHaveLength(1)
+    ).toHaveLength(0)
     expect(updates.some((event) => event.status === 'failed')).toBe(true)
     expect(updates.at(-1)).toMatchObject({
       sourcePath,
-      status: 'uploaded',
-      bytes: 12,
-      percent: 100,
+      status: 'failed',
     })
-  })
-
-  it('keeps the current page listener while a retained session needs a later recovery attempt', async () => {
-    vi.useFakeTimers()
-    const { application, requests, storage } = await fixture({
-      failPartUpload: true,
-      failFirstDetailNonRetryable: true,
-    })
-    const selected = validateMediaSelection(await application.globalData.mediaUpload.chooseMedia())
-    const updates: { readonly status: string; readonly bytes: number; readonly percent: number }[] =
-      []
-
-    const starting = application.globalData.mediaUpload.start(selected, (event) => {
-      updates.push(event)
-    })
-    await vi.runAllTimersAsync()
-    await expect(starting).resolves.toBeUndefined()
-    await flush()
-
-    expect(storage.has('privateMediaUploadResumeV1')).toBe(true)
-    expect(updates.at(-1)).toMatchObject({ status: 'failed' })
-
-    application.onShow?.call(application)
-    await vi.runAllTimersAsync()
-    await vi.waitFor(() => {
-      expect(storage.has('privateMediaUploadResumeV1')).toBe(false)
-    })
-
-    expect(
-      requests.filter((request) => request.url.endsWith(`/v1/uploads/${uploadId}`)),
-    ).toHaveLength(2)
-    expect(updates.at(-1)).toMatchObject({ status: 'uploaded', bytes: 12, percent: 100 })
-  })
-
-  it('recovers a retained current batch instead of creating a duplicate when retry is tapped', async () => {
-    vi.useFakeTimers()
-    const { application, requests, storage } = await fixture({
-      failPartUpload: true,
-      failFirstDetailNonRetryable: true,
-    })
-    const selected = validateMediaSelection(await application.globalData.mediaUpload.chooseMedia())
-    const firstStatuses: string[] = []
-    const retryStatuses: string[] = []
-
-    const starting = application.globalData.mediaUpload.start(selected, (event) => {
-      firstStatuses.push(event.status)
-    })
-    await vi.runAllTimersAsync()
-    await expect(starting).resolves.toBeUndefined()
-    await flush()
-    expect(storage.has('privateMediaUploadResumeV1')).toBe(true)
-
-    const retrying = application.globalData.mediaUpload.start(selected, (event) => {
-      retryStatuses.push(event.status)
-    })
-    const retryRejected = expect(retrying).rejects.toMatchObject({
-      name: 'ApplicationUploadBusyError',
-    })
-    await vi.runAllTimersAsync()
-    await retryRejected
-    await vi.waitFor(() => {
-      expect(storage.has('privateMediaUploadResumeV1')).toBe(false)
-    })
-
-    expect(
-      requests.filter(
-        (request) => request.url.endsWith('/v1/uploads') && request.method === 'POST',
-      ),
-    ).toHaveLength(1)
-    expect(firstStatuses.at(-1)).toBe('uploaded')
-    expect(retryStatuses).toEqual([])
-  })
-
-  it('does not route an older same-path retained record into the current batch listener', async () => {
-    vi.useFakeTimers()
-    const older: UploadRunnerResumeMetadata = {
-      version: 1,
-      phase: 'finalizing',
-      file: {
-        sourcePath,
-        fileName: 'private-photo.jpg',
-        sizeBytes: 12,
-        kind: 'image',
-        mimeType: 'image/jpeg',
-      },
-      initializeIdempotencyKey: initializeKey,
-      uploadId,
-      parts: [{ partNumber: 1, offsetBytes: 0, sizeBytes: 12 }],
-      confirmedBytes: 12,
-      confirmedPartHashes: { 1: 'a'.repeat(64) },
-      completeIdempotencyKey: completeKey,
-      abortIdempotencyKey: null,
-      paused: false,
-    }
-    const { application, requests, storage } = await fixture({
-      failPartUpload: true,
-      initialStorage: {
-        privateMediaUploadResumeV1: {
-          version: 2,
-          records: { [initializeKey]: older },
-        },
-      },
-    })
-    const selected = validateMediaSelection(await application.globalData.mediaUpload.chooseMedia())
-    const statuses: string[] = []
-
-    const starting = application.globalData.mediaUpload.start(selected, (event) => {
-      statuses.push(event.status)
-    })
-    await vi.runAllTimersAsync()
-    await expect(starting).resolves.toBeUndefined()
-    await vi.waitFor(() => {
-      expect(storage.has('privateMediaUploadResumeV1')).toBe(false)
-    })
-
-    expect(
-      requests.filter((request) => request.url.endsWith(`/v1/uploads/${uploadId}`)),
-    ).toHaveLength(2)
-    expect(statuses.filter((status) => status === 'uploaded')).toHaveLength(1)
   })
 })

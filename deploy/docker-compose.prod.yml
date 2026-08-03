@@ -47,6 +47,26 @@ services:
         condition: service_healthy
     restart: 'no'
 
+  spool-init:
+    <<: *api-image
+    user: '0:0'
+    command:
+      - sh
+      - -c
+      - mkdir -p /var/lib/wx-upload/spool && chown 1000:1000 /var/lib/wx-upload/spool && chmod 700 /var/lib/wx-upload/spool
+    volumes:
+      - upload-spool:/var/lib/wx-upload/spool
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    restart: 'no'
+
   api:
     <<: [*api-image, *hardened-api]
     environment:
@@ -68,8 +88,13 @@ services:
       R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:?R2_ACCESS_KEY_ID is required}
       R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:?R2_SECRET_ACCESS_KEY is required}
       R2_FORCE_PATH_STYLE: 'false'
+      UPLOAD_SPOOL_DIR: /var/lib/wx-upload/spool
+    volumes:
+      - upload-spool:/var/lib/wx-upload/spool
     depends_on:
       migrate:
+        condition: service_completed_successfully
+      spool-init:
         condition: service_completed_successfully
     healthcheck:
       test:
@@ -119,3 +144,4 @@ services:
 
 volumes:
   postgres-data:
+  upload-spool:

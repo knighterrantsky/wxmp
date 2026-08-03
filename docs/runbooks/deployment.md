@@ -14,14 +14,15 @@
 | 容器编排 | Docker Compose |
 | Compose project | `wx-private-media-upload-production` |
 | 镜像仓库 | `ghcr.io/knighterrantsky/wxmp-api` |
-| 对象存储 | Cloudflare R2 私有 bucket |
+| 服务器上传落盘 | Docker named volume `upload-spool` |
+| 内部对象存储 | Cloudflare R2 私有 bucket |
 | 数据库 | PostgreSQL 17 |
 | 服务器部署根目录 | `/opt/wx-private-media-upload` |
 | 生产配置 | `/etc/wx-private-media-upload/production.env` |
 | TLS 目录 | `/etc/wx-private-media-upload/tls` |
 | 部署账号 | `wxdeploy` |
 
-当前生产部署只运行 Nginx、API、PostgreSQL、一次性数据库迁移任务，以及按计划运行的维护任务。微信小程序由微信开发者工具或后续微信 CI 发布，不部署在该服务器上。
+当前生产部署运行 Nginx、API、PostgreSQL、持久化 `upload-spool` 卷、一次性 `spool-init`/数据库迁移任务，以及按计划运行的维护任务。微信小程序由微信开发者工具或后续微信 CI 发布，不部署在该服务器上。
 
 ## 2. 交付架构
 
@@ -36,10 +37,11 @@
 京东云轻量主机 :443
     |
     v
-Nginx -> Fastify API -> PostgreSQL
-                    |
-                    v
-             Cloudflare R2（私有）
+Nginx -> Fastify API -> upload-spool（持久化本地分片）
+                    |             |
+                    v             | 服务端内部队列
+               PostgreSQL        v
+                          Cloudflare R2（私有）
 
 main push
     |
@@ -53,6 +55,7 @@ GitHub Actions：verify -> publish -> deploy
 安全边界：
 
 - 小程序只保存公开 API origin，不包含 AppSecret、R2 凭据、JWT 私钥或数据库密码。
+- 小程序只上传到 Fastify API；数据完整落入 `upload-spool` 并在 PostgreSQL 中形成可恢复队列任务后，即返回用户级“已上传”。
 - R2 不开启公开访问，API 不返回 object key、multipart upload ID、存储凭据或下载地址。
 - PostgreSQL 不映射宿主机端口；API 3000 端口也不对公网开放。
 - 生产镜像和部署目录使用完整 40 位 Git commit SHA 标识，禁止用可变 `latest` 标签部署。
@@ -201,6 +204,7 @@ chmod 640 /etc/wx-private-media-upload/production.env
 | JWT | `JWT_PRIVATE_KEY`、`JWT_PUBLIC_KEY` |
 | API 安全 | `CURSOR_SIGNING_KEY`、`MONITORING_TOKEN` |
 | R2 | `R2_ENDPOINT`、`R2_BUCKET`、`R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY` |
+| 持久化上传目录 | `UPLOAD_SPOOL_DIR`（Compose 固定为 `/var/lib/wx-upload/spool`） |
 | TLS | `TLS_CERTIFICATE_FILE`、`TLS_PRIVATE_KEY_FILE`、`HTTPS_PORT` |
 
 数据库 URL 中的密码必须与对应角色密码一致，保留字符需要百分号编码。生产 Compose 固定真实微信认证和 R2 virtual-hosted 风格，不需要在服务器配置微信 stub 或 MinIO。
@@ -343,7 +347,7 @@ docker compose \
   ps --all
 ```
 
-预期：`postgres` 和 `api` 为 healthy，`nginx` 为 running，`migrate` 成功退出。
+预期：`postgres` 和 `api` 为 healthy，`nginx` 为 running，`migrate` 和 `spool-init` 成功退出。`spool-init` 只负责把命名卷目录设为 API 运行 UID/GID `1000:1000`、权限 `0700`。
 
 检查内部 readiness；令牌直接从 API 容器环境读取，不展开到宿主机命令历史：
 
@@ -357,7 +361,7 @@ docker compose \
   "const r=await fetch('http://127.0.0.1:3000/health/ready',{headers:{'x-monitoring-token':process.env.MONITORING_TOKEN}}); process.stdout.write(await r.text()); if(!r.ok) process.exit(1)"
 ```
 
-返回 `{"status":"ready"}` 表示 PostgreSQL 与私有 R2 均通过探测。
+返回 `{"status":"ready"}` 表示 PostgreSQL 与 `upload-spool` 持久化目录均可用。R2 状态不阻断服务器接收新文件，需通过 finalizer backlog 与 R2 错误指标另行验证。
 
 最后从公网检查：
 

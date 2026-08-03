@@ -4,7 +4,7 @@
 > 版本：1.0
 > 日期：2026-07-14
 > 数据库：PostgreSQL 17
-> 关联文档：[架构设计](../superpowers/specs/2026-07-14-wechat-private-media-upload-design.md) · [接口设计](../api/media-upload-api.md)
+> 关联文档：[当前上传状态与一致性设计](../design/upload-state-model.md) · [接口设计](../api/media-upload-api.md)
 
 ## 1. 设计原则
 
@@ -12,12 +12,13 @@
 2. 微信 `openid` 的唯一范围是小程序 AppID，因此身份唯一键为 `(provider, app_id, openid)`。
 3. 昵称可以为空直到首次上传确认，可以重复和修改，不能用于授权或对象路径。
 4. 媒体对象、上传会话和分片分别建模，避免一个状态字段承担多套状态机。
-5. 原文件名只用于展示；R2 object key 必须由服务端生成。
+5. 原文件名只用于展示；服务器持久化路径和 R2 object key 必须由服务端生成。
 6. 单文件范围为 `12 bytes` 至 `200 MiB = 209,715,200 bytes`；分片固定为 `8 MiB = 8,388,608 bytes`，最多 25 片。
-7. PostgreSQL 与 R2 不存在分布式事务，使用幂等操作、固定对象键和对账任务恢复。
-8. R2 Multipart ETag 不能当作完整文件 MD5；首版仅保存每个分片的 SHA-256，并以 ListParts/HEAD 校验分片 ETag、大小和最终对象大小，不宣称已经得到完整文件的 SHA-256。
-9. 完整媒体对象首版不自动删除；任何物理删除都必须是后续明确审批的管理操作。
-10. 未来 QNAP NAS 与 R2 的自动同步、同步凭据、计划任务、同步状态、完整性校验及同步后的删除策略不属于当前版本；当前表不为其预留字段。
+7. PostgreSQL 与服务器文件系统不存在分布式事务；必须遵守“文件落盘在先、数据库确认在后”的单向顺序，并允许安全覆盖未被数据库确认的孤立分片。
+8. PostgreSQL 中的 `upload_sessions.status='completing'` 与 `next_finalize_at` 是 R2 内部交付队列的持久化事实；进程重启不依赖内存队列。
+9. R2 Multipart ETag 不能当作完整文件 MD5；首版保存每个服务器分片的 SHA-256，并在后台交付中以 ListParts/HEAD 校验 R2 ETag、大小和最终对象大小。
+10. 完整媒体对象首版不自动删除；用户删除上传记录只设置 `history_hidden_at`，任何物理删除都必须是后续明确审批的管理操作。
+11. 未来 QNAP NAS 与 R2 的自动同步、同步凭据、计划任务、同步状态、完整性校验及同步后的删除策略不属于当前版本；当前表不为其预留字段。
 
 ## 2. 状态定义
 
@@ -35,10 +36,10 @@
 
 | 状态 | 含义 |
 |---|---|
-| `initiating` | 数据库记录已创建，正在创建 R2 multipart |
-| `uploading` | 客户端可以上传或重传分片 |
-| `completing` | 正在 ListParts、CompleteMultipartUpload 与 HEAD 对账 |
-| `completed` | 完整对象已确认可用 |
+| `initiating` | 数据库记录已创建，正在创建服务器持久化上传目录 |
+| `uploading` | 客户端可以向业务服务器上传分片 |
+| `completing` | 服务器已完整接收，内部 R2 交付任务可被 finalizer 恢复 |
+| `completed` | R2 对象已通过 HEAD 验证；这是内部存储状态，不改变客户端早已完成的上传 |
 | `aborting` | 正在终止 multipart |
 | `aborted` | 主动中止完成 |
 | `expired` | initiating/uploading 超过 24 小时，或 completing 经 R2 对账确认未完成后，已完成安全清理 |
@@ -49,8 +50,8 @@
 | 状态 | 含义 |
 |---|---|
 | `pending` | 尚未得到服务端确认 |
-| `uploaded` | R2 UploadPart 成功并保存 ETag 与哈希 |
-| `verified` | Complete 前通过 R2 ListParts 复核 |
+| `uploaded` | 分片已在服务器持久化目录落盘，并保存服务器 ETag 与 SHA-256 |
+| `verified` | 后台 R2 交付完成时已复核 |
 
 API 详情可返回 `pending | uploaded | verified`。客户端只在会话仍为 `uploading` 时重传 `pending`；`uploaded` 与 `verified` 均不得重传。
 
@@ -67,7 +68,8 @@ uploading | finalizing | cancelling | uploaded | upload_failed | aborted | expir
 | 条件 | 用户状态 |
 |---|---|
 | upload session 为 initiating/uploading | `uploading` |
-| upload session 为 completing | `finalizing` |
+| upload session 为 completing 且 confirmed bytes 已完整 | `uploaded` |
+| upload session 为 completing 但 confirmed bytes 不完整（异常兼容） | `finalizing` |
 | upload session 为 aborting | `cancelling` |
 | upload session 为 completed 且 media 为 ready | `uploaded` |
 | upload/media failed | `upload_failed` |
@@ -459,7 +461,8 @@ CREATE TABLE upload_sessions (
     status <> 'failed' OR (failed_at IS NOT NULL AND failure_code IS NOT NULL)
   ),
   CONSTRAINT ck_upload_history_hidden CHECK (
-    history_hidden_at IS NULL OR status = 'completed'
+    history_hidden_at IS NULL
+    OR status IN ('completing', 'completed', 'aborted', 'expired', 'failed')
   ),
   CONSTRAINT ck_upload_version CHECK (row_version >= 0)
 );
@@ -490,7 +493,7 @@ CREATE INDEX ix_upload_reconcile_stuck
 
 每个媒体记录只对应一个上传会话。活跃会话内可重传分片；会话进入不可恢复的 `failed/aborted/expired` 后，用户重新上传会创建新的媒体记录和上传会话，旧记录保留在历史中。
 
-`history_hidden_at` 只表示用户已从上传记录页清除该成功记录。它不删除媒体对象、R2 对象或审计事件；列表查询必须过滤该字段。只有 `completed` 会话允许设置此字段。
+`history_hidden_at` 只表示用户已从上传记录页隐藏该记录。它不删除媒体对象、上传会话、分片元数据、服务器文件、R2 对象或审计事件；列表查询必须过滤该字段。只有服务器已完整接收的 `completing/completed`，或已终止的 `aborted/expired/failed` 会话允许设置此字段。
 
 `last_activity_at` 在成功确认分片或进入 `completing/aborting` 时更新，用于判断状态持续时长；finalizer/aborter 的失败重试只更新各自的 `next_*_at` 和错误字段，不推进 `last_activity_at`，否则会掩盖长期卡住告警。
 
@@ -728,10 +731,9 @@ aborted        -> purged
 pending  -> uploaded
 uploaded -> uploaded   # 相同 part number 合法重传
 uploaded -> verified
-uploaded -> pending    # 仅 finalizer 在期限内确认 R2 缺片/不匹配后修复
 ```
 
-`uploaded -> pending` 只能发生在会话仍为 `completing`、`HEAD` 明确完整对象不存在、`ListParts` 明确 Complete 尚未成功且写入期限仍有效时。转换事务必须清空该分片的 `actual_size_bytes`、`checksum_sha256`、`r2_etag`、`uploaded_at`、`verified_at`，保留 `attempt_count`，再从剩余 `uploaded/verified` 行重新计算会话确认字节数和分片数，并把会话恢复为 `uploading`。客户端看到这些 `pending` 分片后重新读取原文件并上传；再次满足完成条件时，这是新的完成周期，必须使用新的 complete `Idempotency-Key`，而不是重放上一周期已经稳定返回的 `202`。
+会话进入 `completing` 后，服务器已接收事实不可逆：finalizer 不得把分片从 `uploaded` 回退为 `pending`，不得清空大小、SHA-256 或服务器 ETag，也不得把会话恢复为客户端 `uploading`。内部 R2 manifest 不一致时保持 `completing`，更新 `next_finalize_at` 与受控错误码并告警；修复只能由服务端使用持久化 spool 完成。
 
 `verified` 分片不可再修改。状态转换必须使用带当前状态与 `row_version` 的条件更新，不能先读后无条件写。
 
@@ -755,30 +757,28 @@ uploaded -> pending    # 仅 finalizer 在期限内确认 R2 缺片/不匹配后
 3. 插入 `media_objects(pending_upload)` 与 `upload_sessions(initiating)`。
 4. 写审计并提交。
 
-第一事务还要把新会话 ID 写入幂等记录的 `resource_id`，使崩溃恢复可以同时收敛业务记录与幂等账本。事务外调用 R2 `CreateMultipartUpload`。成功后第二事务：
+第一事务还要把新会话 ID 写入幂等记录的 `resource_id`，使崩溃恢复可以同时收敛业务记录与幂等账本。事务外在 `UPLOAD_SPOOL_DIR` 下原子创建 multipart manifest 与 parts 目录，不访问 R2。成功后第二事务：
 
 1. 锁定上传会话。
-2. 写入 `r2_upload_id` 并转为 `uploading`。
+2. 将本地 spool UUID 写入历史命名字段 `r2_upload_id` 并转为 `uploading`。此字段当前是服务器持久化会话 ID，后续 migration 可在不改变语义的前提下重命名。
 3. 插入 1–25 行 `upload_parts(pending)`。
 4. 完成幂等记录并提交。
 
-R2 明确拒绝且可确定 multipart 未创建时，在短事务中把会话/媒体与对应幂等记录一起写成稳定失败。R2 超时、网络中断或 5xx 等创建结果未知时，保持 `initiating + in_progress`，返回可重试错误并交给 initiating 对账，不能直接声称创建失败。
-
-R2 成功而第二事务前崩溃，或 CreateMultipart 结果未知时，数据库还没有 `r2_upload_id`。initiating 对账任务使用已经持久化且全局唯一的 object key 调用 `ListMultipartUploads`：找到与本次创建时间匹配的 multipart 时先终止；明确不存在时直接收口；之后在同一短事务中把会话/媒体转为可解释失败，并把关联的 `in_progress` 幂等记录写成可稳定重放的失败响应、清空 `locked_until`。列举或终止结果未知时保持两者原状态并重试；列举或终止持续失败时由 R2 默认 7 天未完成上传生命周期兜底。对账不得为同一 session 再创建第二个 multipart，也不得让同 Key 永久停留在 `IDEMPOTENCY_IN_PROGRESS`。
+本地目录创建明确失败时，在短事务中把会话/媒体与对应幂等记录一起写成稳定失败。如果 manifest 已经原子落盘但第二事务前崩溃，数据库仍保持 `initiating + in_progress`，定期对账按已持久化的 object key 与 manifest 收敛；孤立目录可由受审计的维护任务在超过保留期后清理。
 
 ### 7.3 上传分片
 
-1. 读取会话、媒体归属与计划分片，不在 R2 网络请求期间持有长数据库事务。
+1. 读取会话、媒体归属与计划分片，不在请求体流式写入期间持有长数据库事务。
 2. 对同一 `uploadId/partNumber` 取得短期分布式锁或 PostgreSQL advisory lock。
-3. 流式计算 SHA-256、校验大小与首片类型，并调用 R2 UploadPart。
-4. 成功后在短事务中锁定会话；只有状态仍是 `uploading` 才 upsert 分片 ETag、哈希与大小，并从当前 `uploaded/verified` 分片重新汇总 `confirmed_size_bytes` 和 `confirmed_part_count`，不能对重放请求盲目累加。
-5. 若 API 在 R2 成功后崩溃，客户端按相同 part number 重传即可安全覆盖并补齐数据库记录。
+3. 流式计算 SHA-256、校验大小与首片类型，写入同目录临时文件。通过后执行文件 `fsync`、原子 `rename`、目录 `fsync`，并原子写入分片 manifest。
+4. 落盘成功后才在短事务中锁定会话；只有状态仍是 `uploading` 才 upsert 分片 ETag、哈希与大小，并从当前 `uploaded/verified` 分片重新汇总 `confirmed_size_bytes` 和 `confirmed_part_count`，不能对重放请求盲目累加。
+5. 若 API 在文件落盘后、数据库确认前崩溃，数据库仍显示 `pending`；用户手动重试相同 part number 时可安全覆盖并补齐记录。
 
 ### 7.4 完成 multipart
 
 1. 事务锁定顺序固定为 `media_objects -> upload_sessions -> upload_parts`。
-2. 验证分片编号连续、大小总和正确、无正在处理的分片，将会话转为 `completing`，设置 `finalize_attempt_count=0`、`next_finalize_at=now` 后提交；HTTP 请求随即返回 `202 finalizing`。
-3. 持久化 finalizer 每秒只扫描 `status='completing' AND next_finalize_at <= now` 的候选，并在专用连接上对 `uploadId` 取得 PostgreSQL session-level advisory lock；重新读取状态后，先在事务外 HEAD 固定对象键。对象已存在且大小正确时跳到补齐事务；否则调用 R2 ListParts，核对 ETag 与大小，再执行 CompleteMultipartUpload 和最终 HEAD。网络请求期间不持有行锁；连接或进程退出会自动释放 advisory lock。
+2. 验证分片编号连续、大小总和正确、无正在处理的分片，将会话转为 `completing`，设置 `finalize_attempt_count=0`、`next_finalize_at=now` 后提交；HTTP 请求随即返回 `202 uploaded`。此时所有字节已在服务器持久化卷中，小程序不再跟踪 R2。
+3. 持久化 finalizer 每秒只扫描 `status='completing' AND next_finalize_at <= now` 的候选，并在专用连接上对 `uploadId` 取得 PostgreSQL session-level advisory lock；重新读取状态后，先在事务外 HEAD 固定对象键。对象已存在且大小正确时跳到补齐事务；否则从本地 spool 读取分片，创建或恢复 R2 multipart，上传缺失分片、Complete 并执行最终 HEAD。网络请求期间不持有行锁。
 4. 可重试的 R2 错误在短事务中增加 `finalize_attempt_count`，记录错误码和时间，并按 full-jitter 设置 `next_finalize_at = now + random(0, min(2^attempt, 300s))`。退避状态持久化，R2 长时间故障时不会每秒重试同一对象；超过 15 分钟触发告警但继续对账。
 5. 成功时第二事务按相同顺序加锁：
    - 分片转 `verified`；
@@ -791,7 +791,7 @@ R2 成功而第二事务前崩溃，或 CreateMultipart 结果未知时，数据
 
 1. 用户中止事务只锁定仍为 `initiating/uploading` 的会话，写 `status=aborting`、请求原因、`abort_attempt_count=0`、`next_abort_at=now` 与审计事件后提交；HTTP 随即返回 `202 cancelling`。
 2. 超时清理以相同方式写入 `abort_reason=expired`。`completing` 必须先按 R2 事实对账，不能直接进入本流程。
-3. 持久化 aborter 扫描到期记录并对 `uploadId` 取得 session-level advisory lock。没有 `r2_upload_id` 时直接收口；否则在事务外调用 AbortMultipartUpload。R2 返回“upload 不存在”也按成功清理处理。
+3. 持久化 aborter 扫描到期记录并对 `uploadId` 取得 session-level advisory lock。没有本地 spool ID 时直接收口；否则先根据持久化 remote state 尝试 AbortMultipartUpload，再删除本地 spool 目录。R2 返回“upload 不存在”也按成功清理处理。
 4. 可重试错误增加 `abort_attempt_count`，写错误摘要，并用最大 300 秒 full-jitter 更新 `next_abort_at`；明确的权限/配置错误同样保持 `aborting`，固定 300 秒后再检查并触发高优先级告警，等待运维修复凭据或策略。任何 Abort 失败都不能伪装成清理完成，也不能让 worker 停止对账；进程重启后继续。
 5. 清理成功后在短事务中按原因收口：`userCancelled/replaced -> aborted`、`expired -> expired`、`validationFailed -> failed`。最后一种必须同时写预先保存的安全 `failure_code/failed_at` 并把媒体转为 `failed`。所有分支清空 `next_abort_at`、同步媒体状态并写审计。完整 R2 对象已经存在时不得走中止流程。
 
@@ -807,9 +807,10 @@ R2 成功而第二事务前崩溃，或 CreateMultipart 结果未知时，数据
 | 数据 | 保留策略 |
 |---|---|
 | 完整 R2 对象 | 首版长期保留，不自动删除 |
+| 服务器 upload spool | 上传期间和 R2 交付期间必须保留；只有交付成功或受审计的中止/维护流程可删除 |
 | `media_objects` | 长期保留，与 R2 对象及上传事实对应 |
 | initiating/uploading 会话 | 24 小时后转 aborting，清理完成后 expired |
-| completing 会话 | 不按年龄直接过期；必须先 HEAD/ListParts 收敛，结果未知时持续重试并告警 |
+| completing 会话 | 不按年龄直接过期；是已经在服务器完整接收的 R2 交付队列，结果未知时持续重试并告警 |
 | R2 未完成 multipart | initiating/uploading 超过 24 小时主动终止；completing 先对账；R2 7 天兜底 |
 | 终态 upload sessions | 摘要长期保留，与媒体主记录共同支撑历史列表和 `uploadId` 详情 |
 | 终态 upload parts | 进入终态时计算 `terminalAt + 90 days`；到期后删除，API 此后返回 `partDetailsRetained=false`。活跃时截止时间为 `null` |
@@ -846,4 +847,4 @@ R2 成功而第二事务前崩溃，或 CreateMultipart 结果未知时，数据
 - 生产量增长后启用连续 WAL 归档，以支持时间点恢复。
 - 每月自动在独立环境恢复并执行表数量、约束、关键查询和抽样媒体引用校验。
 - 每季度进行一次包含 API、PostgreSQL 与 R2 权限恢复的灾难演练。
-- PostgreSQL 备份只包含对象元数据，不包含 R2 文件。首版依赖 R2 作为原始对象存储，不宣称具备跨账户对象灾备。
+- PostgreSQL 备份只包含业务元数据和队列状态，不包含 `upload-spool` 卷或 R2 文件。灾难恢复必须同时考虑 PostgreSQL、持久化 spool 卷与 R2；仅恢复数据库可以保留元数据，但无法恢复尚未交付到 R2 的文件字节。

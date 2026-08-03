@@ -4,8 +4,8 @@
 
 | 路径                | 语义                                  | 访问要求                                                       |
 | ------------------- | ------------------------------------- | -------------------------------------------------------------- |
-| `/health/live`      | API 进程存活，不检查 PostgreSQL 或 R2 | Nginx 443 可达                                                 |
-| `/health/ready`     | 2 秒内同时检查 PostgreSQL 与 R2       | Nginx 仅允许环回或私网来源，并要求 `X-Monitoring-Token`        |
+| `/health/live`      | API 进程存活，不检查 PostgreSQL、spool 或 R2 | Nginx 443 可达                                                 |
+| `/health/ready`     | 2 秒内同时检查 PostgreSQL 与 `upload-spool` 可读写 | Nginx 仅允许环回或私网来源，并要求 `X-Monitoring-Token`        |
 | `/internal/metrics` | Prometheus 文本指标                   | Nginx 返回 404；只能从受控容器网络直连 API，并要求同一监控令牌 |
 
 不要把 API 的 3000 端口发布到宿主机。Prometheus 应加入生产 Compose 的受控网络，抓取 `http://api:3000/internal/metrics` 并通过安全的 header 配置注入 `X-Monitoring-Token`。监控令牌不能出现在抓取 URL、日志或告警正文。
@@ -31,7 +31,7 @@ API 注册的业务指标均以 `wx_upload_` 开头：
 | `wx_upload_parts_total`                      | counter；`outcome`               | 分片结果                           |
 | `wx_upload_part_duration_seconds`            | histogram；`outcome`             | 分片处理延迟                       |
 | `wx_upload_part_bytes_total`                 | counter                          | 已接受分片字节                     |
-| `wx_upload_part_retries_total`               | counter；`outcome`               | 分片重试                           |
+| `wx_upload_part_retries_total`               | counter；`outcome`               | 服务器观测到的分片重放（小程序不自动重试） |
 | `wx_upload_part_checksum_mismatches_total`   | counter                          | 哈希不匹配                         |
 | `wx_upload_r2_operation_duration_seconds`    | histogram；`operation`,`outcome` | R2 操作延迟                        |
 | `wx_upload_r2_operation_errors_total`        | counter；`operation`,`outcome`   | R2 错误与超时                      |
@@ -77,15 +77,17 @@ clamp_min(sum(rate(wx_upload_parts_total[5m])), 0.000001)
 > 0.05
 ```
 
-持续 5 分钟后告警。同时展示重试率、checksum mismatch 与分片 P95，区分网络问题、源文件变化和 R2 问题。
+持续 5 分钟后告警。同时展示客户端手动重放率、checksum mismatch 与分片 P95，区分网络问题、源文件变化、服务器磁盘和入口带宽问题。R2 问题只通过 finalizer backlog 与服务端 R2 operation 指标判断。
 
-### 3.3 PostgreSQL 或 R2 连续三次 readiness 失败
+### 3.3 PostgreSQL 或 upload-spool 连续三次 readiness 失败
 
-监控系统每 30 秒从允许的私网来源请求 `/health/ready`。连续 3 次非 200 即告警。readiness 是联合检查，响应不会泄露依赖地址；用以下信号定位：
+监控系统每 30 秒从允许的私网来源请求 `/health/ready`。连续 3 次非 200 即告警。readiness 是服务器接收能力检查，响应不会泄露依赖地址；用以下信号定位：
 
-- R2：`wx_upload_r2_operation_errors_total`、`wx_upload_critical_reconciliation_total`；
+- spool：容器文件系统权限、命名卷挂载与宿主机磁盘空间；
 - PostgreSQL：JSON 日志中的 `POSTGRES_IDLE_CLIENT_ERROR`、`POSTGRES_UPLOAD_LOCK_CLIENT_ERROR`；
 - API 本身：`/health/live`。liveness 同时失败时先处理进程或主机，不要归因于依赖。
+
+R2 另用 `wx_upload_r2_operation_errors_total`、`wx_upload_critical_reconciliation_total` 和 finalizer backlog 告警。R2 错误不应让 readiness 失败，否则会不必要地阻止服务器接收新文件。
 
 ### 3.4 完成收口超过 15 分钟
 
@@ -101,7 +103,7 @@ increase(wx_upload_completing_timeouts_total[5m]) > 0
 min_over_time(wx_upload_finalizer_backlog[15m]) > 0
 ```
 
-检查 finalizer retry、R2 complete/head/listParts 错误和关键对账代码。不得直接把 `completing` 标记成功；必须以 R2 事实和应用对账结果收口。
+检查 finalizer retry、R2 uploadPart/complete/head/listParts 错误、spool 目录是否存在以及关键对账代码。不得直接把 `completing` 标记成功；必须以 R2 事实和应用对账结果收口。该告警属于后端交付事件，不应让小程序将已完整到达服务器的素材改回上传失败。
 
 ### 3.5 initiating 超过 5 分钟
 

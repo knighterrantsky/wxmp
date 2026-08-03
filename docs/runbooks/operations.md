@@ -22,14 +22,15 @@
 | GitHub runner 用户 | `wxdeploy` |
 | runner 服务 | `actions.runner.knighterrantsky-wxmp.wx-upload-production.service` |
 
-生产数据分为两部分：PostgreSQL 保存用户映射、上传会话和历史状态；Cloudflare R2 保存私有图片/视频对象。数据库备份不能替代 R2 数据保护，R2 同步也不能替代数据库备份。
+生产数据分为三部分：PostgreSQL 保存用户映射、上传会话、分片元数据、历史可见性和可恢复队列状态；Docker `upload-spool` 命名卷保存已到服务器但尚未完成 R2 交付的文件字节；Cloudflare R2 保存交付完成的私有对象。三者不能互相替代备份。
 
 ## 2. 操作原则
 
 - 正常发布只通过 GitHub Actions，从 `main` 交付不可变 SHA。
 - 禁止在生产服务器直接修改 release 文件、构建镜像或检出未审核源码。
 - 禁止删除 `postgres-data` volume 处理普通启动故障。
-- 禁止手工把 `completing` 上传改成成功；必须由 R2 事实和后台对账收口。
+- 禁止手工修改 `completing`、`confirmed_size_bytes` 或分片状态；它们是服务端已接收事实与 R2 交付队列的恢复依据。
+- 禁止使用 `docker compose down -v`、`docker volume rm` 或 `docker system prune --volumes`；`upload-spool` 可能包含唯一尚未交付到 R2 的文件副本。
 - 禁止把 `production.env`、`docker inspect` 完整输出、token、数据库 URL 或用户 openid 粘贴到日志和工单。
 - 操作前记录当前 SHA；涉及配置、数据库、证书或回滚时先确认备份与恢复路径。
 - 日志按 `requestId` 排查，不要求用户提供 access token 或 refresh token。
@@ -81,9 +82,9 @@ prod_compose config --quiet
    prod_compose ps --all
    ```
 
-   `postgres`、`api` 应为 healthy，`nginx` 应为 running，`migrate` 应已成功退出。
+   `postgres`、`api` 应为 healthy，`nginx` 应为 running，`migrate`、`spool-init` 应已成功退出。
 
-3. PostgreSQL 与 R2 联合 readiness 正常：
+3. PostgreSQL 与本地持久化上传目录 readiness 正常：
 
    ```bash
    prod_compose exec -T api \
@@ -102,7 +103,7 @@ prod_compose config --quiet
    docker system df
    ```
 
-7. 维护任务无失败，finalizer/abort backlog 没有持续增长。
+7. 维护任务无失败，finalizer/abort backlog 没有持续增长，`upload-spool` 卷空间充足。
 
 ### 4.2 每周
 
@@ -278,7 +279,18 @@ sha256sum "$backup_file" > "${backup_file}.sha256"
 
 备份文件包含用户映射和业务数据，按敏感数据管理。至少保留 7 个日备、4 个周备和 3 个长期恢复点，并把副本保存到与该主机故障域隔离的位置。
 
-### 7.2 恢复演练
+### 7.2 upload-spool 保护
+
+`upload-spool` 可能包含已被小程序显示为“已上传”、但尚未交付到 R2 的唯一文件副本。它必须使用可停顿或快照一致的卷备份方案，不能边写边用普通 `cp`/`tar` 声称获得一致备份。
+
+最低要求：
+
+- 监控命名卷容量和宿主机可用空间；按“最大同时用户数 × 每用户最大未交付文件数 × 200 MiB”估算最坏容量。
+- 优先使用云盘/宿主机卷快照，并与 PostgreSQL 备份记录同一恢复时间点。
+- 恢复时保留原 UUID 目录、manifest、part 文件和权限；不对内容做人工重命名。
+- 只有 PostgreSQL 和 spool 快照的记录能匹配时，才能恢复尚未交付的 `completing` 任务。如果不一致，先隔离环境审计，不能手工标成 completed。
+
+### 7.3 恢复演练
 
 恢复必须在隔离 PostgreSQL 实例中进行，禁止直接覆盖生产 `wx_upload`。最低步骤：
 
@@ -293,7 +305,7 @@ sha256sum "$backup_file" > "${backup_file}.sha256"
 
 `pg_restore --list` 只能证明归档可解析，不能替代完整恢复演练。
 
-### 7.3 数据库故障禁令
+### 7.4 数据库故障禁令
 
 - 不删除或重建生产 `postgres-data` volume，除非已经确认灾难恢复并获得明确批准。
 - 不直接修改 `media_app.schema_migrations`。
@@ -395,14 +407,14 @@ prod_compose logs --since 30m --no-color api
 ```
 
 - 502 通常表示 Nginx 无法连接 API、API 重启或上游提前关闭。
-- 504 通常表示分片上传超过代理/上游超时、API 阻塞或 R2 延迟异常。
+- 504 通常表示客户端到业务服务器的分片上传超过代理/上游超时、API 阻塞、服务器磁盘写入过慢或入口带宽不足。
 - 分片路由允许 16 MiB，代理超时为 210 秒；普通路由 body 上限为 64 KiB。
 
-不要通过全局无限增大超时掩盖 R2、带宽或应用问题。
+不要通过全局无限增大超时掩盖服务器磁盘、带宽或应用问题。R2 延迟只影响后台交付队列，不应拖慢客户端分片请求。
 
 ### 9.3 liveness 正常、readiness 503
 
-这表示 API 进程存活，但 PostgreSQL 或 R2 的 2 秒联合探测失败。
+这表示 API 进程存活，但 PostgreSQL 探测失败，或 `upload-spool` 持久化目录当前不可读写。R2 不参与 readiness；R2 故障由内部交付队列积压和 finalizer 错误指标告警。
 
 ```bash
 prod_compose logs --since 30m --no-color api
@@ -412,8 +424,8 @@ prod_compose ps postgres
 结合指标区分：
 
 - PostgreSQL：连接错误、连接池错误、磁盘满、数据库重启；
-- R2：endpoint/DNS/凭据、bucket 权限、网络超时、上游错误；
-- 两者都正常但仍超时：检查主机网络、CPU、内存和事件循环阻塞。
+- upload-spool：命名卷未挂载、目录权限错误、磁盘只读或空间耗尽；
+- 两者都正常但仍超时：检查 CPU、内存和事件循环阻塞。
 
 readiness 需要监控令牌且只允许私网或容器网络访问，公网 403/401 不代表依赖故障。
 
@@ -425,9 +437,9 @@ prod_compose logs --no-color migrate
 
 确认 `MIGRATION_DATABASE_URL` 使用 `wx_migrate`，数据库可连接，迁移 SQL 与当前 schema 兼容。禁止跳过迁移强行启动 API，也不要手工把失败迁移标记为成功。
 
-### 9.5 R2 上传失败
+### 9.5 R2 内部交付失败
 
-检查 API 日志中的受控 R2 operation/outcome、readiness 和 Cloudflare R2 状态。确认：
+检查 API 日志中的受控 R2 operation/outcome、finalizer backlog 和 Cloudflare R2 状态。R2 故障时 API readiness 仍可能正常，因为小程序仍可把文件安全上传到服务器。确认：
 
 - endpoint 是账户专属 HTTPS 根地址；
 - bucket 名正确且保持私有；
@@ -436,17 +448,18 @@ prod_compose logs --no-color migrate
 - 没有把 Cloudflare API token value 误填为 S3 secret；
 - 轮换凭据时新旧凭据没有提前撤销。
 
-不要在客户端下发临时 R2 凭据，也不要临时开放 bucket 验证问题。
+不要在客户端下发临时 R2 凭据，也不要临时开放 bucket 验证问题。不要要求用户重传已完整到达服务器的素材；修复 R2 后让内部队列自动消化。
 
-### 9.6 上传长时间停在 finalizing
+### 9.6 内部 R2 交付队列长时间积压
 
 1. 查看 `wx_upload_finalizer_backlog`、retry 和 reconciliation 指标；
 2. 以 requestId、内部 uploadId 检索 API 日志；
-3. 检查 R2 complete/head/listParts 操作；
-4. 保持后台对账运行，等待确定存储事实；
-5. 只有服务端明确返回可修复 parts 时，客户端才创建新的 complete 周期。
+3. 检查 R2 uploadPart/complete/head/listParts 操作；
+4. 确认 PostgreSQL `completing` 记录的 `next_finalize_at`、`last_finalize_error_code` 与 `finalize_attempt_count` 在更新；
+5. 确认对应 spool 目录仍存在，且卷磁盘没有被删除或填满；
+6. 保持后台队列运行，小程序中的记录仍显示“已上传”，不要触发客户端补传。
 
-禁止直接把数据库状态改为 `uploaded`，也禁止创建第二个未知 multipart 覆盖原状态。
+禁止直接把数据库内部状态改为 `completed`，也禁止删除对应 spool 目录或创建第二个未知 multipart 覆盖原状态。
 
 ### 9.7 磁盘空间不足
 
@@ -456,9 +469,10 @@ docker system df
 journalctl --disk-usage
 du -sh /opt/wx-private-media-upload/releases/*
 du -sh /var/lib/docker
+docker volume inspect wx-private-media-upload-production_upload-spool
 ```
 
-先确认增长来源。Docker 已配置单文件 10 MiB、最多 3 个文件的 JSON 日志轮转。清理镜像或 release 前记录当前和回滚 SHA；禁止使用 `docker system prune --volumes`，因为 volume 中包含 PostgreSQL 数据。
+先确认增长来源。Docker 已配置单文件 10 MiB、最多 3 个文件的 JSON 日志轮转。清理镜像或 release 前记录当前和回滚 SHA；禁止使用 `docker system prune --volumes`，因为 volume 中包含 PostgreSQL 数据和尚未交付到 R2 的上传文件。
 
 ### 9.8 runner offline
 
@@ -506,7 +520,7 @@ journalctl \
 | 路径 | 语义 | 访问方式 |
 | --- | --- | --- |
 | `/health/live` | API 进程存活 | 公网 HTTPS |
-| `/health/ready` | PostgreSQL 与 R2 联合探测 | 私网/容器网络 + 监控令牌 |
+| `/health/ready` | PostgreSQL 与 `upload-spool` 可写性探测 | 私网/容器网络 + 监控令牌 |
 | `/internal/metrics` | Prometheus 指标 | 只允许容器网络直连 API + 监控令牌 |
 
 最低告警：

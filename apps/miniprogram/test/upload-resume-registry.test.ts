@@ -90,6 +90,18 @@ describe('upload resume registry', () => {
     expect(registry.keys()).toEqual([secondMetadata.initializeIdempotencyKey])
   })
 
+  it('removes exactly one retained record for an explicit manual action', async () => {
+    const memory = memoryStorage()
+    const registry = createUploadResumeRegistry(memory.storage)
+    await registry.createStore().save(metadata(1))
+    await registry.createStore().save(metadata(2))
+
+    registry.remove(metadata(1).initializeIdempotencyKey)
+
+    expect(registry.keys()).toEqual([metadata(2).initializeIdempotencyKey])
+    expect(registry.record(metadata(1).initializeIdempotencyKey)).toBeUndefined()
+  })
+
   it('migrates the v1 single-record shape without losing resumability', async () => {
     const legacy = metadata(3)
     const memory = memoryStorage(legacy)

@@ -50,11 +50,32 @@ export interface ClearUploadedHistoryRepositoryResult {
   readonly clearedCount: number
 }
 
+export interface DeleteUploadHistoryRepositoryInput {
+  readonly userId: string
+  readonly uploadId: string
+  readonly sessionId: string
+  readonly deletedAt: Date
+  readonly eventId: string
+  readonly context: {
+    readonly requestId: string
+    readonly sourceIp: string
+  }
+}
+
+export interface DeleteUploadHistoryRepositoryResult {
+  readonly userStatus: HistoryUserStatus | null
+  readonly found: boolean
+  readonly terminal: boolean
+}
+
 export interface UploadHistoryRepository {
   listPage(input: HistoryRepositoryPageInput): Promise<HistoryRepositoryPage>
   clearUploaded(
     input: ClearUploadedHistoryRepositoryInput,
   ): Promise<ClearUploadedHistoryRepositoryResult>
+  deleteRecord(
+    input: DeleteUploadHistoryRepositoryInput,
+  ): Promise<DeleteUploadHistoryRepositoryResult>
 }
 
 interface HistoryRow {
@@ -182,9 +203,11 @@ export class PostgresUploadHistoryRepository implements UploadHistoryRepository 
                   u.created_at,
                   greatest(u.updated_at, m.updated_at, u.last_activity_at) as updated_at,
                   case
+                    when u.confirmed_size_bytes = u.expected_size_bytes
+                      and u.status in ('completing', 'completed', 'failed') then 'uploaded'
                     when u.status = 'aborting' then 'cancelling'
                     when u.status = 'completing' and m.storage_status = 'pending_upload'
-                      then 'finalizing'
+                      then 'uploaded'
                     when u.status = 'completed' and m.storage_status = 'ready' then 'uploaded'
                     when u.status = 'failed' or m.storage_status = 'failed' then 'upload_failed'
                     when u.status = 'aborted' and m.storage_status = 'aborted' then 'aborted'
@@ -248,8 +271,8 @@ export class PostgresUploadHistoryRepository implements UploadHistoryRepository 
           where u.user_id = $1
             and u.media_object_id = m.id
             and m.user_id = $1
-            and u.status = 'completed'
-            and m.storage_status = 'ready'
+            and u.confirmed_size_bytes = u.expected_size_bytes
+            and u.status in ('completing', 'completed', 'failed')
             and u.history_hidden_at is null
         returning u.id`,
         [input.userId, input.clearedAt],
@@ -275,6 +298,83 @@ export class PostgresUploadHistoryRepository implements UploadHistoryRepository 
       }
       await client.query('commit')
       return { userStatus, clearedCount }
+    } catch (error) {
+      await rollback(client)
+      throw error
+    } finally {
+      client.release()
+    }
+  }
+
+  async deleteRecord(
+    input: DeleteUploadHistoryRepositoryInput,
+  ): Promise<DeleteUploadHistoryRepositoryResult> {
+    const client = await this.#pool.connect()
+    try {
+      await client.query('begin')
+      const selectedUser = await client.query<{ status: string }>(
+        `select status from media_app.users where id = $1 for update`,
+        [input.userId],
+      )
+      const userStatus = normalizedUserStatus(selectedUser.rows[0]?.status)
+      if (userStatus !== 'active') {
+        await client.query('commit')
+        return { userStatus, found: false, terminal: false }
+      }
+
+      const selected = await client.query<{
+        status: string
+        expected_size_bytes: string
+        confirmed_size_bytes: string
+        history_hidden_at: Date | string | null
+      }>(
+        `select status, expected_size_bytes::text, confirmed_size_bytes::text,
+                history_hidden_at
+           from media_app.upload_sessions
+          where id = $1 and user_id = $2
+          for update`,
+        [input.uploadId, input.userId],
+      )
+      const row = selected.rows[0]
+      if (row === undefined) {
+        await client.query('commit')
+        return { userStatus, found: false, terminal: false }
+      }
+      const serverReceived =
+        Number(row.confirmed_size_bytes) === Number(row.expected_size_bytes) &&
+        ['completing', 'completed', 'failed'].includes(row.status)
+      const terminal =
+        serverReceived || ['completed', 'aborted', 'expired', 'failed'].includes(row.status)
+      if (!terminal) {
+        await client.query('commit')
+        return { userStatus, found: true, terminal: false }
+      }
+      if (row.history_hidden_at === null) {
+        await client.query(
+          `update media_app.upload_sessions
+              set history_hidden_at = $3
+            where id = $1 and user_id = $2 and history_hidden_at is null`,
+          [input.uploadId, input.userId, input.deletedAt],
+        )
+        await client.query(
+          `insert into media_app.audit_events(
+             event_id, occurred_at, actor_type, actor_user_id, actor_session_id,
+             request_id, event_type, entity_type, entity_id, source_ip, metadata
+           ) values ($1, $2, 'user', $3, $4, $5,
+                     'upload.history.deleted', 'upload_session', $6, $7, '{}'::jsonb)`,
+          [
+            input.eventId,
+            input.deletedAt,
+            input.userId,
+            input.sessionId,
+            input.context.requestId,
+            input.uploadId,
+            input.context.sourceIp,
+          ],
+        )
+      }
+      await client.query('commit')
+      return { userStatus, found: true, terminal: true }
     } catch (error) {
       await rollback(client)
       throw error

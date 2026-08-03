@@ -14,6 +14,8 @@ const SAFE_HISTORY_ERROR = '上传记录加载失败，请稍后重试'
 const SAFE_UPLOAD_FAILURE = '上传失败，请稍后重试'
 const SAFE_CANCEL_ERROR = '取消上传失败，请稍后重试'
 const SAFE_CLEAR_ERROR = '清空上传记录失败，请稍后重试'
+const SAFE_RETRY_ERROR = '无法重新上传，请返回素材页重新选择文件'
+const SAFE_DELETE_ERROR = '删除上传记录失败，请稍后重试'
 const WATCH_NEW_UPLOAD_REFRESHES = 6
 
 type HistoryItem = UploadHistoryResponse['data']['items'][number]
@@ -28,6 +30,8 @@ export interface HistoryApi {
   getUpload(uploadId: string): Promise<UploadDetailResponse['data']>
   cancel(uploadId: string): Promise<void>
   clearUploaded(): Promise<number>
+  retry(uploadId: string, fileName: string, sizeBytes: number): Promise<boolean>
+  deleteRecord(uploadId: string, fileName: string, sizeBytes: number): Promise<void>
 }
 
 export type HistoryScheduleHandle = unknown
@@ -44,6 +48,10 @@ export interface HistoryRecordView {
   readonly terminal: boolean
   readonly cancellable: boolean
   readonly cancelPending: boolean
+  readonly retryable: boolean
+  readonly retryPending: boolean
+  readonly deletable: boolean
+  readonly deletePending: boolean
   readonly percent: number
   readonly createdAtLabel: string
   readonly updatedAtLabel: string
@@ -113,13 +121,18 @@ function safeFailureMessage(item: HistoryItem): string | null {
     case 'STORAGE_OBJECT_SIZE_MISMATCH':
       return '文件完整性校验失败，请重新上传'
     case 'STORAGE_UNAVAILABLE':
-      return '私有存储暂时不可用，请稍后重试'
+      return '服务器暂时无法接收，请稍后手动重试'
     default:
       return SAFE_UPLOAD_FAILURE
   }
 }
 
-function recordView(item: HistoryItem, cancelPending: boolean): HistoryRecordView {
+function recordView(
+  item: HistoryItem,
+  cancelPending: boolean,
+  retryPending: boolean,
+  deletePending: boolean,
+): HistoryRecordView {
   const presentedStatus =
     cancelPending && (item.status === 'uploading' || item.status === 'finalizing')
       ? 'cancelling'
@@ -136,6 +149,12 @@ function recordView(item: HistoryItem, cancelPending: boolean): HistoryRecordVie
     terminal: copy.terminal,
     cancellable: !cancelPending && (item.status === 'uploading' || item.status === 'finalizing'),
     cancelPending,
+    retryable:
+      !retryPending &&
+      (item.status === 'upload_failed' || item.status === 'aborted' || item.status === 'expired'),
+    retryPending,
+    deletable: copy.terminal && !deletePending,
+    deletePending,
     percent: Math.min(100, Math.max(0, item.progress.percent)),
     createdAtLabel: localDateTime(item.createdAt),
     updatedAtLabel: localDateTime(item.updatedAt),
@@ -163,6 +182,8 @@ export class HistoryController {
   #error: string | null = null
   #clearingUploaded = false
   readonly #cancelPendingIds = new Set<string>()
+  readonly #retryPendingIds = new Set<string>()
+  readonly #deletePendingIds = new Set<string>()
   #watchRefreshesRemaining: number
   #generation = 0
   #paused = false
@@ -183,7 +204,14 @@ export class HistoryController {
   snapshot(): HistorySnapshot {
     return Object.freeze({
       records: Object.freeze(
-        this.#items.map((item) => recordView(item, this.#cancelPendingIds.has(item.id))),
+        this.#items.map((item) =>
+          recordView(
+            item,
+            this.#cancelPendingIds.has(item.id),
+            this.#retryPendingIds.has(item.id),
+            this.#deletePendingIds.has(item.id),
+          ),
+        ),
       ),
       loading: this.#loading,
       refreshing: this.#refreshing,
@@ -314,6 +342,49 @@ export class HistoryController {
     }
   }
 
+  async retryUpload(uploadId: string): Promise<boolean> {
+    if (this.#disposed || this.#paused || this.#retryPendingIds.has(uploadId)) return false
+    const item = this.#items.find((candidate) => candidate.id === uploadId)
+    if (item === undefined || !['upload_failed', 'aborted', 'expired'].includes(item.status)) {
+      return false
+    }
+    this.#retryPendingIds.add(uploadId)
+    this.#error = null
+    this.#emit()
+    try {
+      const started = await this.#api.retry(item.id, item.fileName, item.sizeBytes)
+      if (!started) this.#error = SAFE_RETRY_ERROR
+      return started
+    } catch {
+      this.#error = SAFE_RETRY_ERROR
+      return false
+    } finally {
+      this.#retryPendingIds.delete(uploadId)
+      this.#ensureRefreshScheduled(this.#generation)
+      this.#emit()
+    }
+  }
+
+  async deleteRecord(uploadId: string): Promise<boolean> {
+    if (this.#disposed || this.#paused || this.#deletePendingIds.has(uploadId)) return false
+    const item = this.#items.find((candidate) => candidate.id === uploadId)
+    if (item === undefined || !recordView(item, false, false, false).terminal) return false
+    this.#deletePendingIds.add(uploadId)
+    this.#error = null
+    this.#emit()
+    try {
+      await this.#api.deleteRecord(uploadId, item.fileName, item.sizeBytes)
+      this.#items = this.#items.filter((candidate) => candidate.id !== uploadId)
+      return true
+    } catch {
+      this.#error = SAFE_DELETE_ERROR
+      return false
+    } finally {
+      this.#deletePendingIds.delete(uploadId)
+      this.#emit()
+    }
+  }
+
   pause(): void {
     if (this.#disposed || this.#paused) return
     this.#paused = true
@@ -333,6 +404,8 @@ export class HistoryController {
     if (this.#disposed) return
     this.#disposed = true
     this.#cancelPendingIds.clear()
+    this.#retryPendingIds.clear()
+    this.#deletePendingIds.clear()
     this.#invalidateGeneration()
   }
 
@@ -451,6 +524,8 @@ function pageController(page: HistoryPageHost): HistoryController {
         getUpload: () => Promise.reject(new Error('history unavailable')),
         cancel: () => Promise.reject(new Error('history unavailable')),
         clearUploaded: () => Promise.reject(new Error('history unavailable')),
+        retry: () => Promise.reject(new Error('history unavailable')),
+        deleteRecord: () => Promise.reject(new Error('history unavailable')),
       } satisfies HistoryApi),
     onChange: (snapshot) => {
       page.setData(snapshot)
@@ -535,7 +610,7 @@ export const historyPageDefinition = {
     try {
       confirmation = await wx.showModal({
         title: '清空已上传记录',
-        content: '只清除已上传的历史记录，不会删除私有存储中的图片或视频。',
+        content: '只从你的列表中隐藏已上传记录，不删除服务器文件或后台元数据。',
         confirmText: '确认清空',
         cancelText: '保留记录',
       })
@@ -551,6 +626,38 @@ export const historyPageDefinition = {
         })
       }
     }
+  },
+
+  async onRetryUpload(
+    this: HistoryPageHost,
+    event: { readonly currentTarget: { readonly dataset: { readonly uploadId?: unknown } } },
+  ): Promise<void> {
+    const uploadId = event.currentTarget.dataset.uploadId
+    if (typeof uploadId !== 'string' || typeof wx !== 'object') return
+    const started = await pageController(this).retryUpload(uploadId)
+    if (started && typeof wx.showToast === 'function') {
+      void wx.showToast({ title: '已重新开始上传', icon: 'success' })
+    }
+  },
+
+  async onDeleteRecord(
+    this: HistoryPageHost,
+    event: { readonly currentTarget: { readonly dataset: { readonly uploadId?: unknown } } },
+  ): Promise<void> {
+    const uploadId = event.currentTarget.dataset.uploadId
+    if (typeof uploadId !== 'string' || typeof wx !== 'object') return
+    let confirmation: { readonly confirm?: boolean }
+    try {
+      confirmation = await wx.showModal({
+        title: '删除上传记录',
+        content: '只从你的列表中隐藏该记录，不删除服务器文件或后台元数据。',
+        confirmText: '删除记录',
+        cancelText: '保留',
+      })
+    } catch {
+      return
+    }
+    if (confirmation.confirm === true) await pageController(this).deleteRecord(uploadId)
   },
 
   onUnload(this: HistoryPageHost): void {

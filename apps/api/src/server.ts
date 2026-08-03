@@ -15,6 +15,7 @@ import { Metrics } from './observability/metrics.js'
 import { Aborter } from './uploads/aborter.js'
 import { Finalizer } from './uploads/finalizer.js'
 import { R2ObjectStorage } from './uploads/r2-object-storage.js'
+import { LocalUploadSpool, QueuedR2ObjectStorage } from './uploads/queued-object-storage.js'
 import { DeadlineScanner, Reconciler } from './uploads/reconciler.js'
 import { PostgresUploadConcurrency } from './uploads/upload-concurrency.js'
 import { UploadWorkerSupervisor } from './uploads/worker-supervisor.js'
@@ -204,13 +205,18 @@ export function createServerRuntime(config: RuntimeConfig) {
   )
   const ids = createSecureIdGenerator(systemClock)
   const objectStorage = new R2ObjectStorage(config.r2)
+  const uploadSpool = new LocalUploadSpool({ rootDirectory: config.uploadSpoolDirectory })
+  const queuedObjectStorage = new QueuedR2ObjectStorage({
+    spool: uploadSpool,
+    remote: objectStorage,
+  })
   const metrics = new Metrics()
   const uploadConcurrency = new PostgresUploadConcurrency({ pool: uploadLockPool })
   const app = buildApp({
     pool,
     readiness: {
       database: (signal) => databaseIsReady(pool, signal),
-      objectStorage: (signal) => objectStorage.ready(signal),
+      objectStorage: (signal) => uploadSpool.ready(signal),
     },
     clock: systemClock,
     ids,
@@ -221,14 +227,14 @@ export function createServerRuntime(config: RuntimeConfig) {
     wechatAppId: config.wechat.appId,
     wechatGateway: createConfiguredWechatGateway(config.wechat),
     tokenService: createConfiguredTokenService(config, ids),
-    objectStorage,
+    objectStorage: uploadSpool,
     objectStorageBucket: config.r2.bucket,
     cursorSigningSecret: Buffer.from(config.cursorSigningKey, 'base64url'),
     uploadConcurrency,
   })
   const finalizer = new Finalizer({
     pool,
-    storage: objectStorage,
+    storage: queuedObjectStorage,
     concurrency: uploadConcurrency,
     clock: systemClock,
     ids,
@@ -236,7 +242,7 @@ export function createServerRuntime(config: RuntimeConfig) {
   })
   const aborter = new Aborter({
     pool,
-    storage: objectStorage,
+    storage: queuedObjectStorage,
     concurrency: uploadConcurrency,
     clock: systemClock,
     ids,
@@ -244,7 +250,7 @@ export function createServerRuntime(config: RuntimeConfig) {
   })
   const reconciler = new Reconciler({
     pool,
-    storage: objectStorage,
+    storage: queuedObjectStorage,
     concurrency: uploadConcurrency,
     clock: systemClock,
     ids,

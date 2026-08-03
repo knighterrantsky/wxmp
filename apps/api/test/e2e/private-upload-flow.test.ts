@@ -152,8 +152,8 @@ describe('private upload API flow against PostgreSQL and MinIO', () => {
     })
     expect(completed.response.status, JSON.stringify(completed.body)).toBe(202)
     expect(completed.body.data).toMatchObject({
-      upload: { id: uploadId, status: 'finalizing' },
-      pollAfterSeconds: 2,
+      upload: { id: uploadId, status: 'uploaded' },
+      pollAfterSeconds: null,
     })
 
     await expect(harness.finalizer.runOnce(10)).resolves.toMatchObject({

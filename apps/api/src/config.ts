@@ -7,6 +7,7 @@ export interface RuntimeConfig {
   nodeEnv: NodeEnvironment
   databaseUrl: string
   cursorSigningKey: string
+  uploadSpoolDirectory: string
   wechat: {
     authMode: 'real' | 'stub'
     appId: string
@@ -159,6 +160,12 @@ function endpointUrl(value: string, name: string): URL {
   }
 }
 
+function absoluteDirectory(env: Environment, name: string, fallback: string): string {
+  const value = env[name] ?? fallback
+  if (!value.startsWith('/') || value.includes('\u0000') || value.length > 4096) invalid(name)
+  return value
+}
+
 function databaseRole(value: string, name: string): string {
   const normalized = value.toLowerCase()
   if (
@@ -213,6 +220,21 @@ export function loadRuntimeConfig(env: Environment): RuntimeConfig {
   const authMode = wechatAuthMode(env)
   const endpoint = env['WECHAT_CODE2SESSION_ENDPOINT'] ?? DEFAULT_WECHAT_ENDPOINT
   const forcePathStyle = booleanValue(env, 'R2_FORCE_PATH_STYLE', false)
+  const uploadSpoolDirectory = absoluteDirectory(
+    env,
+    'UPLOAD_SPOOL_DIR',
+    nodeEnv === 'production' ? '/var/lib/wx-upload/spool' : '/tmp/wx-upload-spool',
+  )
+  if (
+    nodeEnv === 'production' &&
+    ['/tmp', '/run', '/dev', '/proc', '/sys'].some(
+      (ephemeralRoot) =>
+        uploadSpoolDirectory === ephemeralRoot ||
+        uploadSpoolDirectory.startsWith(`${ephemeralRoot}/`),
+    )
+  ) {
+    invalid('UPLOAD_SPOOL_DIR')
+  }
 
   if (authMode === 'real' && endpoint !== DEFAULT_WECHAT_ENDPOINT) {
     invalid('WECHAT_CODE2SESSION_ENDPOINT')
@@ -222,6 +244,7 @@ export function loadRuntimeConfig(env: Environment): RuntimeConfig {
     return {
       nodeEnv,
       databaseUrl: runtimeDatabaseUrl,
+      uploadSpoolDirectory,
       cursorSigningKey: cursorSigningKey(
         env['CURSOR_SIGNING_KEY'] ?? TEST_CURSOR_SIGNING_KEY,
         'CURSOR_SIGNING_KEY',
@@ -311,6 +334,7 @@ export function loadRuntimeConfig(env: Environment): RuntimeConfig {
   return {
     nodeEnv,
     databaseUrl: runtimeDatabaseUrl,
+    uploadSpoolDirectory,
     cursorSigningKey: historyCursorKey,
     wechat: {
       authMode,

@@ -151,21 +151,15 @@ describe('CompletionController finalization cycle', () => {
     expect(harness.run).toHaveBeenCalledOnce()
   })
 
-  it('retries a transient polling network failure without restarting the upload', async () => {
-    let resumeNumber = 0
+  it('surfaces a transient polling failure without automatically retrying', async () => {
     const harness = runnerHarness({
-      resume: () => {
-        resumeNumber += 1
-        if (resumeNumber === 1) {
-          return Promise.reject(
-            Object.assign(new Error('transient private polling failure'), {
-              networkError: true,
-              privateDetail: 'signed request secret',
-            }),
-          )
-        }
-        return Promise.resolve({ action: 'completed', result: 'uploaded' })
-      },
+      resume: () =>
+        Promise.reject(
+          Object.assign(new Error('transient private polling failure'), {
+            networkError: true,
+            privateDetail: 'signed request secret',
+          }),
+        ),
     })
     const backoff = vi.fn<(delayMs: number) => Promise<void>>(() => Promise.resolve())
     const controller = new CompletionController({
@@ -175,28 +169,21 @@ describe('CompletionController finalization cycle', () => {
       random: () => 0.5,
     })
 
-    await expect(controller.run(file)).resolves.toBe('uploaded')
+    await expectControllerError(controller.run(file), 'RUNNER_FAILED')
 
     expect(harness.run).toHaveBeenCalledOnce()
-    expect(harness.resume).toHaveBeenCalledTimes(2)
-    expect(backoff).toHaveBeenCalledOnce()
-    expect(backoff).toHaveBeenCalledWith(500)
+    expect(harness.resume).toHaveBeenCalledOnce()
+    expect(backoff).not.toHaveBeenCalled()
   })
 
-  it('starts a new poll cycle after one retryable resume batch is exhausted', async () => {
-    let resumeNumber = 0
+  it('does not start another poll cycle after a resume failure', async () => {
     const harness = runnerHarness({
-      resume: () => {
-        resumeNumber += 1
-        if (resumeNumber <= 6) {
-          return Promise.reject(
-            Object.assign(new Error('temporary private polling failure'), {
-              networkError: true,
-            }),
-          )
-        }
-        return Promise.resolve({ action: 'completed', result: 'uploaded' })
-      },
+      resume: () =>
+        Promise.reject(
+          Object.assign(new Error('temporary private polling failure'), {
+            networkError: true,
+          }),
+        ),
     })
     const pollSleep = vi.fn<(delayMs: number) => Promise<void>>(() => Promise.resolve())
     const backoff = vi.fn<(delayMs: number) => Promise<void>>(() => Promise.resolve())
@@ -207,12 +194,12 @@ describe('CompletionController finalization cycle', () => {
       random: () => 0,
     })
 
-    await expect(controller.run(file)).resolves.toBe('uploaded')
+    await expectControllerError(controller.run(file), 'RUNNER_FAILED')
 
     expect(harness.run).toHaveBeenCalledOnce()
-    expect(harness.resume).toHaveBeenCalledTimes(7)
-    expect(backoff).toHaveBeenCalledTimes(5)
-    expect(pollSleep).toHaveBeenCalledTimes(2)
+    expect(harness.resume).toHaveBeenCalledOnce()
+    expect(backoff).not.toHaveBeenCalled()
+    expect(pollSleep).toHaveBeenCalledOnce()
   })
 
   it('wakes a paused active upload through the underlying runner foreground hook', async () => {
@@ -458,20 +445,14 @@ describe('CompletionController cold restore', () => {
     expect(sleep).toHaveBeenCalledOnce()
   })
 
-  it('starts another cold-query batch after retry exhaustion without dropping restore state', async () => {
-    let resumeNumber = 0
+  it('does not automatically retry a failed cold restore query', async () => {
     const harness = runnerHarness({
-      resume: () => {
-        resumeNumber += 1
-        if (resumeNumber <= 6) {
-          return Promise.reject(
-            Object.assign(new Error('temporary cold restore network failure'), {
-              networkError: true,
-            }),
-          )
-        }
-        return Promise.resolve({ action: 'completed', result: 'uploaded' })
-      },
+      resume: () =>
+        Promise.reject(
+          Object.assign(new Error('temporary cold restore network failure'), {
+            networkError: true,
+          }),
+        ),
     })
     const recoverySleep = vi.fn<(delayMs: number) => Promise<void>>(() => Promise.resolve())
     const backoff = vi.fn<(delayMs: number) => Promise<void>>(() => Promise.resolve())
@@ -482,13 +463,12 @@ describe('CompletionController cold restore', () => {
       random: () => 0,
     })
 
-    await expect(controller.restore()).resolves.toBe('uploaded')
+    await expectControllerError(controller.restore(), 'RUNNER_FAILED')
 
     expect(harness.run).not.toHaveBeenCalled()
-    expect(harness.resume).toHaveBeenCalledTimes(7)
-    expect(backoff).toHaveBeenCalledTimes(5)
-    expect(recoverySleep).toHaveBeenCalledOnce()
-    expect(recoverySleep).toHaveBeenCalledWith(5_000)
+    expect(harness.resume).toHaveBeenCalledOnce()
+    expect(backoff).not.toHaveBeenCalled()
+    expect(recoverySleep).not.toHaveBeenCalled()
   })
 
   it.each([

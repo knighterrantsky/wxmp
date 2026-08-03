@@ -16,6 +16,7 @@ function runtimeConfig(
     nodeEnv: override.nodeEnv ?? 'development',
     databaseUrl: 'postgresql://runtime:private@127.0.0.1/database',
     cursorSigningKey: 'QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI',
+    uploadSpoolDirectory: '/tmp/wx-upload-spool-test',
     wechat: {
       authMode: 'stub',
       appId: 'wx-development-app',

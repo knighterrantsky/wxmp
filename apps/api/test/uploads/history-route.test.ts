@@ -66,10 +66,17 @@ function fixture() {
   const clearUploaded = vi
     .fn<UploadHistoryRouteService['clearUploaded']>()
     .mockResolvedValue({ clearedCount: 1 })
+  const deleteRecord = vi
+    .fn<UploadHistoryRouteService['deleteRecord']>()
+    .mockResolvedValue({ deleted: true })
   const app = buildAppShell(fakeDependencies({ clock: { now: () => now } }))
-  registerUploadRoutes(app, { uploads: uploadStub(), history: { list, clearUploaded }, tokens })
+  registerUploadRoutes(app, {
+    uploads: uploadStub(),
+    history: { list, clearUploaded, deleteRecord },
+    tokens,
+  })
   apps.push(app)
-  return { app, list, clearUploaded }
+  return { app, list, clearUploaded, deleteRecord }
 }
 
 describe('GET /v1/uploads', () => {
@@ -142,6 +149,38 @@ describe('POST /v1/uploads/history/clear-uploaded', () => {
     expect(clearUploaded.mock.calls[0]?.[0]).toMatchObject({
       userId,
       sessionId,
+      context: {
+        requestId: response.headers['x-request-id'],
+        sourceIp: '127.0.0.1',
+      },
+    })
+  })
+})
+
+describe('POST /v1/uploads/:uploadId/history/delete', () => {
+  it('soft-deletes one authenticated user record through a strict public response', async () => {
+    const { app, deleteRecord } = fixture()
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/v1/uploads/${uploadId}/history/delete`,
+      headers: { authorization: 'Bearer valid-access-token' },
+      payload: {},
+    })
+
+    expect(response.statusCode, response.body).toBe(200)
+    expect(response.json()).toEqual({
+      data: { deleted: true },
+      meta: {
+        requestId: response.headers['x-request-id'],
+        serverTime: now.toISOString(),
+      },
+    })
+    expect(deleteRecord).toHaveBeenCalledOnce()
+    expect(deleteRecord.mock.calls[0]?.[0]).toMatchObject({
+      userId,
+      sessionId,
+      uploadId,
       context: {
         requestId: response.headers['x-request-id'],
         sourceIp: '127.0.0.1',

@@ -18,12 +18,6 @@ import {
 } from '../generated/contracts.js'
 
 import { UploadProgressTracker, type UploadProgress } from '../core/progress.js'
-import {
-  MAX_UPLOAD_RETRIES,
-  fullJitterDelayMs,
-  retryWithFullJitter,
-  shouldRetryUploadFailure,
-} from '../core/retry.js'
 import type { ChunkFile } from './chunk-files.js'
 
 export const UPLOAD_RUNNER_RESUME_STORAGE_KEY = 'privateMediaUploadResumeV1'
@@ -192,7 +186,6 @@ interface ActiveUpload {
   readonly tracker: UploadProgressTracker
   pending: UploadPartPlan[]
   readonly inFlight: Map<number, Promise<PartOutcome>>
-  readonly retryAttempts: Map<number, number>
   readonly parkedChunks: Map<number, ChunkFile>
   readonly waiters: Set<() => void>
   paused: boolean
@@ -542,8 +535,6 @@ export class UploadRunner {
   readonly #source: UploadSourceProbe
   readonly #store: UploadResumeStore
   readonly #createIdempotencyKey: () => MaybePromise<string>
-  readonly #sleep: ((delayMs: number) => Promise<void>) | undefined
-  readonly #random: (() => number) | undefined
   readonly #onStatus: ((event: UploadRunnerStatusEvent) => void) | undefined
   readonly #onProgress: ((event: UploadRunnerProgressEvent) => void) | undefined
   readonly #maxParallelParts: number
@@ -569,8 +560,6 @@ export class UploadRunner {
     this.#source = options.source
     this.#store = options.store
     this.#createIdempotencyKey = options.createIdempotencyKey
-    this.#sleep = options.sleep
-    this.#random = options.random
     this.#onStatus = options.onStatus
     this.#onProgress = options.onProgress
     this.#maxParallelParts = maxParallelParts
@@ -671,7 +660,6 @@ export class UploadRunner {
       await this.#initialize(record)
     } catch (error) {
       const failure = asError(error)
-      if (!shouldRetryUploadFailure(failure)) await this.#clearStore()
       this.#emitStatus('failed', record)
       throw failure
     }
@@ -680,17 +668,9 @@ export class UploadRunner {
 
   async #initialize(record: MutableResumeRecord): Promise<void> {
     const request = toInitializeRequest(record.file)
+    await this.#waitUntilForeground()
     const initialized = snapshotInitialization(
-      await retryWithFullJitter(
-        async () => {
-          await this.#waitUntilForeground()
-          return this.#api.initializeUpload(request, record.initializeIdempotencyKey)
-        },
-        {
-          ...(this.#sleep === undefined ? {} : { sleep: this.#sleep }),
-          ...(this.#random === undefined ? {} : { random: this.#random }),
-        },
-      ),
+      await this.#api.initializeUpload(request, record.initializeIdempotencyKey),
       record.file,
     )
     record.phase = 'uploading'
@@ -713,7 +693,6 @@ export class UploadRunner {
         .map((part) => ({ ...part }))
         .sort((a, b) => a.partNumber - b.partNumber),
       inFlight: new Map(),
-      retryAttempts: new Map(),
       parkedChunks: new Map(),
       waiters: new Set(),
       paused: record.paused,
@@ -751,6 +730,7 @@ export class UploadRunner {
         return await this.#complete(record)
       }
     } catch (error) {
+      await this.#scheduleFailureCleanup(record)
       this.#emitStatus('failed', record)
       throw asError(error)
     } finally {
@@ -814,88 +794,73 @@ export class UploadRunner {
     if (uploadId === null) throw new UploadRunnerResumeError()
     let chunk = active.parkedChunks.get(part.partNumber)
     active.parkedChunks.delete(part.partNumber)
-    let attempt = active.retryAttempts.get(part.partNumber) ?? 0
     try {
-      for (;;) {
-        if (active.paused) {
-          if (chunk !== undefined) {
-            active.parkedChunks.set(part.partNumber, chunk)
-            chunk = undefined
-          }
+      if (active.paused) {
+        if (chunk !== undefined) {
+          active.parkedChunks.set(part.partNumber, chunk)
+          chunk = undefined
+        }
+        return 'paused'
+      }
+      let uploaded: { readonly chunk: ChunkFile; readonly response: UploadPartResponse['data'] }
+      try {
+        chunk ??= await this.#chunks.create(active.record.file.sourcePath, part)
+        const attemptChunk = chunk
+        if (this.#activeIsPaused(active)) {
+          active.parkedChunks.set(part.partNumber, attemptChunk)
+          chunk = undefined
           return 'paused'
         }
-        let uploaded:
-          { readonly chunk: ChunkFile; readonly response: UploadPartResponse['data'] } | undefined
+        active.tracker.startPart(part.partNumber, part.sizeBytes)
+        this.#emitProgress(active.tracker.snapshot(), active.record)
+        let acceptingProgress = true
         try {
-          chunk ??= await this.#chunks.create(active.record.file.sourcePath, part)
-          const attemptChunk = chunk
-          if (this.#activeIsPaused(active)) {
-            active.parkedChunks.set(part.partNumber, attemptChunk)
-            chunk = undefined
-            return 'paused'
-          }
-          active.tracker.startPart(part.partNumber, part.sizeBytes)
-          this.#emitProgress(active.tracker.snapshot(), active.record)
-          let acceptingProgress = true
-          try {
-            const value = await this.#transport.uploadPart({
-              uploadId,
-              partNumber: part.partNumber,
-              sha256: attemptChunk.sha256,
-              chunkSizeBytes: part.sizeBytes,
-              tempPath: attemptChunk.tempPath,
-              onProgress: (event) => {
-                if (!acceptingProgress) return
-                try {
-                  const progress = active.tracker.updatePart(part.partNumber, event.totalBytesSent)
-                  this.#emitProgress(progress, active.record)
-                } catch {
-                  // Ignore malformed or late runtime callbacks.
-                }
-              },
-            })
-            acceptingProgress = false
-            uploaded = {
-              chunk: attemptChunk,
-              response: snapshotPartResponse(
-                value,
-                part,
-                attemptChunk,
-                active.record.file.sizeBytes,
-              ),
-            }
-          } catch (error) {
-            acceptingProgress = false
-            const progress = active.tracker.discardPart(part.partNumber)
-            this.#emitProgress(progress, active.record)
-            if (isPartChecksumMismatch(error)) {
-              await this.#chunks.delete(attemptChunk)
-              chunk = undefined
-            }
-            throw asError(error)
+          const value = await this.#transport.uploadPart({
+            uploadId,
+            partNumber: part.partNumber,
+            sha256: attemptChunk.sha256,
+            chunkSizeBytes: part.sizeBytes,
+            tempPath: attemptChunk.tempPath,
+            onProgress: (event) => {
+              if (!acceptingProgress) return
+              try {
+                const progress = active.tracker.updatePart(part.partNumber, event.totalBytesSent)
+                this.#emitProgress(progress, active.record)
+              } catch {
+                // Ignore malformed or late runtime callbacks.
+              }
+            },
+          })
+          acceptingProgress = false
+          uploaded = {
+            chunk: attemptChunk,
+            response: snapshotPartResponse(value, part, attemptChunk, active.record.file.sizeBytes),
           }
         } catch (error) {
-          const failure = asError(error)
-          if (attempt >= MAX_UPLOAD_RETRIES || !shouldRetryUploadFailure(failure)) throw failure
-          active.retryAttempts.set(part.partNumber, attempt + 1)
-          await this.#sleepForRetry(attempt)
-          attempt += 1
-          continue
+          acceptingProgress = false
+          const progress = active.tracker.discardPart(part.partNumber)
+          this.#emitProgress(progress, active.record)
+          if (isPartChecksumMismatch(error)) {
+            await this.#chunks.delete(attemptChunk)
+            chunk = undefined
+          }
+          throw asError(error)
         }
-        active.record.confirmedBytes = Math.max(
-          active.record.confirmedBytes,
-          uploaded.response.progress.confirmedBytes,
-        )
-        active.record.confirmedPartHashes[part.partNumber] = uploaded.chunk.sha256
-        await this.#persist(active.record)
-        const progress = active.tracker.confirmPart(
-          part.partNumber,
-          uploaded.response.progress.confirmedBytes,
-        )
-        this.#emitProgress(progress, active.record)
-        active.retryAttempts.delete(part.partNumber)
-        return 'uploaded'
+      } catch (error) {
+        throw asError(error)
       }
+      active.record.confirmedBytes = Math.max(
+        active.record.confirmedBytes,
+        uploaded.response.progress.confirmedBytes,
+      )
+      active.record.confirmedPartHashes[part.partNumber] = uploaded.chunk.sha256
+      await this.#persist(active.record)
+      const progress = active.tracker.confirmPart(
+        part.partNumber,
+        uploaded.response.progress.confirmedBytes,
+      )
+      this.#emitProgress(progress, active.record)
+      return 'uploaded'
     } finally {
       if (chunk !== undefined) await this.#chunks.delete(chunk)
     }
@@ -911,23 +876,15 @@ export class UploadRunner {
       await this.#persist(record)
     }
     const idempotencyKey = record.completeIdempotencyKey
-    const attempt = await retryWithFullJitter(
-      async () => {
-        await this.#waitUntilCompletionReady(active)
-        if (active.terminalError !== undefined) throw active.terminalError
-        if (active.serverResult !== undefined) {
-          return { source: 'server' as const, result: active.serverResult }
-        }
-        return {
-          source: 'api' as const,
-          response: await this.#api.completeUpload(uploadId, idempotencyKey),
-        }
-      },
-      {
-        ...(this.#sleep === undefined ? {} : { sleep: this.#sleep }),
-        ...(this.#random === undefined ? {} : { random: this.#random }),
-      },
-    )
+    await this.#waitUntilCompletionReady(active)
+    if (active.terminalError !== undefined) throw active.terminalError
+    const attempt =
+      active.serverResult === undefined
+        ? {
+            source: 'api' as const,
+            response: await this.#api.completeUpload(uploadId, idempotencyKey),
+          }
+        : { source: 'server' as const, result: active.serverResult }
     if (attempt.source === 'server') return this.#settleResult(attempt.result, record)
     const response = attempt.response
     const candidate: unknown = response
@@ -944,11 +901,13 @@ export class UploadRunner {
       if (!validPollAfterSeconds(candidate['pollAfterSeconds'])) {
         throw new UploadRunnerProtocolError()
       }
-      this.#pollAfterSeconds = candidate['pollAfterSeconds']
+      // The API has durably accepted every byte. Any later server-side delivery
+      // work is intentionally outside the client lifecycle.
+      this.#pollAfterSeconds = null
     } else {
       this.#pollAfterSeconds = null
     }
-    return this.#settleResult(candidate['upload']['status'], record)
+    return this.#settleResult('uploaded', record)
   }
 
   async #settleResult(
@@ -990,8 +949,9 @@ export class UploadRunner {
     this.#pollAfterSeconds = detail.pollAfterSeconds
     if (detail.status === 'finalizing' || detail.status === 'uploaded') {
       await this.#discardParkedChunks(active)
-      if (detail.status === 'finalizing') record.phase = 'finalizing'
-      active.serverResult = detail.status
+      // Both states mean every byte is durably on the business server. Any
+      // object-storage work belongs to the backend queue, outside this client.
+      active.serverResult = 'uploaded'
       const pauseIsCurrent = this.#pauseGeneration === pauseGeneration
       active.paused = !pauseIsCurrent
       record.paused = !pauseIsCurrent
@@ -1063,7 +1023,7 @@ export class UploadRunner {
       const detail = this.#snapshotDetail(await this.#api.getUpload(uploadId), stored)
       this.#pollAfterSeconds = detail.pollAfterSeconds
       if (detail.status === 'finalizing' || detail.status === 'uploaded') {
-        const result = await this.#settleResult(detail.status, stored)
+        const result = await this.#settleResult('uploaded', stored)
         return copiedOutcome({ action: 'completed', result })
       }
       if (detail.status !== 'uploading') {
@@ -1175,10 +1135,6 @@ export class UploadRunner {
     active.record.phase = 'uploading'
     active.record.confirmedBytes = detail.confirmedBytes
     active.record.confirmedPartHashes = { ...detail.confirmedHashes }
-    const pendingNumbers = new Set(detail.pending.map((part) => part.partNumber))
-    for (const partNumber of active.retryAttempts.keys()) {
-      if (!pendingNumbers.has(partNumber)) active.retryAttempts.delete(partNumber)
-    }
     if (detail.pending.length > 0) active.record.completeIdempotencyKey = null
     const progress = active.tracker.resetFromServer(detail.confirmedBytes)
     this.#emitProgress(progress, active.record)
@@ -1233,6 +1189,18 @@ export class UploadRunner {
     return copiedOutcome({ action: 'replace' })
   }
 
+  async #scheduleFailureCleanup(record: MutableResumeRecord): Promise<void> {
+    if (record.uploadId === null) return
+    try {
+      record.abortIdempotencyKey ??= await this.#newIdempotencyKey()
+      await this.#persist(record)
+      await this.#api.abortUpload(record.uploadId, 'replaced', record.abortIdempotencyKey)
+    } catch {
+      // Cleanup is best-effort and deliberately has no retry loop. The user may
+      // cancel the visible server record or start a manual retry later.
+    }
+  }
+
   async #pathReadable(path: string): Promise<boolean> {
     try {
       return await this.#source.isReadable(path)
@@ -1284,17 +1252,6 @@ export class UploadRunner {
     const waiters = [...this.#foregroundWaiters]
     this.#foregroundWaiters.clear()
     for (const resolve of waiters) resolve()
-  }
-
-  async #sleepForRetry(retryIndex: number): Promise<void> {
-    const delayMs = fullJitterDelayMs(retryIndex, this.#random)
-    if (this.#sleep !== undefined) {
-      await this.#sleep(delayMs)
-      return
-    }
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, delayMs)
-    })
   }
 
   async #discardParkedChunks(
