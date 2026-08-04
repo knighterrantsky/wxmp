@@ -35,6 +35,13 @@ describe('production delivery configuration', () => {
     expect(compose).not.toContain('latest')
     expect(compose).not.toContain('image: postgres:')
     expect(compose).not.toContain('image: nginx:')
+    expect(compose).toContain('ADMIN_USERNAME: ${ADMIN_USERNAME:?ADMIN_USERNAME is required}')
+    expect(compose).toContain(
+      'ADMIN_PASSWORD_SCRYPT: ${ADMIN_PASSWORD_SCRYPT:?ADMIN_PASSWORD_SCRYPT is required}',
+    )
+    expect(compose).toContain(
+      'ADMIN_SESSION_SECRET: ${ADMIN_SESSION_SECRET:?ADMIN_SESSION_SECRET is required}',
+    )
   })
 
   it('publishes only after verification and gates production deployment to its dedicated runner', () => {

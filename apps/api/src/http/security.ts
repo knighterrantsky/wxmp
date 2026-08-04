@@ -6,7 +6,8 @@ import type { FastifyInstance, FastifyRequest, preHandlerAsyncHookHandler } from
 import { ApiError } from './errors.js'
 import { authenticatedUserId } from './request-context.js'
 
-export type RateLimitPolicyName = 'login' | 'refresh' | 'ordinary' | 'initialize' | 'history'
+export type RateLimitPolicyName =
+  'login' | 'refresh' | 'ordinary' | 'initialize' | 'history' | 'adminLogin' | 'adminRead'
 export type RateLimitIdentity = 'ip' | 'user'
 
 export interface RateLimitPolicy {
@@ -26,6 +27,8 @@ const POLICIES: Readonly<
   ordinary: { max: 120, identity: 'user' },
   initialize: { max: 10, identity: 'user' },
   history: { max: 60, identity: 'user' },
+  adminLogin: { max: 5, identity: 'ip' },
+  adminRead: { max: 180, identity: 'ip' },
 }
 
 function createRateLimitPolicy(name: RateLimitPolicyName): RateLimitPolicy {
@@ -56,6 +59,8 @@ const RATE_LIMIT_POLICIES: Readonly<Record<RateLimitPolicyName, RateLimitPolicy>
   ordinary: createRateLimitPolicy('ordinary'),
   initialize: createRateLimitPolicy('initialize'),
   history: createRateLimitPolicy('history'),
+  adminLogin: createRateLimitPolicy('adminLogin'),
+  adminRead: createRateLimitPolicy('adminRead'),
 }
 
 export function rateLimitPolicy(name: RateLimitPolicyName): RateLimitPolicy {
@@ -75,7 +80,10 @@ export function isMonitoringTokenValid(
 }
 
 function needsNoStore(url: string): boolean {
-  return /^\/v1\/(?:auth(?:\/|$)|profile(?:\/|$)|uploads(?:\/|$))/.test(url)
+  return (
+    /^\/v1\/(?:auth(?:\/|$)|profile(?:\/|$)|uploads(?:\/|$))/.test(url) ||
+    /^\/admin(?:\/|$)/.test(url)
+  )
 }
 
 function configuredPolicy(value: unknown): RateLimitPolicy | undefined {

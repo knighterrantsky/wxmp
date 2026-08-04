@@ -14,6 +14,11 @@ function runtimeConfig(
 ): RuntimeConfig {
   return {
     nodeEnv: override.nodeEnv ?? 'development',
+    admin: {
+      username: 'test-admin',
+      passwordVerifier: `scrypt:16384:8:1:${Buffer.alloc(16, 0x41).toString('base64url')}:${Buffer.alloc(32, 0x42).toString('base64url')}`,
+      sessionSecret: Buffer.alloc(32, 0x43).toString('base64url'),
+    },
     databaseUrl: 'postgresql://runtime:private@127.0.0.1/database',
     cursorSigningKey: 'QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI',
     uploadSpoolDirectory: '/tmp/wx-upload-spool-test',

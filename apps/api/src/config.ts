@@ -1,5 +1,7 @@
 import { createPrivateKey, createPublicKey, timingSafeEqual } from 'node:crypto'
 
+import { parseAdminPasswordVerifier } from './admin/admin-auth.js'
+
 export type Environment = Readonly<Record<string, string | undefined>>
 export type NodeEnvironment = 'development' | 'test' | 'production'
 
@@ -8,6 +10,11 @@ export interface RuntimeConfig {
   databaseUrl: string
   cursorSigningKey: string
   uploadSpoolDirectory: string
+  admin: {
+    username: string
+    passwordVerifier: string
+    sessionSecret: string
+  }
   wechat: {
     authMode: 'real' | 'stub'
     appId: string
@@ -53,6 +60,9 @@ const BUCKET_PATTERN = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/
 const SERVER_HOSTS = ['127.0.0.1', '0.0.0.0', '::1', '::'] as const
 const BASE64URL_SECRET_PATTERN = /^[A-Za-z0-9_-]+$/u
 const TEST_CURSOR_SIGNING_KEY = 'QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI'
+const TEST_ADMIN_PASSWORD_VERIFIER = `scrypt:16384:8:1:${Buffer.alloc(16, 0x41).toString('base64url')}:${Buffer.alloc(32, 0x42).toString('base64url')}`
+const TEST_ADMIN_SESSION_SECRET = Buffer.alloc(32, 0x43).toString('base64url')
+const ADMIN_USERNAME_PATTERN = /^[A-Za-z0-9._-]{1,64}$/u
 
 function invalid(name: string): never {
   throw new Error(`Invalid configuration: ${name}`)
@@ -152,6 +162,38 @@ function serverConfig(env: Environment, nodeEnv: NodeEnvironment): RuntimeConfig
   }
 }
 
+function adminConfig(env: Environment, nodeEnv: NodeEnvironment): RuntimeConfig['admin'] {
+  const username =
+    nodeEnv === 'test' ? (env['ADMIN_USERNAME'] ?? 'test-admin') : required(env, 'ADMIN_USERNAME')
+  const passwordVerifier =
+    nodeEnv === 'test'
+      ? (env['ADMIN_PASSWORD_SCRYPT'] ?? TEST_ADMIN_PASSWORD_VERIFIER)
+      : required(env, 'ADMIN_PASSWORD_SCRYPT')
+  const sessionSecret =
+    nodeEnv === 'test'
+      ? (env['ADMIN_SESSION_SECRET'] ?? TEST_ADMIN_SESSION_SECRET)
+      : required(env, 'ADMIN_SESSION_SECRET')
+  if (!ADMIN_USERNAME_PATTERN.test(username)) invalid('ADMIN_USERNAME')
+  if (parseAdminPasswordVerifier(passwordVerifier) === undefined) invalid('ADMIN_PASSWORD_SCRYPT')
+  cursorSigningKey(sessionSecret, 'ADMIN_SESSION_SECRET')
+  if (
+    nodeEnv === 'production' &&
+    (PLACEHOLDER_PATTERN.test(username) || username.toLowerCase() === 'test-admin')
+  ) {
+    invalid('ADMIN_USERNAME')
+  }
+  if (nodeEnv === 'production' && passwordVerifier === TEST_ADMIN_PASSWORD_VERIFIER) {
+    invalid('ADMIN_PASSWORD_SCRYPT')
+  }
+  if (
+    nodeEnv === 'production' &&
+    (sessionSecret === TEST_ADMIN_SESSION_SECRET || PLACEHOLDER_PATTERN.test(sessionSecret))
+  ) {
+    invalid('ADMIN_SESSION_SECRET')
+  }
+  return { username, passwordVerifier, sessionSecret }
+}
+
 function endpointUrl(value: string, name: string): URL {
   try {
     return new URL(value)
@@ -216,6 +258,7 @@ function validateEd25519Keys(privateKey: string, publicKey: string): void {
 export function loadRuntimeConfig(env: Environment): RuntimeConfig {
   const nodeEnv = nodeEnvironment(env)
   const server = serverConfig(env, nodeEnv)
+  const admin = adminConfig(env, nodeEnv)
   const runtimeDatabaseUrl = databaseUrl(env, 'DATABASE_URL')
   const authMode = wechatAuthMode(env)
   const endpoint = env['WECHAT_CODE2SESSION_ENDPOINT'] ?? DEFAULT_WECHAT_ENDPOINT
@@ -243,6 +286,7 @@ export function loadRuntimeConfig(env: Environment): RuntimeConfig {
   if (nodeEnv === 'test') {
     return {
       nodeEnv,
+      admin,
       databaseUrl: runtimeDatabaseUrl,
       uploadSpoolDirectory,
       cursorSigningKey: cursorSigningKey(
@@ -333,6 +377,7 @@ export function loadRuntimeConfig(env: Environment): RuntimeConfig {
 
   return {
     nodeEnv,
+    admin,
     databaseUrl: runtimeDatabaseUrl,
     uploadSpoolDirectory,
     cursorSigningKey: historyCursorKey,

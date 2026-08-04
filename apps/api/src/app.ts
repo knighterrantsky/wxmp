@@ -7,6 +7,12 @@ import Fastify, {
 } from 'fastify'
 import type { Pool } from 'pg'
 
+import { AdminAuthService, type AdminAuthConfig } from './admin/admin-auth.js'
+import {
+  PostgresAdminUploadRepository,
+  type AdminUploadRepository,
+} from './admin/admin-repository.js'
+import { registerAdminRoutes } from './admin/admin-routes.js'
 import { PostgresAuthRepository, type AuthRepository } from './auth/auth-repository.js'
 import { registerAuthRoutes } from './auth/auth-routes.js'
 import { AuthService } from './auth/auth-service.js'
@@ -54,6 +60,8 @@ export interface AppShellDependencies {
 }
 
 export interface AppDependencies extends AppShellDependencies {
+  admin: AdminAuthConfig
+  adminRepository?: AdminUploadRepository
   wechatAppId: string
   wechatGateway: WechatGateway
   tokenService: TokenService
@@ -168,6 +176,10 @@ export function buildAppShell(deps: AppShellDependencies): FastifyInstance {
 
 export function buildApp(deps: AppDependencies): FastifyInstance {
   const app = buildAppShell(deps)
+  registerAdminRoutes(app, {
+    auth: new AdminAuthService({ ...deps.admin, clock: deps.clock }),
+    repository: deps.adminRepository ?? new PostgresAdminUploadRepository({ pool: deps.pool }),
+  })
   const repository =
     deps.authRepository ??
     new PostgresAuthRepository({ pool: deps.pool, clock: deps.clock, ids: deps.ids })

@@ -6,10 +6,14 @@ const databaseUrl = 'postgresql://runtime:runtime-password@db.internal/wx_upload
 
 const { privateKey, publicKey } = generateKeyPairSync('ed25519')
 const mismatchedPublicKey = generateKeyPairSync('ed25519').publicKey
+const adminPasswordVerifier = `scrypt:16384:8:1:${Buffer.alloc(16, 0x44).toString('base64url')}:${Buffer.alloc(32, 0x45).toString('base64url')}`
 
 const productionEnv = {
   NODE_ENV: 'production',
   DATABASE_URL: databaseUrl,
+  ADMIN_USERNAME: 'production-admin',
+  ADMIN_PASSWORD_SCRYPT: adminPasswordVerifier,
+  ADMIN_SESSION_SECRET: Buffer.alloc(32, 0x46).toString('base64url'),
   WECHAT_AUTH_MODE: 'real',
   WECHAT_APP_ID: 'wx1234567890abcdef',
   WECHAT_APP_SECRET: 'wechat-secret-value-for-production',
@@ -147,6 +151,11 @@ describe('runtime production safety', () => {
     expect(config.wechat.totalTimeoutMs).toBe(5_000)
     expect(config.r2.forcePathStyle).toBe(false)
     expect(config.uploadSpoolDirectory).toBe('/var/lib/wx-upload/spool')
+    expect(config.admin).toEqual({
+      username: 'production-admin',
+      passwordVerifier: adminPasswordVerifier,
+      sessionSecret: Buffer.alloc(32, 0x46).toString('base64url'),
+    })
     expect(config.server).toEqual({
       host: '127.0.0.1',
       port: 3000,
@@ -195,6 +204,10 @@ describe('runtime production safety', () => {
     ['MONITORING_TOKEN', 'local-monitor-token-use-a-random-value'],
     ['MONITORING_TOKEN', 'replace-with-random-monitoring-token'],
     ['MONITORING_TOKEN', 'use-a-random-value-use-a-random-value'],
+    ['ADMIN_USERNAME', 'test-admin'],
+    ['ADMIN_USERNAME', 'name with spaces'],
+    ['ADMIN_PASSWORD_SCRYPT', 'plain-text-password'],
+    ['ADMIN_SESSION_SECRET', 'change-me'],
   ])('rejects unsafe production %s', (name, value) => {
     expect(() => loadRuntimeConfig({ ...productionEnv, [name]: value })).toThrow(new RegExp(name))
   })
@@ -226,6 +239,9 @@ describe('runtime production safety', () => {
   it('requires every external production setting', () => {
     for (const name of [
       'DATABASE_URL',
+      'ADMIN_USERNAME',
+      'ADMIN_PASSWORD_SCRYPT',
+      'ADMIN_SESSION_SECRET',
       'WECHAT_APP_ID',
       'WECHAT_APP_SECRET',
       'JWT_PRIVATE_KEY',

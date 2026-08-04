@@ -1,6 +1,6 @@
 # 微信私有素材上传
 
-这是一个微信小程序与自建 HTTPS API 组成的私有素材上传系统。用户在小程序内完成微信登录、确认微信昵称、选择图片或视频并进行二次确认；API 将 8 MiB 分片流式写入 Cloudflare R2，并在 PostgreSQL 中保存用户映射、上传状态和历史记录。
+这是一个微信小程序与自建 HTTPS API 组成的私有素材上传系统。用户在小程序内完成微信登录、确认微信昵称、选择图片或视频并进行二次确认；API 先将 8 MiB 分片写入服务器持久化暂存区并记录 PostgreSQL 元数据，再由后台队列交付到 Cloudflare R2。
 
 ## 安全边界
 
@@ -9,6 +9,7 @@
 - 每个对象由服务端按内部 `userId` 生成前缀，客户端不能指定存储路径。
 - API、迁移和保留清理分别使用 `wx_runtime`、`wx_migrate`、`wx_maintenance` 数据库角色。
 - 生产配置强制真实微信登录、Cloudflare R2 HTTPS endpoint、Ed25519 密钥和独立监控令牌。
+- `/admin/` 提供账号密码保护的只读审计页；管理员可以查看 openid 映射与 R2 交付状态，但不能从页面下载私有对象或篡改上传终态。
 
 ## 仓库结构
 
@@ -54,5 +55,6 @@ pnpm test:e2e:local
 4. [生产密钥与部署](docs/runbooks/production-secrets.md)
 5. [监控与故障处理](docs/runbooks/monitoring.md)
 6. [真机手工验收](docs/runbooks/manual-acceptance.md)
+7. [上传审计后台](docs/runbooks/admin-console.md)
 
 接口与数据结构分别以 [API 文档](docs/api/media-upload-api.md) 和 [数据库设计](docs/database/media-upload-database.md) 为准。

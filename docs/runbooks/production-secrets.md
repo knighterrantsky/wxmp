@@ -58,13 +58,37 @@ openssl rand -base64 48 | tr '+/' '-_' | tr -d '='
 openssl rand -hex 32
 ```
 
-### 2.4 幂等 Key 说明
+### 2.4 运维后台凭据
+
+- `ADMIN_USERNAME`：只读上传审计后台的登录账号。
+- `ADMIN_PASSWORD_SCRYPT`：密码的 Scrypt 校验串，禁止填写明文密码。
+- `ADMIN_SESSION_SECRET`：至少 32 个随机字节的无填充 base64url，用于签署 8 小时后台会话 Cookie，必须与 JWT、游标和监控令牌相互独立。
+
+在可信开发机的仓库根目录生成密码校验串。命令从终端隐藏读取密码，不把明文写入参数、Git 或 shell 历史：
+
+```bash
+read -rsp 'Admin password: ' ADMIN_PASSWORD && printf '\n'
+printf '%s' "$ADMIN_PASSWORD" | node --input-type=module --eval '
+  import { randomBytes, scryptSync } from "node:crypto";
+  let password = "";
+  for await (const chunk of process.stdin) password += chunk;
+  const salt = randomBytes(16);
+  const digest = scryptSync(password, salt, 32, { N: 16384, r: 8, p: 1, maxmem: 67108864 });
+  process.stdout.write(`scrypt:16384:8:1:${salt.toString("base64url")}:${digest.toString("base64url")}\n`);
+'
+unset ADMIN_PASSWORD
+openssl rand -base64 48 | tr '+/' '-_' | tr -d '='
+```
+
+分别把两条输出写入 `ADMIN_PASSWORD_SCRYPT` 和 `ADMIN_SESSION_SECRET`。修改后台凭据后必须重新创建 API 容器；旧 Cookie 在更换 `ADMIN_SESSION_SECRET` 后立即失效。
+
+### 2.5 幂等 Key 说明
 
 当前实现没有服务端 `IDEMPOTENCY_SIGNING_KEY`，也不需要新增此类环境变量。幂等由小程序为每次业务周期生成 UUIDv7 `Idempotency-Key`，API 把请求哈希和稳定结果写入 PostgreSQL 账本。实施计划中“幂等 secret”这一项对当前实现不适用；添加一个 API 不读取的伪密钥不能提升安全性。
 
 客户端 Key 不是长期凭据，不能拿来替代 JWT、游标签名或监控令牌。
 
-### 2.5 PostgreSQL 四类密码与三条角色连接
+### 2.6 PostgreSQL 四类密码与三条角色连接
 
 首次初始化空 volume 时，PostgreSQL 容器读取四个密码：
 
@@ -93,7 +117,7 @@ MAINTENANCE_DATABASE_URL=postgresql://wx_maintenance:<encoded>@postgres:5432/wx_
 
 初始化 SQL 仅在空 volume 第一次启动时执行。修改 `.env` 不会自动修改已有角色密码；应在维护窗口通过 PostgreSQL 管理连接执行角色密码轮换，再原子更新对应 URL，并逐个重建相关容器。
 
-### 2.6 Cloudflare R2
+### 2.7 Cloudflare R2
 
 - `R2_ENDPOINT` 必须是账户专属的 `https://<account-id>.r2.cloudflarestorage.com` 根地址。
 - `R2_BUCKET` 使用生产专用 bucket；开发、CI、smoke test 使用不同 bucket。
@@ -110,7 +134,7 @@ MAINTENANCE_DATABASE_URL=postgresql://wx_maintenance:<encoded>@postgres:5432/wx_
 
 R2 生命周期是应用 24 小时会话清理与后台对账之外的最终兜底，不能替代应用任务。
 
-### 2.7 TLS 文件
+### 2.8 TLS 文件
 
 `TLS_CERTIFICATE_FILE` 和 `TLS_PRIVATE_KEY_FILE` 必须是宿主机绝对路径，Compose 将它们只读挂载到 Nginx。当前使用 Let’s Encrypt 为 `api.rollinwave.store` 签发公信证书，Certbot standalone 通过 80 端口完成 HTTP-01 验证。
 

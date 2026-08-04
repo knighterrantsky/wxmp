@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { Pool } from 'pg'
 
 import type { AppDependencies } from '../../src/app.js'
+import type { AdminUploadRepository } from '../../src/admin/admin-repository.js'
 import type { AuthRepository } from '../../src/auth/auth-repository.js'
 import type { TokenService } from '../../src/auth/token-service.js'
 import { WechatStubGateway } from '../../src/auth/wechat-stub-gateway.js'
@@ -34,6 +35,8 @@ export interface FakeDependencyOverrides {
   uploadConcurrency?: AppDependencies['uploadConcurrency']
   uploadLockPool?: AppDependencies['uploadLockPool']
   ordinaryRequestTimeoutMs?: AppDependencies['ordinaryRequestTimeoutMs']
+  admin?: AppDependencies['admin']
+  adminRepository?: AdminUploadRepository
 }
 
 export interface FakeDependencies extends AppDependencies {
@@ -83,6 +86,14 @@ export function fakeDependencies(overrides: FakeDependencyOverrides = {}): FakeD
   const objectStorage = overrides.objectStorage ?? defaultObjectStorage
 
   return {
+    admin: overrides.admin ?? {
+      username: 'test-admin',
+      passwordVerifier: `scrypt:16384:8:1:${Buffer.alloc(16, 0x41).toString('base64url')}:${Buffer.alloc(32, 0x42).toString('base64url')}`,
+      sessionSecret: Buffer.alloc(32, 0x43),
+    },
+    ...(overrides.adminRepository === undefined
+      ? {}
+      : { adminRepository: overrides.adminRepository }),
     pool: overrides.pool ?? new Pool(),
     readiness: {
       async database(signal) {

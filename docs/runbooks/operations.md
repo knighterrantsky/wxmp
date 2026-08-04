@@ -8,6 +8,7 @@
 | --- | --- |
 | 服务器 | `117.72.174.2` |
 | API | `https://api.rollinwave.store` |
+| 上传审计后台 | `https://api.rollinwave.store/admin/` |
 | SSH 密钥 | 运维人员本机 `~/.ssh/jdcloud.pem` |
 | Compose project | `wx-private-media-upload-production` |
 | 发布根目录 | `/opt/wx-private-media-upload` |
@@ -34,6 +35,7 @@
 - 禁止把 `production.env`、`docker inspect` 完整输出、token、数据库 URL 或用户 openid 粘贴到日志和工单。
 - 操作前记录当前 SHA；涉及配置、数据库、证书或回滚时先确认备份与恢复路径。
 - 日志按 `requestId` 排查，不要求用户提供 access token 或 refresh token。
+- 后台页面首版只读，不提供修改数据库终态、删除 R2 对象、下载素材或自动通知用户的操作。
 
 ## 3. 运维 shell 准备
 

@@ -78,6 +78,10 @@ export HOST=127.0.0.1
 export PORT=3000
 export TRUST_PROXY=false
 export MONITORING_TOKEN=local-monitoring-token
+export ADMIN_USERNAME=local-admin
+# 本地演示密码为 local-admin-password；这里只保存其固定 Scrypt 校验串。
+export ADMIN_PASSWORD_SCRYPT='scrypt:16384:8:1:TExMTExMTExMTExMTExMTA:KYoD5DsrCy0O_irtbI1DbN_LoQbB_3XdMH9w8MC7gOU'
+export ADMIN_SESSION_SECRET=TU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU0
 export DATABASE_URL='postgresql://wx_runtime:wx_runtime_local@127.0.0.1:55432/wx_upload'
 export WECHAT_AUTH_MODE=stub
 export WECHAT_APP_ID=example-app-id
@@ -105,6 +109,8 @@ curl --fail \
   -H 'X-Monitoring-Token: local-monitoring-token' \
   http://127.0.0.1:3000/health/ready
 ```
+
+本机浏览器直接打开 `http://127.0.0.1:3000/admin/` 时无法保存 Secure Cookie；后台按生产 HTTPS 边界设计。需要本地浏览器联调时，应通过本地 TLS 反向代理访问，或使用测试路由的注入测试验证。
 
 ## 6. 检查 MinIO
 

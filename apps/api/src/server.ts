@@ -132,6 +132,8 @@ export async function databaseIsReady(
 function configuredSecrets(config: RuntimeConfig): string[] {
   return [
     config.databaseUrl,
+    config.admin.passwordVerifier,
+    config.admin.sessionSecret,
     config.cursorSigningKey,
     config.wechat.appSecret,
     config.jwt.privateKey,
@@ -213,6 +215,11 @@ export function createServerRuntime(config: RuntimeConfig) {
   const metrics = new Metrics()
   const uploadConcurrency = new PostgresUploadConcurrency({ pool: uploadLockPool })
   const app = buildApp({
+    admin: {
+      username: config.admin.username,
+      passwordVerifier: config.admin.passwordVerifier,
+      sessionSecret: Buffer.from(config.admin.sessionSecret, 'base64url'),
+    },
     pool,
     readiness: {
       database: (signal) => databaseIsReady(pool, signal),

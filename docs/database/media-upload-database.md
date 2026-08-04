@@ -213,7 +213,7 @@ WHERE i.provider = 'wechat_miniprogram'
   AND i.openid = $2;
 ```
 
-该查询及 `openid` 字段只授权给身份模块；普通上传查询、用户 API、对象键和日志均不暴露 `openid`。
+该查询及 `openid` 字段只授权给身份模块和受账号密码保护的只读运维后台；普通上传查询、用户 API、对象键和日志均不暴露 `openid`。
 
 ### 5.3 登录会话
 

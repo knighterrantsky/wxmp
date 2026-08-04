@@ -68,6 +68,8 @@ describe('HTTP security policy', () => {
     ['ordinary', 120, 'user'],
     ['initialize', 10, 'user'],
     ['history', 60, 'user'],
+    ['adminLogin', 5, 'ip'],
+    ['adminRead', 180, 'ip'],
   ] as const)('declares the %s rate policy', (name, max, identity) => {
     expect(rateLimitPolicy(name)).toMatchObject({
       max,
@@ -82,6 +84,8 @@ describe('HTTP security policy', () => {
     ['ordinary', 120],
     ['initialize', 10],
     ['history', 60],
+    ['adminLogin', 5],
+    ['adminRead', 180],
   ] as const)('enforces the %s route policy at N + 1', async (name, max) => {
     const app = buildApp(fakeDependencies())
     apps.push(app)
