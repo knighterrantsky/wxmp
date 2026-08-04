@@ -77,6 +77,9 @@ jobs:
           MIGRATION_DATABASE_URL=postgresql://wx_migrate:config-only-migrate@postgres:5432/wx_upload \
           MAINTENANCE_DATABASE_URL=postgresql://wx_maintenance:config-only-maintenance@postgres:5432/wx_upload \
           MONITORING_TOKEN=config-only-monitoring-token-value \
+          ADMIN_USERNAME=config-only-admin \
+          ADMIN_PASSWORD_SCRYPT=config-only-password-verifier \
+          ADMIN_SESSION_SECRET=config-only-session-secret \
           WECHAT_APP_ID=config-only-app-id \
           WECHAT_APP_SECRET=config-only-app-secret \
           JWT_PRIVATE_KEY=config-only-private-key \
